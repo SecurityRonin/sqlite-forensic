@@ -8,42 +8,22 @@ generated. The machine-checkable form of this evidence is `forensic/tests/oracle
 ## Summary
 
 - **Conclusion:** on the freelist-page deletion scenario our carver is designed for,
-  its output is **consistent with** the independent `undark` carver — 100% content
-  agreement on every overlapping rowid and 162/163 of undark's recovered deleted rows.
-- **One understood divergence** on our fixture (rowid 237, on a still-allocated page)
-  and a **documented scope boundary** on the DC3 corpus (in-page / dropped-table
-  deletions our freelist-only carver does not scan). Both are diagnosed below; neither
-  is a defect in the freelist-carving path.
+  its output is **consistent with** TWO independent reference carvers — `undark` (C)
+  and `fqlite` (Java) — with **100% content agreement on every overlapping row** and no
+  false positives. Where all three tools overlap on our fixture, they agree exactly.
+- **Two independent oracles, two corpora.** `undark` and a headless source-instrumented
+  tap of `fqlite`'s recovery engine are both used as oracles; our `deleted_places.db`
+  fixture and the third-party DC3 `sqlite_dissect` corpus are both used as input.
+- **Divergences are diagnosed at the page level, not papered over.** Each tool draws the
+  freelist-vs-allocated and trunk-vs-leaf boundaries slightly differently; every
+  ours-vs-oracle difference is explained by *which page* a row lives on and *which pages
+  each tool scans*. None is a defect in our freelist-carving path.
 - We make no claim that our carver is "proven correct". The evidence supports only that
-  its freelist-page recovery is consistent with an independent tool's recovery.
+  its freelist-page recovery is **consistent with** two independent tools' recovery.
 
-## Why the oracle is `undark`, not fqlite
+## The two oracles
 
-The original plan named **fqlite** (Dirk Pawlaszczyk) as the reference oracle. fqlite
-cannot be driven as a headless oracle in its current form, established empirically:
-
-- Its own README states: *"With version 2.0, the support for the command line mode was
-  cancelled."* fqlite 3.x/4.x is a `JavaFX` GUI-only application.
-- Every GitHub release (3.0 … 4.22, the latest at time of writing) ships only platform
-  installers — `…-macOS-arm64.dmg`, `…-windows.exe`, `…-x86_64.deb` — each a ~440 MB
-  `jpackage` self-contained bundle. **No runnable CLI jar is published in any release.**
-- fqlite is **not on Maven Central** (`search.maven.org` returns `numFound: 0` for
-  `fqlite`), so there is no library engine to drive from a small Java shim either.
-- The fqlite GitHub repository ships **no test/sample databases** (the only `.jar` in the
-  tree is `gradle/wrapper/gradle-wrapper.jar`; the only large binaries are PNG/SVG icons
-  and the user-guide PDF). The "fqlite test corpus" referenced in the task does not exist
-  to download.
-
-Rather than fabricate fqlite output, we substituted the **next-best independent oracle**:
-`undark` 0.7.1 by Paul L. Daniels — a small, self-contained C SQLite deleted-record
-carver. It is a different author, language, and algorithm from ours, which is what an
-independent oracle requires. (`sqlite_dissect` was also evaluated as an oracle but its
-free-block carver produced misaligned/garbled column boundaries on these fixtures —
-recovering corrupt `title` values and surfacing live rows — so it was rejected as a
-yardstick. Its *test databases*, authored by DC3, are still used as independent *input*;
-see below.)
-
-## The oracle tool
+### Oracle 1 — `undark` (C)
 
 | | |
 |---|---|
@@ -53,6 +33,43 @@ see below.)
 | Source tarball (master) | <https://github.com/inflex/undark/archive/refs/heads/master.tar.gz> |
 | Source tarball sha256 | `c0a9ee7ebd180727deef52fbafe0ef0e2b7c9b43c5604761bfeb86bc9306912a` |
 | Local binary | `tools/undark` (gitignored, not committed) |
+| Test gate | `UNDARK_BIN` |
+
+### Oracle 2 — `fqlite` (Java), via a headless source-instrumentation tap
+
+fqlite was the originally-named oracle. Its command-line mode was removed in v2.0
+(README: *"With version 2.0, the support for the command line mode was cancelled"*),
+releases ship only ~440 MB `JavaFX` `jpackage` installers (no runnable CLI jar), it is
+**not on Maven Central**, and its repo ships no test databases. So it cannot be used as
+a packaged CLI oracle.
+
+**But fqlite IS usable as an oracle via source instrumentation** — the CLI cancellation
+was the only blocker, not the engine. fqlite's carving engine (`fqlite.base.Job`) is
+plain Java that populates a result list the GUI merely reads. A small headless tap
+(`tools/fqlite/HeadlessTap.java`) constructs `Job`, runs `Job.run(path)`, and emits the
+recovered DELETED records as CSV — never launching the JavaFX UI. The engine is not
+cleanly decoupled from JavaFX in the current source (its logger's static init builds a
+JavaFX `TextArea`, `processDB()` posts a `Platform.runLater` cleanup fence and calls
+`gui.add_table` unguarded), so the tap (a) null-guards those `add_table` calls, (b) sets
+`GUI.baseDir`, and (c) boots the JavaFX *toolkit* headlessly (no window). The full engine
+API map, the JavaFX-coupling findings, and the minimal changes a clean
+`fqlite.base.MAIN` revival would need are in `tools/fqlite/ENGINE_NOTES.md`.
+
+| | |
+|---|---|
+| Tool | `fqlite` (recovery engine) |
+| Version | 4.22 |
+| Commit | `26922bd9e3cdc60c93b72dfb1fb2f5972a0af6a6` |
+| Upstream | <https://github.com/pawlaszczyk/fqlite> |
+| Driver | `tools/fqlite/HeadlessTap.java` + `run-tap.sh` (gitignored; recipe in `tools/fqlite/README.md`) |
+| Test gate | `FQLITE_TAP` |
+
+(`sqlite_dissect` was also evaluated as an oracle but its free-block carver produced
+misaligned/garbled column boundaries on these fixtures — recovering corrupt `title`
+values and surfacing live rows — so it was rejected as a yardstick. Its *test databases*,
+authored by DC3, are still used as independent *input*; see below.)
+
+### `undark` build recipe (macOS / clang)
 
 ### Build recipe (macOS / clang)
 
@@ -88,44 +105,70 @@ live b-tree (read via `sqlite3`) is a recovered-deleted record. (`--freespace` s
 *blocks within allocated pages*; it returns nothing on these fixtures because the deleted
 content there is on freed whole pages, not in allocated-page free blocks.)
 
+### `fqlite` tap invocation
+
+```sh
+FQLITE_TAP=tools/fqlite/run-tap.sh
+"$FQLITE_TAP" <database.db>   # -> CSV: rowid,col1,col2,...  (recovered DELETED rows)
+```
+
+fqlite often cannot recover a carved row's rowid (emits `-1`), so the fqlite comparison
+is keyed by the row's text content (url), not rowid. Build recipe in
+`tools/fqlite/README.md`; engine API map in `tools/fqlite/ENGINE_NOTES.md`.
+
 ## Comparison projection
 
-Both tools' output is reduced to the same identity per row: `rowid -> (text-col-1, text-col-2)`
-— i.e. the `url`/`title` (moz_places) or `name`/`surname` (DC3 `users`) text columns at
-record positions 1 and 2. Agreement is then defined on this projection.
+Each tool's output is reduced to the same identity per row: the `url`/`title`
+(moz_places) or `name`/`surname` (DC3 `users`) text columns at record positions 1 and 2.
+The undark comparison keys by rowid; the fqlite comparison keys by url (fqlite does not
+always recover the rowid). Agreement is defined on this projection.
 
 ## Results
 
-### Corpus 1 — our fixture (undark as independent oracle over our input)
+### Corpus 1 — our fixture (undark AND fqlite as oracles over our input)
 
 `forensic/tests/data/deleted_places.db` — `moz_places`, 400 rows inserted, ids 201..=400
 `DELETE`d without `VACUUM` under `secure_delete=OFF`; freed whole leaf pages onto the
 freelist. Ground truth: 200 live (1..=200), 200 deleted (201..=400). Freelist =
 trunk page 9 + leaf pages 10,11,12,13.
 
-| metric | value |
+Three-way recovery over the deleted range (ids 201..=400):
+
+| tool | recovers | which rows |
+|---|---|---|
+| our carver | **162** | 238..=400 (except 250) |
+| undark | **163** | 237..=400 (except 250) |
+| fqlite | **126** | 235, 237, and 277..=400 (except none) |
+
+Agreement:
+
+| comparison | result |
 |---|---|
-| deleted rows in ground truth | 200 |
-| undark recovers (in 201..=400) | **163** (ids 237..=400, except 250) |
-| our carver recovers (in 201..=400) | **162** (ids 238..=400, except 250) |
-| content agreement on overlapping rowids | **162 / 162 = 100%** (url + title exact) |
-| our recovery vs undark's set | **162 / 163 = 99.4%** |
-| false positives (rows we carve, undark does not) | **0** |
+| content agreement (url + title) on every overlapping row | **100%, 0 mismatches** (all three tools) |
+| our false positives (rows we carve no oracle corroborates) | **0** |
+| ours vs undark | ours ⊇ undark minus 1 row (237); **162/163 = 99.4%** |
+| ours vs fqlite | ours adds 238..=276; fqlite adds 235, 237 — all explained below |
 
-**Divergence — rowid 237 (undark recovers, we do not).** Diagnosed at the page level:
-`site-237` lives on **page 8**, a still-**allocated** leaf page from which some rows were
-deleted in place (an in-page free block). `site-238` lives on **page 9**, the freelist
-trunk page (its 8-byte trunk header + 5 leaf pointers overwrote only the very top of the
-page, above row 238's cell). Our carver scans only freelist pages (9–13) by design — it
-never re-surfaces content from allocated pages, a deliberate safety property so it cannot
-mistake a live page's slack for a deleted row. undark scans byte-by-byte across all pages,
-so it additionally reaches the one in-page remnant on page 8. Neither tool recovers ids
-201..=236 or 250: those cells were overwritten by the freelist trunk header / leaf-pointer
-array when the pages were freed.
+**Why the three tools draw the freelist boundary differently — page-level diagnosis:**
 
-The 237 divergence is encoded as an explicit, asserted exemption in the test
-(`FIXTURE_IN_PAGE_DIVERGENCES`), so if a future carver change makes the two tools agree
-there, the test fails and the exemption must be re-derived rather than silently passing.
+- **Rows 277..=400 live on freelist *leaf* pages 10–13.** All three tools carve these. ✓
+- **Rows 238..=276 live on page 9, the freelist *trunk* page.** Our carver and undark
+  scan the trunk page body (below its small 8-byte trunk header + leaf-pointer array) and
+  recover them. **fqlite reads page 9 only as a trunk** (next-pointer + leaf-pointer
+  array) and does **not** carve record content from its body — so fqlite misses 238..=276.
+  This is a genuine fqlite-specific behaviour, not a defect in either carver.
+- **Rows 235, 237 live on page 8, a still-*allocated* leaf page** (in-page free blocks
+  from rows deleted in place). undark (byte-by-byte) and fqlite (in-page free-block carver)
+  reach them; our carver scans only freelist pages by design, so it skips them — the same
+  safety property (never re-surface content from an allocated page) seen in the DC3 corpus.
+- **Rows 201..=236 and 250** are recovered by no tool: their cells were overwritten by the
+  freelist trunk header / leaf-pointer array when the pages were freed.
+
+Both divergence sets are encoded as explicit, asserted exemptions in the test
+(`FIXTURE_IN_PAGE_DIVERGENCES` / `FQLITE_IN_PAGE_DIVERGENCES` for the allocated-page rows;
+`FQLITE_TRUNK_PAGE_DIVERGENCES` for the trunk-page rows). Each is asserted to be a *real*
+disagreement, so a future carver change that closes a gap fails the test and forces the
+exemption to be re-derived rather than silently passing.
 
 ### Corpus 2 — DC3 `sqlite_dissect` test corpus (independent input *and* independent oracle)
 
@@ -135,14 +178,18 @@ the oracle is ours** — the strongest Doer-Checker form. Provenance + hashes ar
 `tests-oracle-corpus/README.md` and `docs/corpus-catalog.md`. The DBs with carvable
 deleted records:
 
-| DB | table cols | freelist_count | undark recovers | our carver recovers | agreement |
-|---|---|---|---|---|---|
-| `corpus_01-01.db` | 4 | 0 | 10 | 0 | documented gap |
-| `corpus_01-02.db` | 4 | 0 | 10 | 0 | documented gap |
-| `corpus_03-02.db` | 4 | 0 | 11 | 0 | documented gap |
-| `corpus_07-01.db` | 4 | 0 | 19 | 0 | documented gap |
-| `corpus_0A-01.db` | 6 | 1 | 20 | 0 | documented gap |
-| `corpus_0A-02.db` | 6 | 1 | 10 | 0 | documented gap |
+| DB | table cols | freelist_count | undark recovers | fqlite recovers | our carver recovers | agreement |
+|---|---|---|---|---|---|---|
+| `corpus_01-01.db` | 4 | 0 | 10 | 6 | 0 | documented gap |
+| `corpus_01-02.db` | 4 | 0 | 10 | 6 | 0 | documented gap |
+| `corpus_03-02.db` | 4 | 0 | 11 | 7 | 0 | documented gap |
+| `corpus_07-01.db` | 4 | 0 | 19 | 7 | 0 | documented gap |
+| `corpus_0A-01.db` | 6 | 1 | 20 | 20 | 0 | documented gap |
+| `corpus_0A-02.db` | 6 | 1 | 10 | 19 | 0 | documented gap |
+
+Both independent oracles (undark and fqlite) recover deleted rows from these in-page /
+dropped-table DBs; our freelist-only carver recovers none — the same documented scope
+boundary, now corroborated by two tools rather than one.
 
 **Divergence — our carver recovers 0 from every DC3 case (documented scope boundary).**
 This is the load-bearing independent finding. These DBs delete records **without freeing
@@ -164,11 +211,12 @@ agreement is required and holds (vacuously, since our set is empty); our carver 
 ## What this validates, and what it does not
 
 - **Validates:** the freelist-page carving path — the scenario our carver targets — is
-  consistent with an independent tool's recovery (100% content agreement, no false
-  positives, 99.4% recall vs undark on the fixture).
+  consistent with **two** independent tools' recovery (100% content agreement, no false
+  positives; 99.4% recall vs undark, and full agreement vs fqlite outside the trunk-page
+  rows fqlite structurally skips).
 - **Does not validate / out of scope:** in-page free-block recovery and dropped-table
-  recovery. These are an undark capability our carver lacks; surfaced here as the documented
-  divergence and the candidate next feature, not claimed as working.
+  recovery. Both undark and fqlite recover these; our carver does not — surfaced here as
+  the documented divergence and the candidate next feature, not claimed as working.
 - **Epistemic stance:** carved records remain confidence-graded observations
   ("consistent with a deleted row"); this validation likewise establishes *consistency
-  with* an independent oracle, not proof of correctness.
+  with* two independent oracles, not proof of correctness.

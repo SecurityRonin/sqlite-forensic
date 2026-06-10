@@ -1,1 +1,11 @@
 /target
+
+# Independent oracle tooling (not committed — provenance recorded in docs/validation.md
+# and docs/corpus-catalog.md; see tools/README provenance there).
+/tools/
+
+# Third-party validation corpus: the DBs are NOT committed (provenance + hashes
+# recorded in tests-fqlite-corpus/README.md and docs/corpus-catalog.md), but the
+# README that records that provenance IS committed.
+/tests-fqlite-corpus/*
+!/tests-fqlite-corpus/README.md

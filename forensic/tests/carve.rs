@@ -1,4 +1,4 @@
-//! Deleted-record carving validation against a REAL browser-style SQLite
+//! SMOKE test for deleted-record carving over a REAL browser-style SQLite
 //! (`moz_places`, `secure_delete=OFF`; see `docs/corpus-catalog.md`). Rows with
 //! id 201..=400 were `DELETE`d without `VACUUM`, freeing whole leaf pages onto
 //! the freelist whose old cell content (the deleted records) survives intact.
@@ -7,27 +7,39 @@
 //! returns the 200 live rows; the native carver recovers the deleted ones from
 //! the freed pages. Recovered rows are confidence-graded observations, never
 //! assertions.
+//!
+//! # NOT the authoritative validation
+//!
+//! This file is self-referential: the fixture, the carver, and these assertions
+//! are all ours, so it can only smoke-test that the pipeline runs and that a
+//! couple of known rows come back verbatim — it cannot prove correctness against
+//! an independent reference. The authoritative, Doer-Checker validation lives in
+//! `forensic/tests/fqlite_oracle.rs` (differential reconciliation against the
+//! independent `undark` carver and the DC3 `sqlite_dissect` corpus) and is
+//! written up in `docs/validation.md`. The former magic-number assertion
+//! (`carved.len() >= 150`) is intentionally gone: it dressed an arbitrary
+//! threshold up as validation. Completeness is now measured against the oracle.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use sqlite_core::{Database, Value};
 use sqlite_forensic::{carve_deleted_records, AnomalyKind};
 
-const DB: &[u8] = include_bytes!("data/deleted_places.db");
+const DB: &[u8] = include_bytes!("../../tests/data/deleted_places.db");
 const MOZ_PLACES_COLS: usize = 6;
 
 #[test]
-fn recovers_deleted_rows_from_freed_pages() {
+fn smoke_recovers_deleted_rows_from_freed_pages() {
     let db = Database::open(DB.to_vec()).expect("open deleted_places.db");
     let carved = carve_deleted_records(&db, MOZ_PLACES_COLS);
 
-    // The 200 deleted rows (ids 201..=400) lived on the freed pages; we should
-    // recover a substantial majority of them (allowing for the few bytes the
-    // freelist trunk header overwrote at the top of one freed page).
+    // Smoke bound only: the carver must produce a non-trivial result on a fixture
+    // known to hold ~200 deleted rows. The actual completeness claim (vs. the
+    // undark oracle) is asserted in `fqlite_oracle.rs`, NOT here — do not treat
+    // this loose lower bound as validation.
     assert!(
-        carved.len() >= 150,
-        "expected to carve the bulk of the 200 deleted rows, got {}",
-        carved.len()
+        !carved.is_empty(),
+        "carver returned nothing on a fixture with ~200 deleted rows"
     );
 
     // Every carved record is marked unallocated with provenance.

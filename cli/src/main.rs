@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use sqlite4n6::{filter_by_confidence, render_audit, render_carve, MinConfidence, OutputFormat};
+use sqlite4n6::{
+    carve_wal_snapshots, filter_by_confidence, render_audit, render_carve,
+    render_carve_with_snapshot, MinConfidence, OutputFormat,
+};
 use sqlite_core::Database;
 use sqlite_forensic::{audit, carve_all_deleted_records};
 
@@ -89,6 +92,15 @@ struct CarveArgs {
     /// Drop records below this confidence level.
     #[arg(long, value_enum, default_value = "info")]
     min_confidence: ConfidenceArg,
+
+    /// Explicit path to the `-wal` sidecar (overrides auto-detection).
+    #[arg(long, value_name = "WAL")]
+    wal: Option<PathBuf>,
+
+    /// Carve the on-disk image ONLY — ignore any `-wal` sidecar (single view, no
+    /// snapshot column).
+    #[arg(long, conflicts_with = "wal")]
+    no_wal: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -128,12 +140,57 @@ fn open_db(db_path: &Path) -> Result<Database, String> {
     Database::open(bytes).map_err(|e| format!("cannot parse database {}: {e:?}", db_path.display()))
 }
 
+/// The `-wal` sidecar to use for `carve`, applying the resolution policy:
+/// `--no-wal` disables it; an explicit `--wal` wins; otherwise auto-detect the
+/// conventional `<db>-wal` sidecar when it exists on disk. Returns the path only
+/// when a WAL is actually in play (and present).
+fn resolve_wal_path(args: &CarveArgs) -> Option<PathBuf> {
+    if args.no_wal {
+        return None;
+    }
+    if let Some(explicit) = &args.wal {
+        return Some(explicit.clone());
+    }
+    // Auto-detect `<db>-wal` next to the database.
+    let mut name = args.db.as_os_str().to_owned();
+    name.push("-wal");
+    let candidate = PathBuf::from(name);
+    candidate.exists().then_some(candidate)
+}
+
 fn run_carve(args: &CarveArgs) -> Result<(), String> {
-    let db = open_db(&args.db)?;
-    let records = carve_all_deleted_records(&db);
-    let records = filter_by_confidence(records, args.min_confidence.into());
-    for line in render_carve(&records, args.format.into(), args.rowid_only) {
-        println!("{line}");
+    // Open the main file's owned bytes (never written back, no sidecar created).
+    let db_bytes = std::fs::read(&args.db)
+        .map_err(|e| format!("cannot read database {}: {e}", args.db.display()))?;
+
+    // A WAL is in play: open the WAL-applied view, enumerate every materializable
+    // state (on-disk base image, each commit snapshot, WAL-frame residue), and
+    // render with the snapshot (LSN) column.
+    if let Some(wal_path) = resolve_wal_path(args) {
+        let wal_bytes = std::fs::read(&wal_path)
+            .map_err(|e| format!("cannot read WAL {}: {e}", wal_path.display()))?;
+        let db = Database::open_with_wal(db_bytes, &wal_bytes)
+            .map_err(|e| format!("cannot parse database {}: {e:?}", args.db.display()))?;
+        let records = if let Some(timeline) = db.wal_timeline() {
+            carve_wal_snapshots(&db, &timeline)
+        } else {
+            // A present-but-empty/uncommitted WAL yields no timeline; fall back to
+            // the WAL-applied full carve (still LSN-labelled where possible).
+            carve_all_deleted_records(&db)
+        };
+        let records = filter_by_confidence(records, args.min_confidence.into());
+        for line in render_carve_with_snapshot(&records, args.format.into(), args.rowid_only) {
+            println!("{line}");
+        }
+    } else {
+        // On-disk-only view: single view, no snapshot column.
+        let db = Database::open(db_bytes)
+            .map_err(|e| format!("cannot parse database {}: {e:?}", args.db.display()))?;
+        let records = carve_all_deleted_records(&db);
+        let records = filter_by_confidence(records, args.min_confidence.into());
+        for line in render_carve(&records, args.format.into(), args.rowid_only) {
+            println!("{line}");
+        }
     }
     Ok(())
 }

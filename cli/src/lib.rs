@@ -7,8 +7,10 @@
 //! unit-testable. `main()` is the thin shell that only reads the evidence file
 //! and writes the rendered lines to stdout.
 
-use sqlite_core::Value;
-use sqlite_forensic::{Anomaly, CarvedRecord, RecoverySource};
+use sqlite_core::{Database, Value, WalTimeline};
+use sqlite_forensic::{
+    carve_all_deleted_records, carve_at_commit, Anomaly, CarvedRecord, RecoverySource,
+};
 
 /// Output rendering format, shared by `carve` and `audit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -65,6 +67,7 @@ pub fn recovery_source_token(source: RecoverySource) -> &'static str {
         RecoverySource::PriorVersion => "prior-version",
         RecoverySource::FreeblockReconstructed => "freeblock-reconstructed",
         RecoverySource::WalFrame => "wal-frame",
+        RecoverySource::CommitSnapshot => "commit-snapshot",
         // `RecoverySource` is #[non_exhaustive]: a future class renders as its
         // Debug form rather than panicking or mislabelling.
         _ => "other", // cov:unreachable: all RecoverySource variants known at build time are matched above
@@ -167,6 +170,87 @@ fn values_json_array(values: &[Value]) -> String {
     format!("[{}]", parts.join(","))
 }
 
+// ---- WAL N-snapshot enumeration --------------------------------------------
+
+/// The snapshot / LSN label for a carved record — the view it was recovered from.
+///
+/// - `on-disk` — the main file's base-image view (no WAL provenance).
+/// - `commit:(salt1,salt2,commit_frame_index)` — a materialized commit snapshot.
+/// - `wal-frame:(salt1,salt2,frame_index)` — uncheckpointed WAL-frame residue.
+///
+/// The `(salt1, salt2, …)` triple is the salt-qualified LSN: a bare frame index is
+/// meaningless across checkpoint resets, so the label always carries the salts.
+#[must_use]
+pub fn snapshot_label(rec: &CarvedRecord) -> String {
+    match (rec.source, rec.wal.as_ref()) {
+        (RecoverySource::CommitSnapshot, Some(w)) => {
+            format!("commit:({},{},{})", w.salt1, w.salt2, w.frame_index)
+        }
+        (RecoverySource::WalFrame, Some(w)) => {
+            format!("wal-frame:({},{},{})", w.salt1, w.salt2, w.frame_index)
+        }
+        // Every on-disk class (and any WAL record missing provenance) is the
+        // on-disk base-image view.
+        _ => "on-disk".to_string(),
+    }
+}
+
+/// Enumerate the N materializable WAL states and carve each, LSN-labelled.
+///
+/// With a `-wal` in play this carves EVERY materializable view — the on-disk base
+/// image, EACH commit snapshot of the timeline, and the WAL-frame residue — and
+/// returns the union, each record tagged so [`snapshot_label`] resolves its LSN.
+/// A record identical across views (same `rowid` + values) is collapsed to a
+/// single copy, keeping the highest-confidence / earliest-labelled instance, so a
+/// row is reported once rather than repeated per snapshot. The live-row precision
+/// filter inside each carve guarantees no live row is ever re-surfaced.
+#[must_use]
+pub fn carve_wal_snapshots(db: &Database, timeline: &WalTimeline) -> Vec<CarvedRecord> {
+    // (1) on-disk base image + (3) WAL-frame residue — both already produced by
+    // the full carver (carve_all_deleted_records carves the main pages and, when a
+    // WAL overlay is in effect, the WAL frames). On-disk records carry no WAL
+    // provenance → labelled `on-disk`; WAL-frame residue keeps its WalFrame tag.
+    let mut out: Vec<CarvedRecord> = carve_all_deleted_records(db);
+
+    // (2) EACH commit snapshot — the per-commit temporal states.
+    for snapshot in timeline.commit_snapshots() {
+        out.extend(carve_at_commit(db, timeline, snapshot.id()));
+    }
+
+    dedup_keep_earliest_label(out)
+}
+
+/// Collapse records identical in `(rowid, values)` to one, preferring the earliest
+/// snapshot label (a commit snapshot over the later wal-frame/on-disk view) and,
+/// within that, the highest confidence — so a deleted row carries the LSN of the
+/// earliest state it is recoverable in.
+fn dedup_keep_earliest_label(mut records: Vec<CarvedRecord>) -> Vec<CarvedRecord> {
+    // Rank: commit snapshot (earliest) < wal-frame < on-disk; tie-break high conf.
+    fn rank(rec: &CarvedRecord) -> u8 {
+        match rec.source {
+            RecoverySource::CommitSnapshot => 0,
+            RecoverySource::WalFrame => 1,
+            _ => 2,
+        }
+    }
+    records.sort_by(|a, b| {
+        rank(a).cmp(&rank(b)).then_with(|| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut kept: Vec<CarvedRecord> = Vec::new();
+    for rec in records.drain(..) {
+        let key = format!("{}:{:?}", rec.rowid, rec.values);
+        if seen.insert(key) {
+            kept.push(rec);
+        }
+    }
+    kept
+}
+
 // ---- carve rendering -------------------------------------------------------
 
 /// Render carved records as full output lines in the chosen format.
@@ -240,6 +324,89 @@ fn render_carve_jsonl(records: &[CarvedRecord]) -> Vec<String> {
                 rec.rowid,
                 recovery_source_token(rec.source),
                 rec.confidence,
+                values_json_array(&rec.values)
+            )
+        })
+        .collect()
+}
+
+// ---- carve rendering with the snapshot/LSN column --------------------------
+
+/// Render carved records WITH the `snapshot` (LSN) column — the N-snapshot WAL
+/// carve view. Mirrors [`render_carve`] but inserts the [`snapshot_label`] between
+/// the confidence and values columns across every format. `rowid_only` collapses
+/// to bare rowids exactly as [`render_carve`] does.
+#[must_use]
+pub fn render_carve_with_snapshot(
+    records: &[CarvedRecord],
+    format: OutputFormat,
+    rowid_only: bool,
+) -> Vec<String> {
+    if rowid_only {
+        return records.iter().map(|r| rowid_cell(r.rowid)).collect();
+    }
+    match format {
+        OutputFormat::Table => render_carve_snapshot_table(records),
+        OutputFormat::Csv => render_carve_snapshot_csv(records),
+        OutputFormat::Jsonl => render_carve_snapshot_jsonl(records),
+    }
+}
+
+fn render_carve_snapshot_table(records: &[CarvedRecord]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{:>6}  {:>8}  {:>8}  {:<24}  {:>5}  {:<40}  values",
+        "page", "offset", "rowid", "recovery_source", "conf", "snapshot"
+    )];
+    for rec in records {
+        let lead = carve_lead_cells(rec);
+        let values: Vec<String> = rec.values.iter().map(value_to_cell).collect();
+        lines.push(format!(
+            "{:>6}  {:>8}  {:>8}  {:<24}  {:>5}  {:<40}  {}",
+            lead[0],
+            lead[1],
+            lead[2],
+            lead[3],
+            lead[4],
+            snapshot_label(rec),
+            values.join(" | ")
+        ));
+    }
+    lines
+}
+
+fn render_carve_snapshot_csv(records: &[CarvedRecord]) -> Vec<String> {
+    let mut lines =
+        vec!["page,offset,rowid,recovery_source,confidence,snapshot,values".to_string()];
+    for rec in records {
+        let lead = carve_lead_cells(rec);
+        let values: Vec<String> = rec.values.iter().map(value_to_cell).collect();
+        let joined = values.join(" | ");
+        lines.push(format!(
+            "{},{},{},{},{},{},{}",
+            csv_escape(&lead[0]),
+            csv_escape(&lead[1]),
+            csv_escape(&lead[2]),
+            csv_escape(&lead[3]),
+            csv_escape(&lead[4]),
+            csv_escape(&snapshot_label(rec)),
+            csv_escape(&joined)
+        ));
+    }
+    lines
+}
+
+fn render_carve_snapshot_jsonl(records: &[CarvedRecord]) -> Vec<String> {
+    records
+        .iter()
+        .map(|rec| {
+            format!(
+                "{{\"page\":{},\"offset\":{},\"rowid\":{},\"recovery_source\":\"{}\",\"confidence\":{:.4},\"snapshot\":\"{}\",\"values\":{}}}",
+                rec.page,
+                rec.offset,
+                rec.rowid,
+                recovery_source_token(rec.source),
+                rec.confidence,
+                json_escape(&snapshot_label(rec)),
                 values_json_array(&rec.values)
             )
         })
@@ -549,7 +716,10 @@ mod tests {
 
         // WAL-frame residue (#60): labelled wal-frame:(salt1,salt2,frame_index).
         let frame = wal_rec(RecoverySource::WalFrame, 1);
-        assert_eq!(snapshot_label(&frame), "wal-frame:(3131615003,3836839008,1)");
+        assert_eq!(
+            snapshot_label(&frame),
+            "wal-frame:(3131615003,3836839008,1)"
+        );
     }
 
     #[test]
@@ -559,10 +729,22 @@ mod tests {
             wal_rec(RecoverySource::WalFrame, 1),
         ];
         let lines = render_carve_with_snapshot(&records, OutputFormat::Table, false);
-        assert!(lines[0].contains("snapshot"), "header has snapshot col: {}", lines[0]);
+        assert!(
+            lines[0].contains("snapshot"),
+            "header has snapshot col: {}",
+            lines[0]
+        );
         assert_eq!(lines.len(), 3);
-        assert!(lines[1].contains("commit:(3131615003,3836839008,0)"), "{}", lines[1]);
-        assert!(lines[2].contains("wal-frame:(3131615003,3836839008,1)"), "{}", lines[2]);
+        assert!(
+            lines[1].contains("commit:(3131615003,3836839008,0)"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("wal-frame:(3131615003,3836839008,1)"),
+            "{}",
+            lines[2]
+        );
     }
 
     #[test]
@@ -606,6 +788,37 @@ mod tests {
             recovery_source_token(RecoverySource::CommitSnapshot),
             "commit-snapshot"
         );
+    }
+
+    #[test]
+    fn dedup_collapses_identical_record_to_earliest_committed_label() {
+        // The SAME deleted row (rowid 130, identical values) surfaces in all three
+        // views; dedup keeps ONE copy carrying the earliest committed coordinate
+        // (commit snapshot over wal-frame over on-disk), exercising every rank arm
+        // including the on-disk `_` arm.
+        let values = vec![Value::Text("secret WAL body 130".into())];
+        let on_disk = rec(130, 0.95, RecoverySource::FreelistPage, values.clone());
+        let wal_frame = wal_rec(RecoverySource::WalFrame, 1);
+        let commit = wal_rec(RecoverySource::CommitSnapshot, 0);
+        // Feed them out of order so the sort (not input order) decides the winner.
+        let kept = dedup_keep_earliest_label(vec![on_disk, wal_frame, commit]);
+        assert_eq!(kept.len(), 1, "identical record collapses to one copy");
+        assert_eq!(kept[0].source, RecoverySource::CommitSnapshot);
+        assert_eq!(snapshot_label(&kept[0]), "commit:(3131615003,3836839008,0)");
+    }
+
+    #[test]
+    fn dedup_keeps_distinct_records_from_different_views() {
+        // Distinct rows (different rowid/values) are all kept.
+        let a = rec(
+            7,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Integer(7)],
+        );
+        let b = wal_rec(RecoverySource::CommitSnapshot, 0); // rowid 130
+        let kept = dedup_keep_earliest_label(vec![a, b]);
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]

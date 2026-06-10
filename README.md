@@ -23,6 +23,20 @@ $ sqlite4n6 carve History.db --min-confidence medium # drop low-confidence carve
 $ sqlite4n6 audit  History.db                        # graded anomaly findings
 ```
 
+When a `-wal` sidecar is present, `carve` auto-detects it and carves the **full per-commit WAL timeline** — every materializable state, each labelled with its log-sequence coordinate: the on-disk base image, **each commit snapshot** of the WAL, and the uncheckpointed WAL-frame residue. A row deleted late in a transaction history is still a live cell in an *earlier* commit's page image, so the snapshot column tells you the exact committed state a deleted row was last alive in. This is the real N-snapshot temporal model — not a two-point on-disk-vs-latest approximation.
+
+```console
+$ sqlite4n6 carve chat.db                            # auto-detects chat.db-wal
+  page    offset     rowid  recovery_source   conf  snapshot                            values
+     2      1581       130  commit-snapshot   0.90  commit:(3131615003,3836839008,0)    130 | bob | secret body 130
+     2      1261         ?  commit-snapshot   0.40  commit:(3131615003,3836839008,1)    NULL | NULL | ...
+
+$ sqlite4n6 carve chat.db --wal /path/to/chat.db-wal  # point at an explicit sidecar
+$ sqlite4n6 carve chat.db --no-wal                     # on-disk image only, no snapshot column
+```
+
+The `snapshot` column carries the salt-qualified LSN — `commit:(salt1,salt2,commit_frame_index)` for a committed snapshot, `wal-frame:(salt1,salt2,frame_index)` for raw frame residue, `on-disk` for the base image. A record identical across views is collapsed to its earliest committed coordinate. `--no-wal` carves the on-disk image alone (single view, no snapshot column). The evidence file and its sidecars are **never** written.
+
 Or drive the library directly — point the analyzer at the file bytes and get graded findings plus carved deleted records:
 
 ```rust
@@ -57,6 +71,7 @@ The reader (`sqlite-core`) answers *"what does this file actually contain?"*; th
 | Recover deleted rows from in-page free blocks | ✅ | — |
 | Recover dropped-table rows (column count inferred) | ✅ | — |
 | Read uncheckpointed WAL overlay as a separate view | ✅ | applied silently |
+| Carve every WAL commit snapshot, LSN-labelled (per-commit timeline) | ✅ | — |
 | Graded, confidence-scored anomaly findings | ✅ | — |
 | Refuses to ever re-surface a live row as "deleted" | ✅ | n/a |
 | `forbid(unsafe)`, panic-free on hostile input | ✅ | C / FFI |

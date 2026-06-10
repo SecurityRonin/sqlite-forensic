@@ -1291,6 +1291,18 @@ impl CommitSnapshot {
         }
     }
 
+    /// The 1-based page numbers this commit materialized (base ∪ committed frames
+    /// up to this commit, capped to `db_size_after_commit`), ascending.
+    ///
+    /// The carve-at-snapshot primitive iterates these to drive the carving
+    /// primitives over each page image, WITHOUT assuming the pages form a
+    /// contiguous `1..=db_size` range (a truncating commit or a sparse base image
+    /// can leave gaps). Every returned page resolves via [`Self::page_version`].
+    #[must_use]
+    pub fn page_numbers(&self) -> Vec<u32> {
+        self.overlaid.keys().copied().collect()
+    }
+
     /// The image of `page_no` as of this commit, or `None` for a page beyond the
     /// committed database size that the WAL never rewrote.
     #[must_use]

@@ -246,7 +246,7 @@ fn wal_frame_carve_recovers_wal_only_deleted_rows_with_provenance() {
 /// `carve_at_commit` carves the deleted residue of ONE materialized commit
 /// snapshot: it runs the in-page / freelist / freeblock carving over that
 /// commit's MATERIALIZED page images (base ∪ frames up to the commit, capped to
-/// db_size), applies the live-row precision filter, and tags every recovered
+/// `db_size`), applies the live-row precision filter, and tags every recovered
 /// record with the commit's `(salt1, salt2, commit_frame_index)` LSN.
 ///
 /// At the FIRST commit (the INSERT, cfi=0) rows 121..=140 are still live leaf

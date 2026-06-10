@@ -20,43 +20,68 @@ fn body(n: i64) -> Value {
     Value::Text(format!("secret WAL body {n}"))
 }
 
-/// The full enumeration surfaces all three view classes, each LSN-labelled, and
-/// the deleted ids 121..=140 appear at the INSERT-commit snapshot.
+/// The full enumeration carves every materializable state — both commit
+/// snapshots (the per-commit temporal model) plus the on-disk base image and the
+/// WAL-frame residue — and labels each record by its LSN. The deleted ids
+/// 121..=140 surface at the INSERT-commit snapshot, the earliest state in which
+/// they are still recoverable as intact rows.
+///
+/// DEDUP / PRESENTATION (documented): a record identical in `(rowid, values)`
+/// across views is collapsed to ONE copy carrying the EARLIEST label (a commit
+/// snapshot over the later wal-frame/on-disk view). On `wal_carve.db` the
+/// WAL-frame residue for 121..=140 is byte-identical to the INSERT-commit
+/// snapshot's cells, so it collapses INTO `commit:(…,0)` rather than appearing
+/// twice — the commit LSN is the meaningful temporal coordinate. A wal-frame /
+/// on-disk label therefore appears only for residue NO commit snapshot covers.
 #[test]
-fn carve_enumerates_on_disk_each_commit_and_wal_frame() {
+fn carve_enumerates_each_commit_snapshot_and_labels_by_lsn() {
     let db = Database::open_with_wal(MAIN.to_vec(), WAL).expect("open with wal");
     let tl = db.wal_timeline().expect("timeline present");
     let records = carve_wal_snapshots(&db, &tl);
+    assert!(!records.is_empty(), "WAL enumeration recovered records");
 
-    // The label set spans commit snapshots and wal-frame residue (and on-disk if any).
-    let labels: std::collections::HashSet<String> =
-        records.iter().map(snapshot_label).collect();
+    let labels: std::collections::HashSet<String> = records.iter().map(snapshot_label).collect();
     let lsn0 = tl.commit_snapshots()[0].lsn();
     let lsn1 = tl.commit_snapshots()[1].lsn();
-    assert!(
-        labels.contains(&format!("commit:({},{},{})", lsn0.salt1, lsn0.salt2, lsn0.frame_index)),
-        "first commit snapshot label present; saw {labels:?}"
+    let commit0 = format!(
+        "commit:({},{},{})",
+        lsn0.salt1, lsn0.salt2, lsn0.frame_index
     );
-    assert!(
-        labels.contains(&format!("commit:({},{},{})", lsn1.salt1, lsn1.salt2, lsn1.frame_index))
-            || records.iter().any(|r| r.source == RecoverySource::WalFrame),
-        "second commit and/or wal-frame residue present; saw {labels:?}"
-    );
-    assert!(
-        labels.iter().any(|l| l.starts_with("wal-frame:")),
-        "wal-frame residue label present; saw {labels:?}"
+    let commit1 = format!(
+        "commit:({},{},{})",
+        lsn1.salt1, lsn1.salt2, lsn1.frame_index
     );
 
-    // The deleted ids 121..=140 are recovered, at the INSERT-commit snapshot LSN.
-    let commit0 = format!("commit:({},{},{})", lsn0.salt1, lsn0.salt2, lsn0.frame_index);
-    for n in 121..=140 {
-        let at_first_commit = records.iter().any(|r| {
-            r.values.contains(&body(n)) && snapshot_label(r) == commit0
-        });
-        let anywhere = records.iter().any(|r| r.values.contains(&body(n)));
-        assert!(anywhere, "deleted id {n} recovered somewhere in the enumeration");
+    // BOTH commit snapshots are materialized and carved.
+    assert!(
+        labels.contains(&commit0),
+        "first commit label present; saw {labels:?}"
+    );
+    assert!(
+        labels.contains(&commit1),
+        "second commit label present; saw {labels:?}"
+    );
+
+    // Every label is a valid LSN form (commit:, wal-frame:, or on-disk) — no record
+    // is left unlabelled.
+    for l in &labels {
         assert!(
-            at_first_commit || records.iter().any(|r| r.values.contains(&body(n)) && r.source == RecoverySource::WalFrame),
+            l == "on-disk" || l.starts_with("commit:(") || l.starts_with("wal-frame:("),
+            "unexpected snapshot label form: {l}"
+        );
+    }
+
+    // The deleted ids 121..=140 are recovered at the INSERT-commit snapshot LSN
+    // (or, if not collapsed there, as wal-frame residue — both are honest).
+    for n in 121..=140 {
+        let at_first_commit = records
+            .iter()
+            .any(|r| r.values.contains(&body(n)) && snapshot_label(r) == commit0);
+        let as_wal_frame = records
+            .iter()
+            .any(|r| r.values.contains(&body(n)) && r.source == RecoverySource::WalFrame);
+        assert!(
+            at_first_commit || as_wal_frame,
             "deleted id {n} surfaces at the INSERT commit and/or as wal-frame residue"
         );
     }

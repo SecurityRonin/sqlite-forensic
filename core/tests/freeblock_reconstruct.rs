@@ -1,6 +1,6 @@
 //! Freeblock-aware in-page cell reconstruction, validated against the REAL
 //! Nemetz SQLite Forensic Corpus (DFRWS-EU 2018; CC0). See task #56 and
-//! `docs/recovery-comparison.md` ("The freeblock-prefix-clobber FN").
+//! `docs/recovery-comparison.md` ("Freeblock reconstruction").
 //!
 //! When SQLite frees an in-page cell it converts the cell into a **freeblock**:
 //! the cell's first four bytes are overwritten with the freeblock header (2-byte
@@ -26,7 +26,7 @@
 
 use sqlite_core::{Database, Value};
 
-/// 0C-01: in-page deletion, secure_delete=0, five integer columns. Page 2 holds
+/// 0C-01: in-page deletion, `secure_delete=0`, five integer columns. Page 2 holds
 /// six freeblocks (the six freed cells whose first four bytes were clobbered).
 const NEMETZ_0C_01: &[u8] = include_bytes!("../../tests/data/nemetz/0C/0C-01.db");
 

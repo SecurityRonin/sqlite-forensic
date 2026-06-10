@@ -295,6 +295,13 @@ pub enum RecoverySource {
     /// recovered values DIFFER from the current live row (e.g. an edited message
     /// or a changed amount), so it is genuine deleted content — the edit history.
     PriorVersion,
+    /// A record rebuilt by **freeblock reconstruction**: the freed cell's first
+    /// four bytes (payload-length + rowid varints, `header_len`, and the leading
+    /// serial type) were overwritten by SQLite's freeblock header, so the record
+    /// was rebuilt from its surviving serial-type tail plus a schema template. The
+    /// rowid is destroyed (surfaced as `0`), so this is the weakest in-page class
+    /// — a low-confidence "consistent with a deleted row" lead.
+    FreeblockReconstructed,
 }
 
 /// A deleted record recovered from unallocated space — the headline capability
@@ -425,6 +432,22 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
                 source: RecoverySource::InPageFreeBlock,
             });
         }
+        // (2b) Freeblock reconstruction: the freed cells whose first four bytes
+        // were clobbered by freeblock conversion, rebuilt from their surviving
+        // serial tail plus the page's schema template. These carry an unknown
+        // (destroyed) rowid, so the value-collision pass below — not the
+        // rowid-keyed filter — is what guarantees no live row is re-surfaced.
+        for cell in db.reconstruct_freeblock_records(page_bytes) {
+            out.push(CarvedRecord {
+                page,
+                offset: cell.offset,
+                rowid: cell.rowid,
+                values: cell.values,
+                confidence: cell.confidence,
+                allocated: false,
+                source: RecoverySource::FreeblockReconstructed,
+            });
+        }
     }
 
     // VALUE-AWARE classification for carved records whose rowid is currently
@@ -442,17 +465,30 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
     // A rowid-only filter cannot tell these apart and drops both (a false
     // negative on prior versions). Comparing decoded values does.
     let live = db.live_rows();
-    out.retain_mut(|rec| match live.get(&rec.rowid) {
-        // rowid not live → an ordinary deleted record (keep, source unchanged).
-        None => true,
-        // Same rowid: a byte-identical copy is a stale rebalance artifact (drop);
-        // differing values are a deleted prior version (keep, reclassified).
-        Some(live_values) => {
-            if &rec.values == live_values {
-                false
-            } else {
-                rec.source = RecoverySource::PriorVersion;
-                true
+    // Value-level identity of every live row, for collision-checking records whose
+    // rowid is unknown (freeblock reconstructions have a destroyed rowid, so the
+    // rowid-keyed filter below cannot protect against re-surfacing a live row).
+    let live_value_keys: std::collections::HashSet<String> =
+        live.values().map(|v| format!("{v:?}")).collect();
+    out.retain_mut(|rec| {
+        // Freeblock reconstructions carry an unknown rowid → guard by value: drop
+        // any whose decoded values match a currently-live row (never re-surface a
+        // live row), even though we cannot key it by rowid.
+        if rec.source == RecoverySource::FreeblockReconstructed {
+            return !live_value_keys.contains(&format!("{:?}", rec.values));
+        }
+        match live.get(&rec.rowid) {
+            // rowid not live → an ordinary deleted record (keep, source unchanged).
+            None => true,
+            // Same rowid: a byte-identical copy is a stale rebalance artifact (drop);
+            // differing values are a deleted prior version (keep, reclassified).
+            Some(live_values) => {
+                if &rec.values == live_values {
+                    false
+                } else {
+                    rec.source = RecoverySource::PriorVersion;
+                    true
+                }
             }
         }
     });

@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use sqlite_core::{Database, Value};
-use sqlite_forensic::{carve_all_deleted_records, RecoverySource};
+use sqlite_forensic::{carve_all_deleted_records, carve_at_commit, RecoverySource};
 
 const DELETED: &[u8] = include_bytes!("../../tests/data/deleted_places.db");
 /// Nemetz 0C-01: in-page deletion whose freed cells are freeblock-clobbered.
@@ -239,4 +239,88 @@ fn wal_frame_carve_recovers_wal_only_deleted_rows_with_provenance() {
             rec.values
         );
     }
+}
+
+// --- carve-at-snapshot primitive (#63) ---------------------------------------
+
+/// `carve_at_commit` carves the deleted residue of ONE materialized commit
+/// snapshot: it runs the in-page / freelist / freeblock carving over that
+/// commit's MATERIALIZED page images (base ∪ frames up to the commit, capped to
+/// db_size), applies the live-row precision filter, and tags every recovered
+/// record with the commit's `(salt1, salt2, commit_frame_index)` LSN.
+///
+/// At the FIRST commit (the INSERT, cfi=0) rows 121..=140 are still live leaf
+/// cells in page 2's image — they are deleted only at the SECOND commit, so the
+/// earlier snapshot is the state in which they are recoverable as intact rows.
+#[test]
+fn carve_at_first_commit_recovers_rows_deleted_only_later() {
+    let db =
+        Database::open_with_wal(WAL_CARVE_MAIN.to_vec(), WAL_CARVE_WAL).expect("open with wal");
+    let tl = db.wal_timeline().expect("timeline present");
+    let snaps = tl.commit_snapshots();
+    assert_eq!(snaps.len(), 2, "wal_carve has two commit snapshots");
+
+    let first = snaps[0].id();
+    let carved = carve_at_commit(&db, &tl, first);
+
+    // Rows 121..=140 (deleted at the SECOND commit) are recovered at the FIRST.
+    let recovered: Vec<i64> = (121..=140)
+        .filter(|&n| carved.iter().any(|c| c.values.contains(&deleted_body(n))))
+        .collect();
+    assert!(
+        recovered.len() >= 15,
+        "carve@first-commit must recover rows alive then, deleted later; got {recovered:?}"
+    );
+
+    // Every recovered record is tagged with the FIRST commit's LSN, not the
+    // second's: salts match the segment, frame_index == the commit's frame index.
+    let lsn = snaps[0].lsn();
+    for rec in &carved {
+        let prov = rec.wal.as_ref().expect("snapshot record carries WAL LSN");
+        assert_eq!(prov.salt1, lsn.salt1, "salt1 matches the commit's segment");
+        assert_eq!(prov.salt2, lsn.salt2, "salt2 matches the commit's segment");
+        assert_eq!(
+            prov.frame_index, lsn.frame_index,
+            "frame_index is the COMMIT's frame index, labelling which snapshot"
+        );
+    }
+}
+
+/// 0-FALSE-POSITIVE: even though every row 1..=50, 101..=150 is a live leaf cell
+/// in the first commit's page image, `carve_at_commit` must NEVER re-surface a
+/// row that is live in the final WAL-applied view (101..=120, 141..=150 survive,
+/// 1..=50 survive). Only the genuinely-deleted rows come back.
+#[test]
+fn carve_at_commit_never_resurfaces_a_live_row() {
+    let db =
+        Database::open_with_wal(WAL_CARVE_MAIN.to_vec(), WAL_CARVE_WAL).expect("open with wal");
+    let tl = db.wal_timeline().expect("timeline present");
+    let live = db.live_rows();
+
+    for snap in tl.commit_snapshots() {
+        let carved = carve_at_commit(&db, &tl, snap.id());
+        for rec in &carved {
+            let collides = live.values().any(|lv| lv == &rec.values);
+            assert!(
+                !collides,
+                "carve@commit cfi={} re-surfaced a LIVE row: {:?}",
+                snap.id().commit_frame_index,
+                rec.values
+            );
+        }
+    }
+}
+
+/// An unknown `CommitId` (not in the timeline) yields no records — never a panic.
+#[test]
+fn carve_at_unknown_commit_is_empty_not_a_panic() {
+    let db =
+        Database::open_with_wal(WAL_CARVE_MAIN.to_vec(), WAL_CARVE_WAL).expect("open with wal");
+    let tl = db.wal_timeline().expect("timeline present");
+    let mut bogus = tl.commit_snapshots()[0].id();
+    bogus.commit_frame_index = 9999;
+    assert!(
+        carve_at_commit(&db, &tl, bogus).is_empty(),
+        "unknown CommitId must carve nothing"
+    );
 }

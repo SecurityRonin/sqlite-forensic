@@ -112,6 +112,38 @@ fn materialize_first_commit_holds_rows_before_the_delete() {
 }
 
 #[test]
+fn snapshot_enumerates_its_materialized_page_numbers() {
+    // The carve-at-snapshot primitive (task #63) needs to iterate a snapshot's
+    // page images WITHOUT assuming the page numbers are a contiguous 1..=db_size
+    // range. `page_numbers()` returns exactly the pages the snapshot materialized
+    // (base ∪ committed frames, capped to db_size_after_commit), ascending, and
+    // every one must resolve via `page_version`.
+    let db = Database::open_with_wal(CARVE_MAIN.to_vec(), CARVE_WAL).expect("open with wal");
+    let tl = db.wal_timeline().expect("timeline present");
+    let snaps = tl.commit_snapshots();
+
+    for snap in snaps {
+        let pages = snap.page_numbers();
+        // Ascending, no duplicates.
+        assert!(
+            pages.windows(2).all(|w| w[0] < w[1]),
+            "page numbers ascending & unique: {pages:?}"
+        );
+        // Every enumerated page resolves to an image.
+        for &p in &pages {
+            assert!(
+                snap.page_version(p).is_some(),
+                "page {p} enumerated but page_version returned None"
+            );
+            assert!(p <= snap.db_size_after_commit(), "page {p} within db size");
+        }
+    }
+    // wal_carve.db: both commits materialize pages 1 and 2 exactly.
+    assert_eq!(snaps[0].page_numbers(), vec![1, 2]);
+    assert_eq!(snaps[1].page_numbers(), vec![1, 2]);
+}
+
+#[test]
 fn materialize_by_commit_id_is_stable() {
     let db = Database::open_with_wal(CARVE_MAIN.to_vec(), CARVE_WAL).expect("open with wal");
     let tl = db.wal_timeline().expect("timeline present");

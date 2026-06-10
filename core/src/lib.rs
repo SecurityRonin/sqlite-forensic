@@ -76,6 +76,25 @@ pub struct Row {
     pub values: Vec<Value>,
 }
 
+/// A record-shaped cell recovered from unallocated / free space by
+/// [`Database::carve_cells`]. Carries the decoded row plus enough provenance for
+/// the analyzer to grade it as a "consistent with a deleted row" observation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarvedCell {
+    /// Byte offset of the cell within the page slice that was scanned.
+    pub offset: usize,
+    /// Total bytes the candidate cell occupies (cell header + payload), so the
+    /// scanner can skip past a recovered record.
+    pub byte_len: usize,
+    /// Decoded rowid varint.
+    pub rowid: i64,
+    /// Decoded column values, in column order.
+    pub values: Vec<Value>,
+    /// Heuristic confidence in `(0.0, 1.0]` that these bytes are a real record
+    /// rather than a coincidental match.
+    pub confidence: f32,
+}
+
 /// Parsed 100-byte `SQLite` file header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -251,6 +270,50 @@ impl Database {
             trunk = next;
         }
         Ok(free)
+    }
+
+    /// Raw bytes of the 1-based `page` from the **main file only**, ignoring any
+    /// WAL overlay. Carving wants the on-disk page (where deleted residue lives),
+    /// not the WAL-applied view. Returns `None` for page 0 or out-of-range pages.
+    #[must_use]
+    pub fn raw_page(&self, page: u32) -> Option<&[u8]> {
+        if page == 0 {
+            return None;
+        }
+        let ps = self.header.page_size as usize;
+        let start = (page as usize - 1).checked_mul(ps)?;
+        let end = start.checked_add(ps)?;
+        self.bytes.get(start..end)
+    }
+
+    /// Scan a slice of page bytes for record-shaped table-leaf cells of exactly
+    /// `column_count` columns, recovering each as a [`CarvedCell`].
+    ///
+    /// This is the carving primitive the forensic analyzer drives over free /
+    /// unallocated regions: at every byte offset it speculatively parses a
+    /// `payload_len` varint, a `rowid` varint, and a record header, accepting the
+    /// candidate only when the serial-type count matches `column_count`, the
+    /// declared lengths stay within the slice, and every value decodes. Strict
+    /// validation keeps the false-positive rate low; `confidence` reflects how
+    /// strongly the bytes are record-shaped. Bounded: each offset does O(record)
+    /// work and the scan is linear in the slice length.
+    #[must_use]
+    pub fn carve_cells(&self, page_bytes: &[u8], column_count: usize) -> Vec<CarvedCell> {
+        let mut out = Vec::new();
+        if column_count == 0 {
+            return out;
+        }
+        let mut off = 0usize;
+        while off < page_bytes.len() {
+            if let Some(cell) = try_carve_cell_at(page_bytes, off, column_count) {
+                // Skip past this record to avoid re-reporting sub-slices of it.
+                off += cell.byte_len.max(1);
+                out.push(cell);
+            } else {
+                off += 1;
+            }
+        }
+        out
     }
 
     /// Walk a single table b-tree rooted at `root_page` (1-based) and collect
@@ -525,6 +588,95 @@ impl WalOverlay {
             Ok(Some(WalOverlay { pages: committed }))
         }
     }
+}
+
+/// The body byte-width of a serial type (file-format §2.1), or `None` for a
+/// serial value that cannot legally appear in a record body.
+fn serial_body_len(serial: i64) -> Option<usize> {
+    match serial {
+        0 | 8 | 9 | 10 | 11 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(3),
+        4 => Some(4),
+        5 => Some(6),
+        6 | 7 => Some(8),
+        n if n >= 12 => Some(((n - 12) / 2) as usize),
+        _ => None, // negative serial: impossible
+    }
+}
+
+/// Attempt to recognize a table-leaf cell at `off` in `buf` as a record of
+/// exactly `column_count` columns. Returns a [`CarvedCell`] only when the bytes
+/// are self-consistently record-shaped; otherwise `None` (a non-match at this
+/// offset). Never panics — every access is bounds-checked.
+fn try_carve_cell_at(buf: &[u8], off: usize, column_count: usize) -> Option<CarvedCell> {
+    // Cell prefix: payload_len varint, rowid varint.
+    let (payload_len, n1) = read_varint(buf, off).ok()?;
+    let payload_len = usize::try_from(payload_len).ok()?;
+    if payload_len == 0 {
+        return None;
+    }
+    let (rowid, n2) = read_varint(buf, off + n1).ok()?;
+    // A negative rowid is legal but vanishingly rare for browser tables; treat a
+    // non-positive rowid as a non-match to suppress coincidental hits.
+    if rowid <= 0 {
+        return None;
+    }
+    let payload_start = off + n1 + n2;
+    let payload = buf.get(payload_start..payload_start + payload_len)?;
+
+    // Record header: header_len varint, then one serial type per column.
+    let (header_len, hn) = read_varint(payload, 0).ok()?;
+    let header_len = usize::try_from(header_len).ok()?;
+    if header_len > payload.len() || header_len < hn {
+        return None;
+    }
+    let mut serials = Vec::with_capacity(column_count);
+    let mut hpos = hn;
+    while hpos < header_len {
+        let (s, used) = read_varint(payload, hpos).ok()?;
+        serials.push(s);
+        hpos += used;
+    }
+    // Exactly the right column count, and the header consumed cleanly.
+    if serials.len() != column_count || hpos != header_len {
+        return None;
+    }
+
+    // Body length implied by the serial types must equal payload_len - header_len
+    // — a strong self-consistency check that rejects coincidental matches.
+    let mut body_len = 0usize;
+    for &s in &serials {
+        body_len += serial_body_len(s)?;
+    }
+    if header_len + body_len != payload_len {
+        return None;
+    }
+
+    // Decode the record (reusing the live decoder for storage-class fidelity).
+    let values = decode_record(payload, column_count, rowid).ok()?;
+    if values.len() != column_count {
+        return None; // cov:unreachable: decode_record yields one value per serial
+    }
+
+    // Confidence: a fully self-consistent record already passed strong checks;
+    // raise confidence when at least one column is a non-empty, valid-UTF-8 TEXT
+    // (record-shaped *and* human-meaningful), which coincidental byte runs rarely
+    // satisfy.
+    let has_real_text = values.iter().any(|v| match v {
+        Value::Text(t) => !t.is_empty() && !t.contains('\u{FFFD}'),
+        _ => false,
+    });
+    let confidence = if has_real_text { 0.9 } else { 0.6 };
+
+    Some(CarvedCell {
+        offset: off,
+        byte_len: (payload_start + payload_len) - off,
+        rowid,
+        values,
+        confidence,
+    })
 }
 
 /// Parse + validate the 100-byte file header.

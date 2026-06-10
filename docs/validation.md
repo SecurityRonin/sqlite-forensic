@@ -1,9 +1,22 @@
 # Differential Validation — Deleted-Record Carving
 
-This document is the Doer-Checker evidence for `sqlite_forensic::carve_deleted_records`.
-It records how our carver's output was reconciled against an **independent reference
-tool** so that correctness is not asserted only by tests we wrote against a fixture we
-generated. The machine-checkable form of this evidence is `forensic/tests/oracle_differential.rs`.
+This document is the Doer-Checker evidence for `sqlite_forensic`'s deleted-record
+carving. It records how our carver's output was reconciled against an **independent
+reference tool** so that correctness is not asserted only by tests we wrote against a
+fixture we generated. The machine-checkable form of this evidence is
+`forensic/tests/oracle_differential.rs`.
+
+> **Post-#49 update.** The page-level *differential findings* below remain the record
+> of how each tool draws the freelist/allocated boundary. But the **carver scope
+> boundaries they describe are now closed**: `sqlite_forensic::carve_all_deleted_records`
+> added in-page free-block carving and dropped-table carving, so on the fixture it now
+> recovers the in-page remnant (rowid 237) and **exactly matches undark**, and it
+> recovers the DC3 dropped-table rows. The post-#49 capability matrix (per
+> deletion-scenario class, with the new numbers) is
+> [`recovery-comparison.md`](recovery-comparison.md); the differential test asserts
+> agreement now rather than the former exemptions. Where this document says "our
+> freelist-only carver recovers none" of the in-page / dropped-table cases, read it as
+> the *pre-#49* state.
 
 ## Summary
 

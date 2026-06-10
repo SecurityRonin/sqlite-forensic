@@ -28,7 +28,7 @@
 use forensicnomicon::report::{
     Confidence, Evidence, Finding, Location, Observation, Severity, Source,
 };
-use sqlite_core::{Database, Value};
+use sqlite_core::{CommitId, Database, Value, WalTimeline};
 
 /// The classified `SQLite` forensic anomalies this auditor can grade.
 ///
@@ -309,6 +309,14 @@ pub enum RecoverySource {
     /// the `(salt1, salt2, frame_index)` log-sequence provenance in
     /// [`CarvedRecord::wal`].
     WalFrame,
+    /// Residue carved from a **materialized commit snapshot** — the database state
+    /// replayed up to one COMMIT frame of the `-wal` (base image ∪ committed frames
+    /// to that commit). A row that is a live cell at this commit but deleted by a
+    /// later commit survives ONLY in this snapshot's page images. The record
+    /// carries the commit's `(salt1, salt2, commit_frame_index)` LSN in
+    /// [`CarvedRecord::wal`] — the per-commit temporal coordinate, distinct from a
+    /// raw [`RecoverySource::WalFrame`] residue's frame index.
+    CommitSnapshot,
 }
 
 /// Provenance for a record carved from a `-wal` frame: the
@@ -575,6 +583,71 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
             }
         }
     });
+
+    dedup_keep_best(out)
+}
+
+/// Carve the deleted residue of **one materialized commit snapshot** of the
+/// `-wal`, the per-commit temporal building block of the N-snapshot carve.
+///
+/// `id` addresses a [`CommitId`] in `timeline`; the snapshot it resolves to is the
+/// database state replayed up to that COMMIT (base image ∪ every committed frame to
+/// that commit, capped to `db_size_after_commit`). This runs the same three
+/// carving primitives the on-disk path uses — [`Database::carve_leaf_cells`]
+/// (intact cells the snapshot records as allocated, the strongest case),
+/// [`Database::carve_free_regions`], and [`Database::reconstruct_freeblock_records`]
+/// — over each of the snapshot's materialized page images, then applies the SAME
+/// live-row precision filter: a record whose decoded values match a currently-live
+/// row (the WAL-applied view) is dropped, so a row that survived to the final state
+/// is **never** re-surfaced as deleted. Surviving records are tagged
+/// [`RecoverySource::CommitSnapshot`] and carry the commit's
+/// `(salt1, salt2, commit_frame_index)` LSN in [`CarvedRecord::wal`].
+///
+/// An unknown [`CommitId`] (absent from `timeline`) yields an empty vector, never a
+/// panic. Read-only throughout.
+#[must_use]
+pub fn carve_at_commit(db: &Database, timeline: &WalTimeline, id: CommitId) -> Vec<CarvedRecord> {
+    let Some(snapshot) = timeline.snapshot_at(id) else {
+        return Vec::new();
+    };
+    let lsn = snapshot.lsn();
+    let prov = WalProvenance {
+        frame_index: lsn.frame_index,
+        salt1: lsn.salt1,
+        salt2: lsn.salt2,
+    };
+
+    let mut out: Vec<CarvedRecord> = Vec::new();
+    for page_no in snapshot.page_numbers() {
+        let Some(image) = snapshot.page_version(page_no) else {
+            continue; // cov:unreachable: page_numbers only yields materialized pages
+        };
+        let cells = db
+            .carve_leaf_cells(&image.bytes)
+            .into_iter()
+            .chain(db.carve_free_regions(&image.bytes, 0))
+            .chain(db.reconstruct_freeblock_records(&image.bytes));
+        for cell in cells {
+            out.push(CarvedRecord {
+                page: page_no,
+                offset: cell.offset,
+                rowid: cell.rowid,
+                values: cell.values,
+                confidence: cell.confidence,
+                allocated: false,
+                source: RecoverySource::CommitSnapshot,
+                wal: Some(prov),
+            });
+        }
+    }
+
+    // Live-row precision filter (the WAL-applied view): drop any record whose
+    // decoded values match a currently-live row, so a row that survives to the
+    // final state is never re-surfaced as "deleted at an earlier commit".
+    let live = db.live_rows();
+    let live_value_keys: std::collections::HashSet<String> =
+        live.values().map(|v| format!("{v:?}")).collect();
+    out.retain(|rec| !live_value_keys.contains(&format!("{:?}", rec.values)));
 
     dedup_keep_best(out)
 }

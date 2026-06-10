@@ -159,3 +159,83 @@ fn dc3_dropped_table_0a02_recovered() {
         carved.len()
     );
 }
+
+// --- WAL-frame carving (#60) -------------------------------------------------
+
+/// `wal_carve.db` + `-wal`: deleted rows 121..=140 whose freed-cell residue lives
+/// ONLY in the uncheckpointed WAL frames, never on the main file's pages (the
+/// checkpoint(TRUNCATE) baseline predates them). See `docs/corpus-catalog.md` §E.
+const WAL_CARVE_MAIN: &[u8] = include_bytes!("../../tests/data/wal_carve.db");
+const WAL_CARVE_WAL: &[u8] = include_bytes!("../../tests/data/wal_carve.db-wal");
+
+/// The body text a carved record carries for deleted id `n`.
+fn deleted_body(n: i64) -> Value {
+    Value::Text(format!("secret WAL body {n}"))
+}
+
+/// On-disk-only carving (`Database::open`, no WAL) finds the SAME residue with or
+/// without — i.e. NONE of the WAL-only deleted rows, because their bytes are not
+/// in the main file. This is the gap #60 closes.
+#[test]
+fn on_disk_only_carve_misses_wal_only_deleted_rows() {
+    let db = Database::open(WAL_CARVE_MAIN.to_vec()).expect("open main only");
+    let carved = carve_all_deleted_records(&db);
+    let found: Vec<i64> = (121..=140)
+        .filter(|&n| carved.iter().any(|c| c.values.contains(&deleted_body(n))))
+        .collect();
+    assert!(
+        found.is_empty(),
+        "on-disk-only carve must NOT see WAL-resident deleted rows; saw {found:?}"
+    );
+}
+
+/// WAL-frame carving (`open_with_wal`) recovers the deleted rows that live ONLY
+/// in the uncheckpointed WAL frames, tags them `RecoverySource::WalFrame`, and
+/// carries the (frame_index, salt1, salt2) LSN provenance — while never
+/// re-surfacing a live row (ids 101..=120, 141..=150 survive the DELETE).
+#[test]
+fn wal_frame_carve_recovers_wal_only_deleted_rows_with_provenance() {
+    let db = Database::open_with_wal(WAL_CARVE_MAIN.to_vec(), WAL_CARVE_WAL).expect("open with wal");
+    let carved = carve_all_deleted_records(&db);
+
+    // Recovered the bulk of the WAL-only deleted rows 121..=140.
+    let recovered: Vec<i64> = (121..=140)
+        .filter(|&n| carved.iter().any(|c| c.values.contains(&deleted_body(n))))
+        .collect();
+    assert!(
+        recovered.len() >= 15,
+        "WAL-frame carve must recover the WAL-only deleted rows; got {recovered:?}"
+    );
+
+    // Every WAL-only deleted row is tagged WalFrame and carries frame provenance.
+    for n in &recovered {
+        let rec = carved
+            .iter()
+            .find(|c| c.values.contains(&deleted_body(*n)))
+            .expect("recovered record present");
+        assert_eq!(
+            rec.source,
+            RecoverySource::WalFrame,
+            "WAL-resident residue must be tagged WalFrame, not an on-disk class"
+        );
+        let prov = rec
+            .wal
+            .as_ref()
+            .expect("WalFrame record carries WAL provenance");
+        assert!(prov.salt1 != 0 && prov.salt2 != 0, "salts recorded");
+        // The (salt1,salt2,frame_index) LSN identifies which frame it came from.
+        assert!(prov.frame_index < 8, "frame_index within the tiny WAL");
+    }
+
+    // 0-FALSE-POSITIVE: rows that SURVIVED the DELETE (101..=120, 141..=150) are
+    // live in the WAL-applied view and must never be re-surfaced as "deleted".
+    let live = db.live_rows();
+    for rec in &carved {
+        let collides = live.values().any(|lv| lv == &rec.values);
+        assert!(
+            !collides,
+            "WAL-frame carve re-surfaced a LIVE row: {:?}",
+            rec.values
+        );
+    }
+}

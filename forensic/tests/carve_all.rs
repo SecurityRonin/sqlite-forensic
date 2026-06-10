@@ -324,3 +324,85 @@ fn carve_at_unknown_commit_is_empty_not_a_panic() {
         "unknown CommitId must carve nothing"
     );
 }
+
+// --- live sqlite_master precision filter (#64) -------------------------------
+
+/// The CURRENT live `sqlite_master` rows of a database, decoded as plain value
+/// vectors — the schema-table analogue of `Database::live_rows` (which collects
+/// only USER-table b-trees). A carved record equal to one of these is the LIVE
+/// schema row re-surfaced, never deleted residue.
+fn live_schema_rows(db: &Database) -> Vec<Vec<Value>> {
+    db.read_table(1, 5)
+        .expect("page-1 schema is readable")
+        .into_iter()
+        .map(|row| row.values)
+        .collect()
+}
+
+/// The live-row precision filter must cover `sqlite_master` itself: when
+/// `carve_at_commit` materializes the snapshot's page 1 (the schema table), the
+/// LIVE schema row is a still-allocated cell on that page and would otherwise be
+/// emitted as a "recovered" record — contradicting the never-re-surface-a-live-row
+/// guarantee. No carved record may equal a current live `sqlite_master` entry.
+#[test]
+fn carve_at_commit_never_resurfaces_the_live_schema_row() {
+    let db =
+        Database::open_with_wal(WAL_CARVE_MAIN.to_vec(), WAL_CARVE_WAL).expect("open with wal");
+    let tl = db.wal_timeline().expect("timeline present");
+    let schema = live_schema_rows(&db);
+    assert!(
+        !schema.is_empty(),
+        "wal_carve.db has a live sqlite_master entry to guard against"
+    );
+
+    for snap in tl.commit_snapshots() {
+        let carved = carve_at_commit(&db, &tl, snap.id());
+        for rec in &carved {
+            assert!(
+                !schema.contains(&rec.values),
+                "carve@commit cfi={} re-surfaced the LIVE sqlite_master row: {:?}",
+                snap.id().commit_frame_index,
+                rec.values
+            );
+        }
+    }
+}
+
+/// Dropping the live schema row must NOT cost the genuinely-deleted user rows:
+/// ids 121..=140 (deleted at the second commit) still surface at the first commit.
+#[test]
+fn live_schema_filter_keeps_genuinely_deleted_user_rows() {
+    let db =
+        Database::open_with_wal(WAL_CARVE_MAIN.to_vec(), WAL_CARVE_WAL).expect("open with wal");
+    let tl = db.wal_timeline().expect("timeline present");
+    let first = tl.commit_snapshots()[0].id();
+    let carved = carve_at_commit(&db, &tl, first);
+
+    let recovered: Vec<i64> = (121..=140)
+        .filter(|&n| carved.iter().any(|c| c.values.contains(&deleted_body(n))))
+        .collect();
+    assert!(
+        recovered.len() >= 15,
+        "live-schema filter must not drop genuinely-deleted rows 121..=140; got {recovered:?}"
+    );
+}
+
+/// No regression on the non-WAL path: `carve_all_deleted_records` on
+/// `deleted_places.db` must not emit any current live `sqlite_master` row either.
+#[test]
+fn carve_all_never_resurfaces_the_live_schema_row_non_wal() {
+    let db = Database::open(DELETED.to_vec()).expect("open");
+    let schema = live_schema_rows(&db);
+    assert!(
+        !schema.is_empty(),
+        "deleted_places.db has a live sqlite_master entry to guard against"
+    );
+    let carved = carve_all_deleted_records(&db);
+    for rec in &carved {
+        assert!(
+            !schema.contains(&rec.values),
+            "carve_all re-surfaced the LIVE sqlite_master row: {:?}",
+            rec.values
+        );
+    }
+}

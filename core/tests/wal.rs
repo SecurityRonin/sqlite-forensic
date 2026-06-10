@@ -4,9 +4,9 @@
 //! one committed COMMIT frame for page 2 that the main file does not yet reflect.
 //!
 //! Ground truth (cross-checked with the `sqlite3` CLI):
-//!   - main-only view:  id=1 title='Rust' visit_count=5; 2 rows.
-//!   - WAL-applied view: id=1 title='Rust (EDITED IN WAL)' visit_count=777;
-//!                       plus id=3 'WAL-ONLY ROW'; 3 rows.
+//! - main-only view:  id=1 title `Rust`, `visit_count` 5; 2 rows.
+//! - WAL-applied view: id=1 title `Rust (EDITED IN WAL)`, `visit_count` 777;
+//!   plus id=3 `WAL-ONLY ROW`; 3 rows.
 //!
 //! The reader must overlay the WAL WITHOUT mutating either file (the forensic-safe
 //! alternative to libsqlite checkpointing).

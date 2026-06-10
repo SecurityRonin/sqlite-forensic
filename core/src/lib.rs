@@ -101,17 +101,68 @@ impl Header {
 pub struct Database {
     bytes: Vec<u8>,
     header: Header,
+    /// Read-only WAL overlay: newest committed page versions from a `-wal`
+    /// sidecar, applied without checkpointing (never mutates `bytes`).
+    /// `None` when opened without a WAL.
+    wal: Option<WalOverlay>,
+}
+
+/// The newest committed version of each WAL page, materialized into owned bytes.
+///
+/// Built once at open; `page_slice` consults it before the main file so a table
+/// walk transparently sees the WAL-applied view. Read-only: building it copies
+/// frame data out of the `-wal` sidecar and never writes back to either file.
+struct WalOverlay {
+    /// page number (1-based) → that page's newest committed contents.
+    pages: std::collections::BTreeMap<u32, Vec<u8>>,
 }
 
 /// Hard cap on b-tree pages visited in one table walk, to bound work on a
 /// crafted file with cyclic interior pointers.
 const MAX_PAGES_PER_WALK: usize = 1_000_000;
 
+/// WAL magic, big-endian variant (native byte order in the page checksums; the
+/// little-endian variant `0x377f_0683` differs only in checksum endianness,
+/// which the overlay does not verify). file-format §4.1.
+const WAL_MAGIC_BE: u32 = 0x377f_0682;
+/// WAL magic, little-endian-checksum variant.
+const WAL_MAGIC_LE: u32 = 0x377f_0683;
+
 impl Database {
-    /// Parse the file header and validate magic + page size.
+    /// Parse the file header and validate magic + page size. No WAL overlay.
     pub fn open(bytes: Vec<u8>) -> Result<Self, Error> {
         let header = parse_header(&bytes)?;
-        Ok(Self { bytes, header })
+        Ok(Self {
+            bytes,
+            header,
+            wal: None,
+        })
+    }
+
+    /// Parse the main database plus a `-wal` sidecar, overlaying the newest
+    /// **committed** page versions from the WAL on top of the main file.
+    ///
+    /// This is the forensic-safe alternative to libsqlite checkpointing: neither
+    /// file is mutated. The resulting [`Database`] answers `read_table` with the
+    /// WAL-applied view (use [`Database::open`] for the main-only view). Frames
+    /// past the last commit frame, or whose salt does not match the WAL header,
+    /// are ignored — they are uncommitted / superseded and not part of the
+    /// consistent snapshot.
+    pub fn open_with_wal(bytes: Vec<u8>, wal: &[u8]) -> Result<Self, Error> {
+        let header = parse_header(&bytes)?;
+        let overlay = WalOverlay::parse(wal, header.page_size)?;
+        Ok(Self {
+            bytes,
+            header,
+            wal: overlay,
+        })
+    }
+
+    /// Whether a non-empty WAL overlay is in effect (at least one committed
+    /// frame was applied on top of the main file).
+    #[must_use]
+    pub fn wal_applied(&self) -> bool {
+        self.wal.as_ref().is_some_and(|w| !w.pages.is_empty())
     }
 
     #[must_use]
@@ -213,9 +264,19 @@ impl Database {
     }
 
     /// Bytes of the 1-based `page` number, or `PageOutOfRange`.
+    ///
+    /// When a WAL overlay is in effect and holds a committed version of this
+    /// page, the overlaid bytes are returned in preference to the main file —
+    /// this is what makes a table walk see the WAL-applied view. The main file
+    /// is never mutated.
     fn page_slice(&self, page: u32) -> Result<&[u8], Error> {
         if page == 0 {
             return Err(Error::PageOutOfRange(0));
+        }
+        if let Some(wal) = &self.wal {
+            if let Some(overlaid) = wal.pages.get(&page) {
+                return Ok(overlaid.as_slice());
+            }
         }
         let ps = self.header.page_size as usize;
         let start = (page as usize - 1) * ps;
@@ -376,6 +437,93 @@ fn local_payload_len(total: usize, usable: usize) -> usize {
         k
     } else {
         min_local
+    }
+}
+
+impl WalOverlay {
+    /// Parse a `-wal` sidecar into the newest committed page versions.
+    ///
+    /// Returns `Ok(None)` when `wal` is absent of a usable header / has no
+    /// frames (a no-op overlay). Iterates frames in file order, accumulating the
+    /// page data of each frame whose salt matches the WAL header; on reaching a
+    /// COMMIT frame (`db_size_after_commit != 0`) the accumulated pages are
+    /// promoted into the committed snapshot. Frames after the last commit are
+    /// uncommitted and dropped. Bounds-checked and breadth-capped against a
+    /// crafted WAL (a frame whose declared page data runs past the file ends the
+    /// scan rather than panicking).
+    fn parse(wal: &[u8], page_size: u32) -> Result<Option<Self>, Error> {
+        use forensicnomicon::sqlite::{SQLITE_WAL_FRAME_HEADER_SIZE, SQLITE_WAL_HEADER_SIZE};
+
+        // No header → no overlay (treat a too-short WAL as empty, not an error:
+        // a missing/zero-length sidecar is normal and must not fail the open).
+        let Some(hdr) = wal.get(..SQLITE_WAL_HEADER_SIZE) else {
+            return Ok(None);
+        };
+        let magic = be_u32(hdr, 0);
+        if magic != WAL_MAGIC_BE && magic != WAL_MAGIC_LE {
+            return Ok(None);
+        }
+        // The WAL records its own page size (offset 8); trust the DB header's
+        // page size but require agreement to avoid mis-slicing frames.
+        let wal_page_size = be_u32(hdr, 8);
+        if wal_page_size != page_size {
+            return Ok(None);
+        }
+        // WAL header layout (file-format §4.1): salt-1 at offset 16, salt-2 at
+        // offset 20 (the two checksum words follow at 24 and 28).
+        let salt1 = be_u32(hdr, 16);
+        let salt2 = be_u32(hdr, 20);
+
+        let ps = page_size as usize;
+        let frame_stride = SQLITE_WAL_FRAME_HEADER_SIZE + ps;
+
+        let mut committed: std::collections::BTreeMap<u32, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut pending: std::collections::BTreeMap<u32, Vec<u8>> =
+            std::collections::BTreeMap::new();
+
+        let mut off = SQLITE_WAL_HEADER_SIZE;
+        // One frame per page in the file is the natural breadth cap; allow a
+        // generous multiple for repeated rewrites, but keep it bounded.
+        let max_frames = wal.len() / frame_stride + 1;
+        let mut frame_no = 0usize;
+
+        while let Some(frame) = wal.get(off..off + frame_stride) {
+            frame_no += 1;
+            if frame_no > max_frames {
+                break; // cov:unreachable: the slice walk already bounds frame_no
+            }
+            let page_no = be_u32(frame, 0);
+            let db_size = be_u32(frame, 4);
+            let fsalt1 = be_u32(frame, 8);
+            let fsalt2 = be_u32(frame, 12);
+            // A frame from a different checkpoint generation (salt mismatch) is
+            // stale residue, not part of this WAL's live content — stop here.
+            if fsalt1 != salt1 || fsalt2 != salt2 {
+                break;
+            }
+            if page_no == 0 {
+                break; // malformed frame; stop rather than mis-index
+            }
+            let data = frame
+                .get(SQLITE_WAL_FRAME_HEADER_SIZE..)
+                .ok_or(Error::TruncatedCell)?;
+            pending.insert(page_no, data.to_vec());
+
+            if db_size != 0 {
+                // COMMIT frame: promote everything pending into the snapshot.
+                for (p, d) in std::mem::take(&mut pending) {
+                    committed.insert(p, d);
+                }
+            }
+            off += frame_stride;
+        }
+
+        if committed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(WalOverlay { pages: committed }))
+        }
     }
 }
 

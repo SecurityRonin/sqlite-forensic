@@ -9,7 +9,7 @@ For the per-repo index (classification + oracle methodology) see
 deleted-record carving validation see
 [`../../docs/validation.md`](../../docs/validation.md). The gitignored
 independent-oracle corpus is documented separately in
-[`../../tests-fqlite-corpus/README.md`](../../tests-fqlite-corpus/README.md).
+[`../../tests-oracle-corpus/README.md`](../../tests-oracle-corpus/README.md).
 
 All files here are **SYNTHETIC** — built locally with the real `sqlite3` engine
 (`SQLite 3.45.3 2024-04-15`, REAL engine / synthetic data). The generator command
@@ -78,7 +78,7 @@ IS the provenance; there is no download URL.
 - **Identity:** `moz_places` with 400 rows inserted, ids 201..=400 `DELETE`d
   **without VACUUM** under `secure_delete=OFF`, freeing whole leaf pages onto the
   freelist whose old cell content survives. The deleted-record carving fixture
-  (`forensic/tests/carve.rs`, `forensic/tests/fqlite_oracle.rs`,
+  (`forensic/tests/carve.rs`, `forensic/tests/oracle_differential.rs`,
   `forensic/tests/audit_realdb.rs`) and the freelist fixture
   (`core/tests/freelist.rs`).
 - **Generator:**

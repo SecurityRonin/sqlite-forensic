@@ -3,7 +3,7 @@
 This document is the Doer-Checker evidence for `sqlite_forensic::carve_deleted_records`.
 It records how our carver's output was reconciled against an **independent reference
 tool** so that correctness is not asserted only by tests we wrote against a fixture we
-generated. The machine-checkable form of this evidence is `forensic/tests/fqlite_oracle.rs`.
+generated. The machine-checkable form of this evidence is `forensic/tests/oracle_differential.rs`.
 
 ## Summary
 
@@ -132,7 +132,7 @@ there, the test fails and the exemption must be re-derived rather than silently 
 The Department of Defense Cyber Crime Center (DC3) `sqlite_dissect` test databases were
 authored by neither us nor undark's author, so for these cases **neither the input DB nor
 the oracle is ours** — the strongest Doer-Checker form. Provenance + hashes are in
-`tests-fqlite-corpus/README.md` and `docs/corpus-catalog.md`. The DBs with carvable
+`tests-oracle-corpus/README.md` and `docs/corpus-catalog.md`. The DBs with carvable
 deleted records:
 
 | DB | table cols | freelist_count | undark recovers | our carver recovers | agreement |

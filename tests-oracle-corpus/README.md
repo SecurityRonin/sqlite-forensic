@@ -1,8 +1,8 @@
-# Independent Validation Corpus — `tests-fqlite-corpus/`
+# Independent Validation Corpus — `tests-oracle-corpus/`
 
 These SQLite databases are **third-party, externally authored** test artifacts
 used as independent INPUT for the deleted-record carving validation
-(`forensic/tests/fqlite_oracle.rs`; methodology in `../docs/validation.md`). They
+(`forensic/tests/oracle_differential.rs`; methodology in `../docs/validation.md`). They
 are paired with the independent `undark` oracle so that, for these cases, neither
 the input DB nor the recovery oracle is ours — the strongest Doer-Checker form.
 
@@ -12,7 +12,7 @@ documents large untracked artifacts). For the per-repo index see
 [`../docs/corpus-catalog.md`](../docs/corpus-catalog.md) §G.
 
 To reproduce locally, download the DC3 `sqlite_dissect` test files into
-`tests-fqlite-corpus/dc3-sqlite-dissect/` (flatten `corpus/` with a `corpus_`
+`tests-oracle-corpus/dc3-sqlite-dissect/` (flatten `corpus/` with a `corpus_`
 prefix to match the filenames below), e.g. fetch each from the raw base URL.
 
 ## dc3-sqlite-dissect/  (REAL-ext)

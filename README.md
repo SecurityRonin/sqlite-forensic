@@ -14,7 +14,16 @@
 
 Every browser history, every chat app, every mobile artifact is a SQLite file — and the forensically interesting rows are usually the *deleted* ones. The standard `sqlite3`/rusqlite path cannot see them: it reads the live b-tree and stops. `sqlite-forensic` reads the raw file format itself — freelist pages, in-page free blocks, dropped-table pages, and an uncheckpointed WAL overlay — and recovers what the live query cannot, as severity-graded, confidence-scored observations.
 
-This is a Rust library workspace (two crates, no CLI yet). Point the analyzer at the file bytes and get graded findings plus carved deleted records:
+This is a Rust library workspace with a CLI (`sqlite4n6`). The fastest path — point it at a database and read the deleted rows straight out of free space. It opens the evidence **read-only** and never writes the file or its sidecars:
+
+```console
+$ sqlite4n6 carve History.db                       # deleted rows, table view
+$ sqlite4n6 carve History.db --format jsonl         # one JSON object per record
+$ sqlite4n6 carve History.db --min-confidence medium # drop low-confidence carves
+$ sqlite4n6 audit  History.db                        # graded anomaly findings
+```
+
+Or drive the library directly — point the analyzer at the file bytes and get graded findings plus carved deleted records:
 
 ```rust
 use sqlite_core::Database;
@@ -56,7 +65,7 @@ The reader (`sqlite-core`) answers *"what does this file actually contain?"*; th
 
 ## The two crates
 
-This is one workspace (`sqlite-forensic`) with two members, following the fleet reader/analyzer split:
+This is one workspace (`sqlite-forensic`): two library crates following the fleet reader/analyzer split, plus the `sqlite4n6` CLI that consumes them:
 
 | Crate | Role | Entry points |
 |---|---|---|

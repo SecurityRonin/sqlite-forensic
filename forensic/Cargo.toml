@@ -2,7 +2,7 @@
 name = "sqlite-forensic"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 description = "Forensic anomaly auditor for SQLite databases — header-integrity findings as graded report::Finding, built on sqlite-core (WS-C spike skeleton; WS-E expands carving/WAL/freelist)."
 
 [dependencies]

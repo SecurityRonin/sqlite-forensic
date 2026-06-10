@@ -16,7 +16,7 @@ sqlite-forensic has **no telemetry**. It makes no network requests of any kind.
 
 ## Open Source
 
-sqlite-forensic is open source (MIT). You can audit every line of code at [github.com/SecurityRonin/sqlite-forensic](https://github.com/SecurityRonin/sqlite-forensic).
+sqlite-forensic is open source (Apache-2.0). You can audit every line of code at [github.com/SecurityRonin/sqlite-forensic](https://github.com/SecurityRonin/sqlite-forensic).
 
 ## Contact
 

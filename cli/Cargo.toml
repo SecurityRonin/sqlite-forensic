@@ -1,0 +1,23 @@
+[package]
+name = "sqlite4n6"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "sqlite4n6 — read-only SQLite forensic CLI: carve deleted records and grade anomalies into severity-ranked findings, single static binary."
+
+[lib]
+name = "sqlite4n6"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sqlite4n6"
+path = "src/main.rs"
+
+[dependencies]
+sqlite-core = { workspace = true }
+sqlite-forensic = { workspace = true }
+forensicnomicon = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true

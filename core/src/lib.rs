@@ -493,6 +493,95 @@ impl Database {
         ids
     }
 
+    /// Collect every **currently-live** row's decoded column values, keyed by
+    /// rowid, across all user table b-trees. This is the value-aware companion to
+    /// [`Database::live_rowids`]: the forensic carver uses it to tell a stale
+    /// rebalance copy (same rowid AND same values → drop) from a deleted prior
+    /// version (same rowid but DIFFERENT values → recover, e.g. an edited message
+    /// or a changed amount).
+    ///
+    /// Column values are decoded by inferring the column count from each live
+    /// cell's own serial-type array (the same self-describing record format the
+    /// carver uses), so no schema column count is required. Best-effort,
+    /// bounded, and panic-free: a malformed b-tree yields a partial map.
+    #[must_use]
+    pub fn live_rows(&self) -> std::collections::BTreeMap<i64, Vec<Value>> {
+        let mut rows = std::collections::BTreeMap::new();
+        let Ok(schema) = self.read_table(1, 5) else {
+            return rows; // cov:unreachable: a validly-opened DB has a readable page-1 schema
+        };
+        for row in schema {
+            let is_table = matches!(row.values.first(), Some(Value::Text(t)) if t == "table");
+            if !is_table {
+                continue; // cov:unreachable: the test fixtures' schemas hold only table rows
+            }
+            let Some(Value::Integer(root)) = row.values.get(3) else {
+                continue; // cov:unreachable: a 'table' schema row always has an integer rootpage
+            };
+            let Ok(root) = u32::try_from(*root) else {
+                continue; // cov:unreachable: a real rootpage is a small positive page number
+            };
+            let mut visited = 0usize;
+            self.collect_rows(root, &mut rows, &mut visited);
+        }
+        rows
+    }
+
+    /// Walk the table b-tree rooted at `page`, decoding every live leaf cell's
+    /// values (column count inferred per cell) into `rows` keyed by rowid.
+    /// Best-effort and bounded, mirroring [`Database::collect_rowids`].
+    fn collect_rows(
+        &self,
+        page: u32,
+        rows: &mut std::collections::BTreeMap<i64, Vec<Value>>,
+        visited: &mut usize,
+    ) {
+        *visited += 1;
+        if *visited > MAX_PAGES_PER_WALK {
+            return; // cov:unreachable: test b-trees are far below the 1M-page cap
+        }
+        let Ok(slice) = self.page_slice(page) else {
+            return; // cov:unreachable: schema rootpages and their children are in range
+        };
+        let hdr_off = if page == 1 { SQLITE_HEADER_SIZE } else { 0 };
+        let Some(&page_type) = slice.get(hdr_off) else {
+            return; // cov:unreachable: a full page slice always has its header byte
+        };
+        let cell_count = be_u16(slice, hdr_off + 3) as usize;
+        match page_type {
+            0x0d => {
+                let cell_ptr_array = hdr_off + 8;
+                for i in 0..cell_count {
+                    let cell_off = be_u16(slice, cell_ptr_array + i * 2) as usize;
+                    // Decode the live cell with an inferred column count; on any
+                    // parse hiccup (e.g. a table narrower than MIN_INFERRED_COLUMNS),
+                    // fall back to the rowid alone (empty values) so the row is
+                    // still known to be live.
+                    if let Some(cell) = try_carve_cell_at(slice, cell_off, None) {
+                        rows.insert(cell.rowid, cell.values);
+                    } else if let Some(rowid) = live_cell_rowid(slice, cell_off) {
+                        rows.entry(rowid).or_default(); // cov:unreachable: a >=2-col live cell always decodes above
+                    }
+                }
+            }
+            0x05 => {
+                let cell_ptr_array = hdr_off + 12;
+                for i in 0..cell_count {
+                    let cell_off = be_u16(slice, cell_ptr_array + i * 2) as usize;
+                    let child = be_u32(slice, cell_off);
+                    if child != 0 && child != page {
+                        self.collect_rows(child, rows, visited);
+                    }
+                }
+                let right = be_u32(slice, hdr_off + 8);
+                if right != 0 && right != page {
+                    self.collect_rows(right, rows, visited);
+                }
+            }
+            _ => {} // cov:unreachable: a table b-tree root/child is leaf (0x0d) or interior (0x05)
+        }
+    }
+
     /// Walk the table b-tree rooted at `page`, inserting every live leaf cell's
     /// rowid into `ids`. Best-effort and bounded: a malformed/cyclic structure
     /// stops the walk rather than erroring or looping.
@@ -519,11 +608,8 @@ impl Database {
                 let cell_ptr_array = hdr_off + 8;
                 for i in 0..cell_count {
                     let cell_off = be_u16(slice, cell_ptr_array + i * 2) as usize;
-                    // rowid is the 2nd varint of a table-leaf cell.
-                    if let Ok((_payload, n1)) = read_varint(slice, cell_off) {
-                        if let Ok((rowid, _)) = read_varint(slice, cell_off + n1) {
-                            ids.insert(rowid);
-                        }
+                    if let Some(rowid) = live_cell_rowid(slice, cell_off) {
+                        ids.insert(rowid);
                     }
                 }
             }
@@ -854,6 +940,15 @@ fn live_cell_len(buf: &[u8], off: usize, usable: usize) -> Option<usize> {
         n1 + n2 + local + 4 // 4-byte first-overflow-page pointer
     };
     Some(on_page)
+}
+
+/// The rowid of a table-leaf cell at `off` — its 2nd varint (after the
+/// payload-length varint). `None` if either varint is out of bounds. Used to
+/// identify a live row even when its full record cannot be decoded.
+fn live_cell_rowid(buf: &[u8], off: usize) -> Option<i64> {
+    let (_payload_len, n1) = read_varint(buf, off).ok()?;
+    let (rowid, _) = read_varint(buf, off + n1).ok()?;
+    Some(rowid)
 }
 
 /// Given the sorted byte extents of live cells, return the maximal **free**
@@ -1279,5 +1374,38 @@ mod tests {
         let live = del.live_rowids();
         assert!(live.contains(&1) && live.contains(&200));
         assert!(!live.contains(&201) && !live.contains(&400));
+    }
+
+    #[test]
+    fn live_rows_decodes_current_values() {
+        let db = Database::open(CLEAN_DB.to_vec()).unwrap();
+        let rows = db.live_rows();
+        // places.db has 5 live rows keyed by rowid 1..=5, each decoded to values.
+        assert_eq!(rows.len(), 5);
+        // Row 1's url column (index 1) is the rust-lang URL (cross-checks that
+        // values are decoded, not just rowids collected).
+        let r1 = rows.get(&1).expect("row 1 present");
+        assert!(
+            matches!(r1.get(1), Some(Value::Text(t)) if t.contains("rust-lang")),
+            "row 1 values must be decoded: {r1:?}"
+        );
+        // The value map and the rowid set agree on which rows are live.
+        let ids = db.live_rowids();
+        assert_eq!(
+            rows.keys().copied().collect::<Vec<_>>(),
+            ids.into_iter().collect::<Vec<_>>()
+        );
+
+        // The deletions fixture's table b-tree has an INTERIOR root page (0x05),
+        // so this exercises the interior-walk branch of collect_rows and confirms
+        // values are decoded for all 200 live rows.
+        let del = Database::open(DELETED_DB.to_vec()).unwrap();
+        let del_rows = del.live_rows();
+        assert_eq!(del_rows.len(), 200);
+        let r1 = del_rows.get(&1).expect("live row 1");
+        assert!(
+            matches!(r1.get(1), Some(Value::Text(t)) if t.contains("site-1.example")),
+            "interior-walked live row 1 must decode its url: {r1:?}"
+        );
     }
 }

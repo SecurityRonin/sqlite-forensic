@@ -290,6 +290,11 @@ pub enum RecoverySource {
     /// A page whose table was `DROP`ped — on the freelist with no `sqlite_master`
     /// schema, so the column count was inferred from the record itself.
     DroppedTable,
+    /// A **prior version** of a still-live row: an `UPDATE` freed the old version
+    /// of the row into slack while the new version kept the same rowid. The
+    /// recovered values DIFFER from the current live row (e.g. an edited message
+    /// or a changed amount), so it is genuine deleted content — the edit history.
+    PriorVersion,
 }
 
 /// A deleted record recovered from unallocated space — the headline capability
@@ -422,14 +427,35 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
         }
     }
 
-    // 0-FALSE-POSITIVE: a b-tree rebalance can move a still-LIVE row to another
-    // page, leaving a stale byte-copy of it in the old page's free space. That
-    // copy parses as a clean record but is NOT a deleted row — reporting it would
-    // be a false positive. Drop any carved record whose rowid is currently live.
-    // (carve_free_regions already excludes live *cells* structurally; this
-    // additionally excludes live *content* lingering in free space.)
-    let live = db.live_rowids();
-    out.retain(|rec| !live.contains(&rec.rowid));
+    // VALUE-AWARE classification for carved records whose rowid is currently
+    // LIVE. Two very different cases share a live rowid:
+    //
+    //   * Stale rebalance copy — a b-tree rebalance moved a still-live row to
+    //     another page, leaving a byte-identical copy in the old page's slack.
+    //     SAME rowid, SAME values → NOT deleted → drop (the 0-false-positive
+    //     precision win we must preserve).
+    //   * Prior version — an UPDATE freed the OLD version of the row into slack
+    //     while the new version kept the same rowid. SAME rowid, DIFFERENT values
+    //     → genuinely-deleted content (the edited message / changed amount, often
+    //     THE evidence) → recover, tagged `PriorVersion`.
+    //
+    // A rowid-only filter cannot tell these apart and drops both (a false
+    // negative on prior versions). Comparing decoded values does.
+    let live = db.live_rows();
+    out.retain_mut(|rec| match live.get(&rec.rowid) {
+        // rowid not live → an ordinary deleted record (keep, source unchanged).
+        None => true,
+        // Same rowid: a byte-identical copy is a stale rebalance artifact (drop);
+        // differing values are a deleted prior version (keep, reclassified).
+        Some(live_values) => {
+            if &rec.values == live_values {
+                false
+            } else {
+                rec.source = RecoverySource::PriorVersion;
+                true
+            }
+        }
+    });
 
     dedup_keep_best(out)
 }

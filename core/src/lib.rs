@@ -142,6 +142,19 @@ struct WalOverlay {
 /// crafted file with cyclic interior pointers.
 const MAX_PAGES_PER_WALK: usize = 1_000_000;
 
+/// Minimum column count accepted when **inferring** a record's width during
+/// dropped-table carving. A coincidental byte run can look like a self-consistent
+/// 1-column record far too easily; requiring at least two columns (the smallest a
+/// real rowid table with a non-rowid column has) suppresses that false-positive
+/// class without losing real records.
+const MIN_INFERRED_COLUMNS: usize = 2;
+
+/// Confidence multiplier applied to records carved from an allocated page's
+/// in-page free space. Such residue is more often partially overwritten (its
+/// freeblock may have been reused) than whole-page freelist recovery, so it is
+/// graded a notch lower even when it parses cleanly.
+const IN_PAGE_CONFIDENCE_FACTOR: f32 = 0.8;
+
 /// WAL magic, big-endian variant (native byte order in the page checksums; the
 /// little-endian variant `0x377f_0683` differs only in checksum endianness,
 /// which the overlay does not verify). file-format §4.1.
@@ -307,7 +320,7 @@ impl Database {
         }
         let mut off = 0usize;
         while off < page_bytes.len() {
-            if let Some(cell) = try_carve_cell_at(page_bytes, off, column_count) {
+            if let Some(cell) = try_carve_cell_at(page_bytes, off, Some(column_count)) {
                 // Skip past this record to avoid re-reporting sub-slices of it.
                 off += cell.byte_len.max(1);
                 out.push(cell);
@@ -316,6 +329,220 @@ impl Database {
             }
         }
         out
+    }
+
+    /// Carve record-shaped cells from a page slice **inferring** each record's
+    /// column count from its own serial-type array, instead of requiring a fixed
+    /// count. This is what makes **dropped-table / schema-gone** recovery
+    /// possible: the page's table was `DROP`ped, so `sqlite_master` no longer
+    /// records a column count, but each record still self-describes its columns.
+    ///
+    /// Inferring the count removes one validity check, so the remaining
+    /// self-consistency checks are kept strict to hold the false-positive rate
+    /// down: `header_len + body_len == payload_len`, every serial type legal,
+    /// `rowid > 0`, the payload fully in-bounds, and at least
+    /// [`MIN_INFERRED_COLUMNS`] columns. Records carved this way are graded a
+    /// notch lower in confidence than fixed-count carving.
+    #[must_use]
+    pub fn carve_cells_inferred(&self, page_bytes: &[u8]) -> Vec<CarvedCell> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off < page_bytes.len() {
+            if let Some(cell) = try_carve_cell_at(page_bytes, off, None) {
+                off += cell.byte_len.max(1);
+                out.push(cell);
+            } else {
+                off += 1;
+            }
+        }
+        out
+    }
+
+    /// Carve deleted records from the **free (unallocated) regions** of an
+    /// allocated table-leaf page (type `0x0D`), never re-surfacing a live cell.
+    ///
+    /// On an allocated leaf, deleted-cell residue survives in two places: the
+    /// unallocated gap between the cell-pointer array and the cell-content area,
+    /// and the slack between/after live cells (a former freeblock whose chain
+    /// pointer may already be gone). This method computes the exact byte ranges
+    /// occupied by **live** cells and carves only the complement — so a live
+    /// (allocated) cell can never be returned as a deleted record. That is the
+    /// 0-false-positive guarantee, enforced structurally rather than by a filter.
+    ///
+    /// `page_bytes` is one whole page. `column_count_hint`, when non-zero, is the
+    /// table's known column count (matched exactly); pass 0 to infer the count
+    /// per record (for a page whose schema is gone). Non-leaf pages yield nothing.
+    #[must_use]
+    pub fn carve_free_regions(
+        &self,
+        page_bytes: &[u8],
+        column_count_hint: usize,
+    ) -> Vec<CarvedCell> {
+        // Page 1 carries the 100-byte file header before its b-tree header; for a
+        // standalone page slice we assume hdr_off 0 unless it starts with the
+        // file magic (page 1 passed whole).
+        let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
+            SQLITE_HEADER_SIZE
+        } else {
+            0
+        };
+        let Some(&page_type) = page_bytes.get(hdr_off) else {
+            return Vec::new();
+        };
+        if page_type != 0x0d {
+            return Vec::new(); // only table-leaf pages have carvable cell residue
+        }
+        let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
+        let cell_ptr_array = hdr_off + 8; // leaf header is 8 bytes
+        let usable = self.header.usable_size() as usize;
+
+        // Compute the byte extent [start, end) of every LIVE cell. These ranges
+        // are excluded from carving so no allocated cell is ever re-surfaced.
+        let mut live: Vec<(usize, usize)> = Vec::with_capacity(cell_count);
+        for i in 0..cell_count {
+            let p = cell_ptr_array + i * 2;
+            let cell_off = be_u16(page_bytes, p) as usize;
+            if cell_off == 0 || cell_off >= page_bytes.len() {
+                continue; // cov:unreachable: a valid leaf points cells within page
+            }
+            if let Some(len) = live_cell_len(page_bytes, cell_off, usable) {
+                live.push((cell_off, cell_off.saturating_add(len)));
+            }
+        }
+        live.sort_unstable_by_key(|&(s, _)| s);
+
+        // Carve each maximal free region (complement of the live extents), within
+        // the cell-content area only (below the cell-pointer array).
+        let content_lo = cell_ptr_array + cell_count * 2;
+        let mut out = Vec::new();
+        let regions = free_regions(&live, content_lo, page_bytes.len());
+        for (lo, hi) in regions {
+            let Some(region) = page_bytes.get(lo..hi) else {
+                continue; // cov:unreachable: free_regions yields in-bounds spans
+            };
+            let cells = if column_count_hint == 0 {
+                self.carve_cells_inferred(region)
+            } else {
+                self.carve_cells(region, column_count_hint)
+            };
+            for mut cell in cells {
+                // Translate the offset from region-local to page-local, and grade
+                // in-page recovery a notch lower (residue here is more often
+                // partially overwritten than freed-page recovery).
+                cell.offset += lo;
+                cell.confidence *= IN_PAGE_CONFIDENCE_FACTOR;
+                out.push(cell);
+            }
+        }
+        out
+    }
+
+    /// Whether `sqlite_master` (the schema table rooted at page 1) lists at least
+    /// one **user** table — i.e. a `type='table'` row whose name is not an
+    /// internal `sqlite_*` table. A database where every table was `DROP`ped (or
+    /// that never had one) returns `false`; the forensic carver uses this to label
+    /// freed content as dropped-table residue. Errors (unreadable schema) are
+    /// treated as "no user table" so the carver degrades safely.
+    #[must_use]
+    pub fn has_user_table(&self) -> bool {
+        // sqlite_master is a 5-column table: (type, name, tbl_name, rootpage, sql).
+        let Ok(rows) = self.read_table(1, 5) else {
+            return false;
+        };
+        rows.iter().any(|row| {
+            let is_table = matches!(row.values.first(), Some(Value::Text(t)) if t == "table");
+            let user = matches!(
+                row.values.get(1),
+                Some(Value::Text(n)) if !n.starts_with("sqlite_")
+            );
+            is_table && user
+        })
+    }
+
+    /// Collect the rowids of every **currently-live** row across all user table
+    /// b-trees (the roots listed in `sqlite_master`). The forensic carver uses
+    /// this to drop any carved "deleted" record whose rowid is in fact still live
+    /// — a stale copy of a live row can linger in free space after a b-tree
+    /// rebalance moved the row to another page, and reporting it as deleted would
+    /// be a false positive. Rowid collection ignores the column count (the rowid
+    /// is in the cell prefix), so it works even when a schema row is malformed.
+    ///
+    /// Bounded and panic-free: unreadable schema or a malformed b-tree yields a
+    /// partial (possibly empty) set rather than an error.
+    #[must_use]
+    pub fn live_rowids(&self) -> std::collections::BTreeSet<i64> {
+        let mut ids = std::collections::BTreeSet::new();
+        let Ok(schema) = self.read_table(1, 5) else {
+            return ids;
+        };
+        for row in schema {
+            // sqlite_master row: (type, name, tbl_name, rootpage, sql).
+            let is_table = matches!(row.values.first(), Some(Value::Text(t)) if t == "table");
+            if !is_table {
+                continue;
+            }
+            let Some(Value::Integer(root)) = row.values.get(3) else {
+                continue;
+            };
+            let Ok(root) = u32::try_from(*root) else {
+                continue;
+            };
+            let mut visited = 0usize;
+            self.collect_rowids(root, &mut ids, &mut visited);
+        }
+        ids
+    }
+
+    /// Walk the table b-tree rooted at `page`, inserting every live leaf cell's
+    /// rowid into `ids`. Best-effort and bounded: a malformed/cyclic structure
+    /// stops the walk rather than erroring or looping.
+    fn collect_rowids(
+        &self,
+        page: u32,
+        ids: &mut std::collections::BTreeSet<i64>,
+        visited: &mut usize,
+    ) {
+        *visited += 1;
+        if *visited > MAX_PAGES_PER_WALK {
+            return;
+        }
+        let Ok(slice) = self.page_slice(page) else {
+            return;
+        };
+        let hdr_off = if page == 1 { SQLITE_HEADER_SIZE } else { 0 };
+        let Some(&page_type) = slice.get(hdr_off) else {
+            return;
+        };
+        let cell_count = be_u16(slice, hdr_off + 3) as usize;
+        match page_type {
+            0x0d => {
+                let cell_ptr_array = hdr_off + 8;
+                for i in 0..cell_count {
+                    let cell_off = be_u16(slice, cell_ptr_array + i * 2) as usize;
+                    // rowid is the 2nd varint of a table-leaf cell.
+                    if let Ok((_payload, n1)) = read_varint(slice, cell_off) {
+                        if let Ok((rowid, _)) = read_varint(slice, cell_off + n1) {
+                            ids.insert(rowid);
+                        }
+                    }
+                }
+            }
+            0x05 => {
+                let cell_ptr_array = hdr_off + 12;
+                for i in 0..cell_count {
+                    let cell_off = be_u16(slice, cell_ptr_array + i * 2) as usize;
+                    let child = be_u32(slice, cell_off);
+                    if child != 0 && child != page {
+                        self.collect_rowids(child, ids, visited);
+                    }
+                }
+                let right = be_u32(slice, hdr_off + 8);
+                if right != 0 && right != page {
+                    self.collect_rowids(right, ids, visited);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Walk a single table b-tree rooted at `root_page` (1-based) and collect
@@ -608,11 +835,62 @@ fn serial_body_len(serial: i64) -> Option<usize> {
     }
 }
 
-/// Attempt to recognize a table-leaf cell at `off` in `buf` as a record of
-/// exactly `column_count` columns. Returns a [`CarvedCell`] only when the bytes
-/// are self-consistently record-shaped; otherwise `None` (a non-match at this
-/// offset). Never panics — every access is bounds-checked.
-fn try_carve_cell_at(buf: &[u8], off: usize, column_count: usize) -> Option<CarvedCell> {
+/// Byte length of a **live** table-leaf cell at `off`, for computing the byte
+/// extent the cell occupies (so [`Database::carve_free_regions`] can exclude it).
+/// Returns `None` if the cell header does not parse in bounds.
+///
+/// Mirrors the live cell layout: payload-length varint, rowid varint, then the
+/// local payload (capped at the spill threshold) plus a 4-byte overflow pointer
+/// when the payload spills. We only need the on-page footprint, so for a spilled
+/// cell that is `local + 4` bytes, not the full reassembled payload.
+fn live_cell_len(buf: &[u8], off: usize, usable: usize) -> Option<usize> {
+    let (payload_len, n1) = read_varint(buf, off).ok()?;
+    let (_rowid, n2) = read_varint(buf, off + n1).ok()?;
+    let total = usize::try_from(payload_len).ok()?;
+    let local = local_payload_len(total, usable);
+    let on_page = if local >= total {
+        n1 + n2 + total
+    } else {
+        n1 + n2 + local + 4 // 4-byte first-overflow-page pointer
+    };
+    Some(on_page)
+}
+
+/// Given the sorted byte extents of live cells, return the maximal **free**
+/// (unallocated) spans within `[lo, hi)` — the complement of the live extents.
+/// These are the only ranges [`Database::carve_free_regions`] scans, so a live
+/// cell can never be re-surfaced.
+fn free_regions(live: &[(usize, usize)], lo: usize, hi: usize) -> Vec<(usize, usize)> {
+    let mut regions = Vec::new();
+    let mut cursor = lo;
+    for &(s, e) in live {
+        let s = s.clamp(lo, hi);
+        let e = e.clamp(lo, hi);
+        if s > cursor {
+            regions.push((cursor, s));
+        }
+        if e > cursor {
+            cursor = e;
+        }
+    }
+    if cursor < hi {
+        regions.push((cursor, hi));
+    }
+    regions
+}
+
+/// Attempt to recognize a table-leaf cell at `off` in `buf` as a record.
+///
+/// `expected_columns` is `Some(n)` to require exactly `n` columns (fixed-schema
+/// carving), or `None` to **infer** the column count from the record's own
+/// serial-type array (dropped-table / schema-gone carving). Returns a
+/// [`CarvedCell`] only when the bytes are self-consistently record-shaped;
+/// otherwise `None`. Never panics — every access is bounds-checked.
+fn try_carve_cell_at(
+    buf: &[u8],
+    off: usize,
+    expected_columns: Option<usize>,
+) -> Option<CarvedCell> {
     // Cell prefix: payload_len varint, rowid varint.
     let (payload_len, n1) = read_varint(buf, off).ok()?;
     let payload_len = usize::try_from(payload_len).ok()?;
@@ -634,17 +912,26 @@ fn try_carve_cell_at(buf: &[u8], off: usize, column_count: usize) -> Option<Carv
     if header_len > payload.len() || header_len < hn {
         return None;
     }
-    let mut serials = Vec::with_capacity(column_count);
+    let cap = expected_columns.unwrap_or(0);
+    let mut serials = Vec::with_capacity(cap);
     let mut hpos = hn;
     while hpos < header_len {
         let (s, used) = read_varint(payload, hpos).ok()?;
         serials.push(s);
         hpos += used;
     }
-    // Exactly the right column count, and the header consumed cleanly.
-    if serials.len() != column_count || hpos != header_len {
+    // The header must consume cleanly, and match the expected column count when
+    // one was given. When inferring, require a minimum plausible column count to
+    // suppress coincidental 1-column matches.
+    if hpos != header_len {
         return None;
     }
+    match expected_columns {
+        Some(n) if serials.len() != n => return None,
+        None if serials.len() < MIN_INFERRED_COLUMNS => return None,
+        _ => {}
+    }
+    let column_count = serials.len();
 
     // Body length implied by the serial types must equal payload_len - header_len
     // — a strong self-consistency check that rejects coincidental matches.

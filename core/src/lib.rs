@@ -245,7 +245,7 @@ impl Database {
         let cell_count = be_u16(slice, hdr_off + 3) as usize;
 
         match page_type {
-            0x0d => read_leaf_cells(slice, hdr_off, cell_count, column_count, rows),
+            0x0d => self.read_leaf_cells(slice, hdr_off, cell_count, column_count, rows),
             0x05 => {
                 // Interior table page: 12-byte header; cell = 4-byte child ptr +
                 // varint key. Recurse into every child plus the right-most ptr.
@@ -262,35 +262,121 @@ impl Database {
             other => Err(Error::NotATablePage(other)),
         }
     }
-}
 
-fn read_leaf_cells(
-    slice: &[u8],
-    hdr_off: usize,
-    cell_count: usize,
-    column_count: usize,
-    rows: &mut Vec<Row>,
-) -> Result<(), Error> {
-    let cell_ptr_array = hdr_off + 8; // leaf b-tree header is 8 bytes
-    for i in 0..cell_count {
-        let p = cell_ptr_array + i * 2;
-        let cell_off = be_u16(slice, p) as usize;
-        let row = decode_leaf_cell(slice, cell_off, column_count)?;
-        rows.push(row);
+    fn read_leaf_cells(
+        &self,
+        slice: &[u8],
+        hdr_off: usize,
+        cell_count: usize,
+        column_count: usize,
+        rows: &mut Vec<Row>,
+    ) -> Result<(), Error> {
+        let cell_ptr_array = hdr_off + 8; // leaf b-tree header is 8 bytes
+        for i in 0..cell_count {
+            let p = cell_ptr_array + i * 2;
+            let cell_off = be_u16(slice, p) as usize;
+            let row = self.decode_leaf_cell(slice, cell_off, column_count)?;
+            rows.push(row);
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// Decode one table-leaf cell at `off` into a [`Row`], reassembling the
+    /// payload from its overflow-page chain when it spills past the leaf page.
+    fn decode_leaf_cell(
+        &self,
+        slice: &[u8],
+        off: usize,
+        column_count: usize,
+    ) -> Result<Row, Error> {
+        let (payload_len, n1) = read_varint(slice, off)?;
+        let (rowid, n2) = read_varint(slice, off + n1)?;
+        let payload_start = off + n1 + n2;
+        let total = usize::try_from(payload_len).map_err(|_| Error::TruncatedCell)?;
+
+        let usable = self.header.usable_size() as usize;
+        let local = local_payload_len(total, usable);
+
+        let payload = if local >= total {
+            // Whole payload is on the leaf page (no spill).
+            slice
+                .get(payload_start..payload_start + total)
+                .ok_or(Error::TruncatedCell)?
+                .to_vec()
+        } else {
+            // Spilled: `local` bytes on the leaf, then a 4-byte overflow page
+            // pointer, then the remainder follows the overflow chain.
+            let head = slice
+                .get(payload_start..payload_start + local)
+                .ok_or(Error::TruncatedCell)?;
+            let first_overflow = be_u32(slice, payload_start + local);
+            let mut buf = Vec::with_capacity(total);
+            buf.extend_from_slice(head);
+            self.read_overflow_chain(first_overflow, total - local, &mut buf)?;
+            buf
+        };
+
+        let values = decode_record(&payload, column_count, rowid)?;
+        Ok(Row { rowid, values })
+    }
+
+    /// Follow an overflow-page chain starting at `first` (1-based page number),
+    /// appending up to `remaining` payload bytes to `buf`. Each overflow page is
+    /// a 4-byte big-endian "next page" pointer (0 ends the chain) followed by up
+    /// to `usable - 4` content bytes.
+    ///
+    /// Bounded against cyclic/over-long chains via [`Error::MalformedOverflow`].
+    fn read_overflow_chain(
+        &self,
+        first: u32,
+        mut remaining: usize,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        let usable = self.header.usable_size() as usize;
+        let per_page = usable.saturating_sub(4);
+        if per_page == 0 {
+            return Err(Error::MalformedOverflow);
+        }
+        let total_pages = self.file_page_count();
+        let cap = total_pages as usize + 1;
+
+        let mut page = first;
+        let mut visited = 0usize;
+        while remaining > 0 {
+            if page == 0 || page > total_pages {
+                return Err(Error::MalformedOverflow);
+            }
+            visited += 1;
+            if visited > cap {
+                return Err(Error::MalformedOverflow);
+            }
+            let slice = self.page_slice(page)?;
+            let next = be_u32(slice, 0);
+            let take = remaining.min(per_page);
+            let chunk = slice.get(4..4 + take).ok_or(Error::TruncatedCell)?;
+            buf.extend_from_slice(chunk);
+            remaining -= take;
+            page = next;
+        }
+        Ok(())
+    }
 }
 
-/// Decode one table-leaf cell at `off` into a [`Row`]. Overflow pages are out
-/// of spike scope: we only read payload bytes present on the page (never
-/// over-read past the page).
-fn decode_leaf_cell(slice: &[u8], off: usize, column_count: usize) -> Result<Row, Error> {
-    let (_payload_len, n1) = read_varint(slice, off)?;
-    let (rowid, n2) = read_varint(slice, off + n1)?;
-    let payload_start = off + n1 + n2;
-    let payload = slice.get(payload_start..).ok_or(Error::TruncatedCell)?;
-    let values = decode_record(payload, column_count, rowid)?;
-    Ok(Row { rowid, values })
+/// Number of payload bytes stored locally on a table-leaf page for a record of
+/// `total` bytes, given the page's `usable` size (file-format §1.6 overflow
+/// rule). When the return value equals `total`, the record does not spill.
+fn local_payload_len(total: usize, usable: usize) -> usize {
+    let max_local = usable - 35; // X: largest payload kept entirely local
+    if total <= max_local {
+        return total;
+    }
+    let min_local = (usable - 12) * 32 / 255 - 23; // M
+    let k = min_local + (total - min_local) % (usable - 4);
+    if k <= max_local {
+        k
+    } else {
+        min_local
+    }
 }
 
 /// Parse + validate the 100-byte file header.

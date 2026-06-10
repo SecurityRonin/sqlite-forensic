@@ -20,8 +20,7 @@ IS the provenance; there is no download URL.
 - **Source:** SYNTHETIC — system `sqlite3` CLI.
 - **Identity:** single-table `moz_places` DB exercising every SQLite storage class
   (Integer/Real/Text/Blob/Null) and the `INTEGER PRIMARY KEY` rowid-alias rule.
-  Pre-existing WS-C spike fixture (also documented in
-  `docs/ws-c-sqlite-core-spike.md`).
+  Pre-existing core-reader spike fixture.
 - **Generator:**
 
   ```sh

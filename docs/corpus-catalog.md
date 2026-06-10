@@ -27,7 +27,7 @@ resulting file inspected, not just named).
 ## §A `tests/data/places.db`  (pre-existing, WS-C spike)
 
 Single-table `moz_places` DB exercising every storage class + the rowid-alias
-rule. Generator is documented in `docs/ws-c-sqlite-core-spike.md` §generator.
+rule. The verbatim generator is in `tests/data/README.md` (§`places.db`).
 
 - md5 `f07a69d05358f227e2120080370bbb6b`, 8192 bytes (2 pages, 4096-byte page).
 

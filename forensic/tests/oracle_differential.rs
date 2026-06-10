@@ -8,38 +8,40 @@
 //! spot by reconciling our output against an **independent reference tool** as
 //! the yardstick.
 //!
-//! ## Oracle: `undark`, not fqlite
+//! ## Two independent oracles: `undark` and `fqlite`
 //!
-//! The original plan named **fqlite** (Pawlaszczyk) as the oracle. fqlite turned
-//! out to be unusable as a headless oracle: every release since 2.0 ships a
-//! `JavaFX` GUI-only application (its README states "With version 2.0, the support
-//! for the command line mode was cancelled"), the current releases are ~440 MB
-//! `jpackage` native bundles with no runnable CLI jar, and fqlite is not
-//! published to Maven Central, so there is no engine to drive headlessly. See
-//! `docs/validation.md` for the full evidence.
+//! - **undark** (Paul L. Daniels) — a small C SQLite deleted-record carver.
+//! - **fqlite** (Dirk Pawlaszczyk) — a Java forensic SQLite recovery tool. Its
+//!   command-line mode was removed at v2.0, but its carving engine
+//!   (`fqlite.base.Job`) is plain Java that populates a result list the GUI
+//!   merely reads. A headless source-instrumentation tap
+//!   (`tools/fqlite/run-tap.sh`) drives that engine with no `JavaFX` UI and emits
+//!   recovered DELETED records as CSV. So fqlite IS usable as an oracle — the CLI
+//!   cancellation was the only blocker. See `tools/fqlite/ENGINE_NOTES.md`.
 //!
-//! The independent oracle is therefore **undark** (Paul L. Daniels), a small
-//! C SQLite deleted-record carver. It is a different author, a different
-//! language, and a different algorithm from ours, which is exactly what an
-//! independent oracle must be.
+//! Two different authors, two different languages, two different algorithms — the
+//! independence an oracle requires. Where all three (ours, undark, fqlite) agree
+//! on our fixture, that is the strongest evidence.
 //!
 //! ## Two corpora, two levels of independence
 //!
-//! 1. `tests/data/deleted_places.db` — OUR fixture. undark is an
-//!    independent *oracle* over our input.
+//! 1. `tests/data/deleted_places.db` — OUR fixture. undark and fqlite are
+//!    independent *oracles* over our input.
 //! 2. `tests-oracle-corpus/dc3-sqlite-dissect/*.db` — the DC3 (Department of
 //!    Defense Cyber Crime Center) `sqlite_dissect` test corpus. Authored by
-//!    neither us nor undark's author, so neither the input DB nor the oracle is
-//!    ours — the strongest form of Doer-Checker validation. These DBs exercise
+//!    neither us nor the oracle authors, so neither the input DB nor the oracle
+//!    is ours — the strongest form of Doer-Checker validation. These DBs exercise
 //!    in-page free-block deletion and dropped-table cases our whole-freed-page
 //!    fixture cannot reach, and they surface a documented carver scope boundary.
 //!
 //! # Gating
 //!
-//! Skips (passes) unless `UNDARK_BIN` points at a built `undark` binary, so CI
-//! without the tool still passes. The DC3 corpus is gitignored; cases over it
-//! also skip if the files are absent. Provenance, hashes, and the exact build
-//! recipe for undark are in `docs/validation.md` and `docs/corpus-catalog.md`.
+//! Each oracle is independently gated: the undark tests skip unless `UNDARK_BIN`
+//! is set; the fqlite test skips unless `FQLITE_TAP` is set — so CI without
+//! either tool still passes. The DC3 corpus is gitignored; cases over it also
+//! skip if the files are absent. Provenance, hashes, and the exact build recipes
+//! are in `docs/validation.md`, `docs/corpus-catalog.md`, and
+//! `tools/fqlite/README.md` + `ENGINE_NOTES.md`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -297,11 +299,34 @@ fn our_fixture_agrees_with_undark() {
     );
 }
 
+/// Deleted-range urls that fqlite recovers but our carver does NOT, for a
+/// documented and understood reason (allocated-page in-page remnants, same class
+/// as the undark `FIXTURE_IN_PAGE_DIVERGENCES`). site-235 and site-237 live on
+/// page 8, a still-allocated leaf page; fqlite's in-page free-block carver and
+/// undark reach them, our freelist-only carver does not.
+const FQLITE_IN_PAGE_DIVERGENCES: &[u32] = &[235, 237];
+
+/// Deleted-range urls our carver recovers but fqlite does NOT, for a documented
+/// and understood reason (the freelist TRUNK page). Rows site-238..=site-276
+/// live on page 9, the freelist trunk page; fqlite reads page 9 only as a trunk
+/// (next-pointer + leaf-pointer array) and does not carve record content from
+/// its body, whereas our carver (and undark) scan the trunk page body bytes
+/// below the small trunk header. This is the inverse of the DC3 gap: the two
+/// tools draw the freelist-vs-content boundary in different places. See
+/// `docs/validation.md` for the page-level diagnosis.
+const FQLITE_TRUNK_PAGE_DIVERGENCES: std::ops::RangeInclusive<u32> = 238..=276;
+
 /// OUR fixture, reconciled against the SECOND independent oracle: fqlite.
 ///
-/// RED claim: our carver and fqlite recover the *identical* deleted-row set
-/// (same url/title content). Deliberately strict so the harness is proven able
-/// to fail before GREEN relaxes it to the honest, page-diagnosed criterion.
+/// Honest GREEN criterion (page-diagnosed, not "identical sets"):
+///   1. No false positives: every deleted row we carve, fqlite also recovers,
+///      except the documented freelist-trunk-page rows fqlite structurally skips.
+///   2. Exact content agreement (url + title) on every overlapping row.
+///   3. Every fqlite-recovered deleted row is either recovered by us or a
+///      documented allocated-page in-page remnant.
+///
+/// Both divergence sets are asserted to be *real* (the tools genuinely disagree
+/// there), so a future carver change cannot leave a stale exemption.
 #[test]
 fn our_fixture_agrees_with_fqlite() {
     let Some(tap) = fqlite_tap() else {
@@ -314,22 +339,85 @@ fn our_fixture_agrees_with_fqlite() {
     let ours = ours_recover_by_url(&db, 6);
     let oracle = fqlite_recover(&tap, &db_path);
 
-    // Restrict both to the deleted-range urls (site-201..=site-400).
-    let in_del = |url: &str| {
+    // site-N id of a deleted-range url, if any.
+    let site_id = |url: &str| -> Option<u32> {
         url.strip_prefix("https://site-")
             .and_then(|s| s.split('.').next())
             .and_then(|n| n.parse::<u32>().ok())
-            .is_some_and(|n| (201..=400).contains(&n))
+            .filter(|n| (201..=400).contains(n))
     };
-    let ours_urls: std::collections::BTreeSet<&String> =
-        ours.keys().filter(|u| in_del(u)).collect();
-    let oracle_urls: std::collections::BTreeSet<&String> =
-        oracle.keys().filter(|u| in_del(u)).collect();
+    let ours_del: BTreeMap<u32, &(i64, String, String)> = ours
+        .iter()
+        .filter_map(|(u, v)| site_id(u).map(|n| (n, v)))
+        .collect();
+    let oracle_del: BTreeMap<u32, &(i64, String, String)> = oracle
+        .iter()
+        .filter_map(|(u, v)| site_id(u).map(|n| (n, v)))
+        .collect();
 
-    // RED: demand exact set equality on the recovered urls.
+    let trunk = &FQLITE_TRUNK_PAGE_DIVERGENCES;
+    let in_page: std::collections::BTreeSet<u32> =
+        FQLITE_IN_PAGE_DIVERGENCES.iter().copied().collect();
+
+    // (1) No false positives, modulo the documented trunk-page rows fqlite skips.
+    let mut ours_uncorroborated: Vec<u32> = ours_del
+        .keys()
+        .filter(|n| !oracle_del.contains_key(n) && !trunk.contains(n))
+        .copied()
+        .collect();
+    ours_uncorroborated.sort_unstable();
+    assert!(
+        ours_uncorroborated.is_empty(),
+        "rows we carve that fqlite neither recovers nor explains (possible false positives): {ours_uncorroborated:?}"
+    );
+
+    // (2) Exact content agreement (url + title) on every overlapping row.
+    for (n, ours_val) in &ours_del {
+        if let Some(oracle_val) = oracle_del.get(n) {
+            assert_eq!(
+                (&ours_val.1, &ours_val.2),
+                (&oracle_val.1, &oracle_val.2),
+                "site-{n}: content mismatch ours {ours_val:?} vs fqlite {oracle_val:?}"
+            );
+        }
+    }
+
+    // (3) Every fqlite-recovered deleted row is recovered by us or a documented
+    // allocated-page in-page remnant.
+    let mut fqlite_unexplained: Vec<u32> = oracle_del
+        .keys()
+        .filter(|n| !ours_del.contains_key(n) && !in_page.contains(n))
+        .copied()
+        .collect();
+    fqlite_unexplained.sort_unstable();
+    assert!(
+        fqlite_unexplained.is_empty(),
+        "fqlite recovered deleted rows we miss with no documented reason: {fqlite_unexplained:?}"
+    );
+
+    // Both documented divergences must be real (the tools genuinely disagree),
+    // so neither exemption can silently go stale.
+    for n in FQLITE_IN_PAGE_DIVERGENCES {
+        assert!(
+            oracle_del.contains_key(n) && !ours_del.contains_key(n),
+            "stale in-page exemption site-{n}: fqlite/ours no longer disagree — re-verify"
+        );
+    }
+    assert!(
+        trunk
+            .clone()
+            .any(|n| ours_del.contains_key(&n) && !oracle_del.contains_key(&n)),
+        "stale trunk-page exemption: fqlite no longer skips the freelist trunk page — re-verify"
+    );
+
+    // Row-300 verbatim, cross-checked against fqlite too.
     assert_eq!(
-        ours_urls, oracle_urls,
-        "our carved deleted-row set must equal fqlite's exactly"
+        oracle_del.get(&300).map(|v| (&v.1, &v.2)),
+        Some((
+            &"https://site-300.example.com/path/page".to_string(),
+            &"Title for record number 300 SECRETMARKER".to_string()
+        )),
+        "row 300 must be recovered verbatim and agree with fqlite"
     );
 }
 

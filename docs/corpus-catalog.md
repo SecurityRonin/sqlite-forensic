@@ -125,12 +125,14 @@ PY
 - md5 `wal_places.db` = `bad96eb068359bcb142533696b6515fc`, 8192 bytes.
 - md5 `wal_places.db-wal` = `84b08a77d90914c917d92e60a6c8eeab`, 4152 bytes.
 
-## §F Independent oracle tool — `undark` (VENDORED, not committed)
+## §F Independent oracle tools (VENDORED, not committed)
 
-The independent reference carver used to validate `carve_deleted_records`
-(differential methodology in `docs/validation.md`; harness in
-`forensic/tests/oracle_differential.rs`). `tools/` is gitignored — the binary is **not
-committed**; this entry is its provenance record.
+Two independent reference carvers validate `carve_deleted_records` (differential
+methodology in `docs/validation.md`; harness in
+`forensic/tests/oracle_differential.rs`). `tools/` is gitignored — neither tool is
+**committed**; these entries are their provenance record.
+
+### §F.1 `undark` (C) — test gate `UNDARK_BIN`
 
 - Classification: `VENDORED` (third-party tool), confidence `✓` (built and run).
 - Tool: `undark` 0.7.1, Paul L. Daniels.
@@ -146,12 +148,31 @@ committed**; this entry is its provenance record.
   (`rowid,id,col1,col2,…`); deleted rows = recovered rowids absent from the live
   b-tree.
 
-> Why not fqlite: fqlite has been GUI-only since v2.0 ("command line mode was
-> cancelled"), ships only ~440 MB `jpackage` installers (no CLI jar), is not on
-> Maven Central, and ships no test databases in its repo — so it cannot serve as
-> a headless oracle or supply a corpus. `undark` is the substitute oracle; the
-> DC3 corpus below supplies independent input. Full evidence in
-> `docs/validation.md`.
+### §F.2 `fqlite` (Java) — test gate `FQLITE_TAP`
+
+fqlite's CLI was removed at v2.0, but its carving engine (`fqlite.base.Job`) is
+plain Java that populates a result list the GUI merely reads. A headless
+source-instrumentation tap drives it with no JavaFX UI — so fqlite IS usable as
+an oracle, the CLI cancellation was the only blocker.
+
+- Classification: `VENDORED` (third-party tool, source-instrumented), confidence
+  `✓` (built and run).
+- Tool: `fqlite` 4.22, Dirk Pawlaszczyk.
+- Upstream: <https://github.com/pawlaszczyk/fqlite>
+- Commit: `26922bd9e3cdc60c93b72dfb1fb2f5972a0af6a6`.
+- Build: clone at the commit, null-guard the unguarded `gui.add_table(...)` calls
+  in `Job.java`, stub the `rag`/`erm` LLM packages, compile the engine + the
+  `HeadlessTap` driver against JavaFX 22 + commons-codec/jspecify/antlr/sqlite-jdbc
+  (JDK 25, `--release 21`). Full recipe in `tools/fqlite/README.md`; engine API
+  map + the JavaFX-coupling findings (relevant to a future upstream CLI revival)
+  in `tools/fqlite/ENGINE_NOTES.md`. Both gitignored.
+- Invocation: `tools/fqlite/run-tap.sh <db>` → CSV `rowid,col1,col2,…` of
+  recovered DELETED rows (rowid `-1` when fqlite cannot recover it; the fqlite
+  comparison is keyed by url content).
+
+> `sqlite_dissect` was also evaluated as an oracle but its free-block carver
+> produced misaligned/garbled columns on these fixtures, so it was rejected as a
+> yardstick; its DC3-authored databases are still used as independent input (§G).
 
 ## §G `tests-oracle-corpus/dc3-sqlite-dissect/`  (REAL-ext, not committed)
 
@@ -200,5 +221,7 @@ Committed fixtures (under `tests/data/`, `tests/data/`):
 | `tests/data/deleted_places.db` | `16682d7df99b1e8a89287a508d95eb47` | 53248 |
 
 Not committed (provenance only — see §F, §G and the per-directory READMEs):
-`tools/undark`, and the DC3 corpus under `tests-oracle-corpus/dc3-sqlite-dissect/`
-(full sha256/md5 list in `tests-oracle-corpus/README.md`).
+`tools/undark`, the fqlite tap under `tools/fqlite/` (source, jars, built classes
+— recipe in `tools/fqlite/README.md`), and the DC3 corpus under
+`tests-oracle-corpus/dc3-sqlite-dissect/` (full sha256/md5 list in
+`tests-oracle-corpus/README.md`).

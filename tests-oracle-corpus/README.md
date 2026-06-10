@@ -3,8 +3,9 @@
 These SQLite databases are **third-party, externally authored** test artifacts
 used as independent INPUT for the deleted-record carving validation
 (`forensic/tests/oracle_differential.rs`; methodology in `../docs/validation.md`). They
-are paired with the independent `undark` oracle so that, for these cases, neither
-the input DB nor the recovery oracle is ours — the strongest Doer-Checker form.
+are paired with the independent `undark` and `fqlite` oracles so that, for these
+cases, neither the input DB nor the recovery oracle is ours — the strongest
+Doer-Checker form.
 
 This directory is **gitignored** — the `.db` files are NOT committed. This README
 is their provenance record (modelled on how `~/src/issen/tests/data/README.md`
@@ -24,7 +25,7 @@ prefix to match the filenames below), e.g. fetch each from the raw base URL.
 - **Raw base URL:**
   <https://raw.githubusercontent.com/dod-cyber-crime-center/sqlite-dissect/master/sqlite_dissect/tests/test_files/>
 - **Identity:** crafted SQLite databases exercising deletion/recovery edge cases,
-  authored by neither us nor undark's author.
+  authored by neither us nor the oracle (undark/fqlite) authors.
 
 ### Files wired into the differential test (contain carvable deleted records)
 
@@ -39,8 +40,8 @@ prefix to match the filenames below), e.g. fetch each from the raw base URL.
 
 > All six exercise scenarios our whole-freed-page fixture cannot reach. Our
 > freelist-only carver recovers 0 from each (the documented scope boundary in
-> `../docs/validation.md`); undark recovers them. The test asserts our carver
-> produces no false positives and records the gap explicitly.
+> `../docs/validation.md`); both undark and fqlite recover them. The test asserts
+> our carver produces no false positives and records the gap explicitly.
 
 ### Other DC3 files downloaded (no carvable deleted records / not wired in)
 

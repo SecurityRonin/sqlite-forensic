@@ -12,3 +12,11 @@ version = "0.1.0"
 dependencies = [
  "forensicnomicon",
 ]
+
+[[package]]
+name = "sqlite-forensic"
+version = "0.1.0"
+dependencies = [
+ "forensicnomicon",
+ "sqlite-core",
+]

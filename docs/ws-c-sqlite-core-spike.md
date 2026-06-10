@@ -183,14 +183,19 @@ NTFS, the registry, VHDX, etc.; SQLite is the same call.
 
 ## Prototype status
 
-- **Crate:** `~/src/sqlite-core` (`[lib] name = "sqlite_core"`), single-crate
-  workspace carrying the Paranoid-Gatekeeper lints (`unwrap_used`/`expect_used =
-  deny`, `unsafe_code = forbid`).
-- **Tests:** 12 passing (8 unit + 4 integration). Clippy pedantic `-D warnings`
-  clean; `cargo fmt --check` clean. Production code is panic-free (no
-  `unwrap`/`expect`/`panic!`/unchecked indexing).
-- **Commits (gitsign-signed, local only — no GitHub remote created):**
-  - RED: `test(sqlite-core): RED — native header parse + table-walk against real .db`
-  - GREEN: `feat(sqlite-core): GREEN — native panic-free SQLite header + table-walk`
-- The repo is **local only**. Creating a GitHub remote needs the user's
-  authorization and was deliberately not done.
+- **Repo:** `~/src/sqlite-forensic` — a workspace on the fleet `*-core`/`*-forensic`
+  standard (matching `ntfs-forensic`/`vmdk-forensic`):
+  - `core/` → crate `sqlite-core` (`[lib] name = "sqlite_core"`) — the native
+    reader this spike proves.
+  - `forensic/` → crate `sqlite-forensic` — the anomaly auditor; WS-C ships a
+    minimal skeleton grading one header observation (`SQLITE-RESERVED-SPACE-NONZERO`),
+    which WS-E expands into b-tree carving, deleted-record recovery, freelist
+    anomalies, and WAL-overlay honesty.
+  - Root carries the Paranoid-Gatekeeper `[workspace.lints]` (`unwrap_used`/
+    `expect_used = deny`, `unsafe_code = forbid`) and the tooling files
+    (`deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitleaks.toml`, `LICENSE`).
+- **Tests:** 15 passing (8 reader unit + 4 reader integration + 3 forensic).
+  Clippy pedantic clean; `cargo fmt --check` clean. Production code is panic-free
+  (no `unwrap`/`expect`/`panic!`/unchecked indexing).
+- **Origin:** the spike began life as the single-crate `~/src/sqlite-core` repo;
+  its git history is preserved through the restructure via `git mv`.

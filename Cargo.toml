@@ -1,25 +1,12 @@
-[package]
-name = "sqlite-core"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-description = "Native, read-only, panic-free SQLite file-format reader for forensics (WS-C spike prototype)."
-
-[lib]
-name = "sqlite_core"
-path = "src/lib.rs"
-
-[dependencies]
-# Consume KNOWLEDGE-layer format constants instead of re-hardcoding them.
-forensicnomicon = { path = "../forensicnomicon" }
-
-[lints]
-workspace = true
-
 [workspace]
-# Single-crate workspace so the Paranoid-Gatekeeper lints live in one place,
-# matching the ntfs-forensic reference layout. WS-E would split this into
-# core/ + forensic/ members.
+resolver = "2"
+members = ["core", "forensic"]
+
+[workspace.dependencies]
+# KNOWLEDGE-layer format constants + the shared report model (Severity/Observation).
+forensicnomicon = { path = "../forensicnomicon" }
+# The native reader, consumed by the forensic analyzer.
+sqlite-core = { version = "0.1.0", path = "core" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

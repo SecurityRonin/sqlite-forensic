@@ -279,6 +279,53 @@ of `docs/recovery-comparison.md`.
   `tests/data/nemetz/gen_ground_truth.py`; the harness reads the manifest, never
   the `.xml` at test time.
 
+## §J `tests/data/wal_carve.db` + `…-wal`  (WAL-frame deleted-residue carving)
+
+A main DB + persistent `-wal` sidecar where the genuinely-different deleted rows
+live **only in the uncheckpointed WAL frames**, never on the main file's pages.
+A `wal_checkpoint(TRUNCATE)` first flushes a clean baseline (rows 1..=50) to the
+main file and empties the WAL; then — with a held reader blocking any further
+checkpoint — rows 101..=150 are inserted (COMMIT) and 121..=140 deleted (COMMIT),
+with **no checkpoint**. So the freed-cell residue for 121..=140 exists only in the
+`-wal` frames; the on-disk pages never held rows 101..=150. Drives the WAL-frame
+carving tests in `core/tests/wal.rs` and `forensic/tests/carve_all.rs` (#60).
+
+```sh
+python3 - <<'PY'
+import sqlite3, shutil, os
+for f in ('walcarve.db','walcarve.db-wal','walcarve.db-shm'):
+    if os.path.exists(f): os.remove(f)
+con = sqlite3.connect('walcarve.db')
+con.execute("PRAGMA page_size=4096")
+con.execute("PRAGMA journal_mode=WAL")
+con.execute("PRAGMA wal_autocheckpoint=0")
+con.execute("CREATE TABLE msg(id INTEGER PRIMARY KEY, sender TEXT, body TEXT)")
+for i in range(1, 51):
+    con.execute("INSERT INTO msg VALUES (?,?,?)", (i, f"alice{i}", f"baseline message {i}"))
+con.commit()
+con.execute("PRAGMA wal_checkpoint(TRUNCATE)"); con.commit()   # baseline → main file, WAL emptied
+reader = sqlite3.connect('walcarve.db')                        # hold a read txn (blocks checkpoint)
+reader.execute("BEGIN"); reader.execute("SELECT count(*) FROM msg").fetchone()
+con.execute("PRAGMA wal_autocheckpoint=0")
+for i in range(101, 151):
+    con.execute("INSERT INTO msg VALUES (?,?,?)", (i, f"bob{i}", f"secret WAL body {i}"))
+con.commit()                                                   # INSERT commit → WAL frame 0
+con.execute("DELETE FROM msg WHERE id BETWEEN 121 AND 140"); con.commit()  # DELETE commit → WAL frame 1
+shutil.copy('walcarve.db','wal_carve.db')          # snapshot while WAL is live
+shutil.copy('walcarve.db-wal','wal_carve.db-wal')
+reader.close(); con.close()
+PY
+```
+
+- Ground truth: on-disk-only carve recovers **0** of the WAL-resident deleted rows
+  (their bytes are not in the main file); WAL-frame carve recovers **20/20** rows
+  121..=140, each tagged `RecoverySource::WalFrame` with `(salt1, salt2,
+  frame_index)` provenance, and re-surfaces **0** surviving (live) rows (101..=120,
+  141..=150). WAL = 2 COMMIT frames for page 2 (the INSERT commit, then the DELETE
+  commit).
+- md5 `wal_carve.db` = `6747389de0fefcc4c23543353a31325a`, 8192 bytes.
+- md5 `wal_carve.db-wal` = `598e80ad38536f4b7a6cb51ddaedc767`, 8272 bytes.
+
 ## §H MD5 manifest
 
 Committed fixtures (under `tests/data/`, `tests/data/`):
@@ -289,6 +336,8 @@ Committed fixtures (under `tests/data/`, `tests/data/`):
 | `tests/data/overflow.db` | `1c17320320a173fb5968c598f9df7373` | 16384 |
 | `tests/data/wal_places.db` | `bad96eb068359bcb142533696b6515fc` | 8192 |
 | `tests/data/wal_places.db-wal` | `84b08a77d90914c917d92e60a6c8eeab` | 4152 |
+| `tests/data/wal_carve.db` | `6747389de0fefcc4c23543353a31325a` | 8192 |
+| `tests/data/wal_carve.db-wal` | `598e80ad38536f4b7a6cb51ddaedc767` | 8272 |
 | `tests/data/deleted_places.db` | `16682d7df99b1e8a89287a508d95eb47` | 53248 |
 | `tests/data/updated_messages.db` | `e1edbb56bf37efa6a7c1e738040f1360` | 8192 |
 

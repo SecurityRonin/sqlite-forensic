@@ -191,11 +191,12 @@ fn on_disk_only_carve_misses_wal_only_deleted_rows() {
 
 /// WAL-frame carving (`open_with_wal`) recovers the deleted rows that live ONLY
 /// in the uncheckpointed WAL frames, tags them `RecoverySource::WalFrame`, and
-/// carries the (frame_index, salt1, salt2) LSN provenance — while never
+/// carries the `(frame_index, salt1, salt2)` LSN provenance — while never
 /// re-surfacing a live row (ids 101..=120, 141..=150 survive the DELETE).
 #[test]
 fn wal_frame_carve_recovers_wal_only_deleted_rows_with_provenance() {
-    let db = Database::open_with_wal(WAL_CARVE_MAIN.to_vec(), WAL_CARVE_WAL).expect("open with wal");
+    let db =
+        Database::open_with_wal(WAL_CARVE_MAIN.to_vec(), WAL_CARVE_WAL).expect("open with wal");
     let carved = carve_all_deleted_records(&db);
 
     // Recovered the bulk of the WAL-only deleted rows 121..=140.

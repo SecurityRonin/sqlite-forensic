@@ -248,6 +248,37 @@ differential test:
 | `corpus_0A-01.db` | `c640727d2fe3e269d196e64c25cf896e9fa21c2626d4f6b88398274c4e1691d1` | `a174174a3f98fe7733e4a32e7aab86b7` | 8192 |
 | `corpus_0A-02.db` | `030fd0a82fa37707f448e90a21bc178f120b018b009999daaefdc61d04b24d24` | `c1be2eb3388bc294ec0deecb334180b9` | 8192 |
 
+## §I `tests/data/nemetz/`  (REAL-ext, CC0, **committed**)
+
+The **SQLite Forensic Corpus** (Nemetz, Schmitt & Freiling, DFRWS-EU 2018) — a
+third-party dataset that ships, per database, an `.xml` answer key tagging every
+deleted row with its full decoded content. This is independent deleted-record
+**ground truth**: unlike our `deleted_places.db` fixture (we authored both the
+deleter and the carver), here a third party authored the deletions *and* the
+answer key, so a recall/precision number against it is real. It drives
+`forensic/tests/nemetz_metrics.rs` (the per-DB confusion matrix) and is the basis
+of `docs/recovery-comparison.md`.
+
+- Classification: `REAL-ext` (externally-authored real artifacts), confidence `✓`
+  (downloaded, extracted, SQLite magic + schema + answer-key parse confirmed per
+  file). **Committed** (CC0 public domain — redistribution unrestricted).
+- Authors: Sebastian Nemetz, Sven Schmitt, Felix Freiling (FAU Erlangen-Nuremberg).
+- Paper: <https://doi.org/10.1016/j.diin.2018.01.015>.
+- Download (v2.0): <https://downloads.digitalcorpora.org/corpora/sql/sqlite_forensic_corpus_v2.0.zip>
+  (302 → `digitalcorpora.s3.amazonaws.com`; `curl -L`). Zip md5
+  `02aa205efa80757602a2911156db79a6`.
+- Vendored subset (32 databases): deleted/overwritten categories `0A`,`0B`,`0C`,
+  `0D`,`0E` (per-row deleted ground truth) plus anti-forensic category `11`
+  (`*_antifor.db` — manipulated page/cell pointers, a no-phantom robustness test
+  with no deleted ground truth). Per-file md5 manifest, the category table, and
+  the `gen_ground_truth.py` regeneration recipe live in
+  [`../tests/data/nemetz/README.md`](../tests/data/nemetz/README.md) — the single
+  detailed index for this dataset (cross-referenced, not duplicated here).
+- Ground-truth manifest `tests/data/nemetz/nemetz_ground_truth.json` is generated
+  from the `.xml` answer keys by the committed
+  `tests/data/nemetz/gen_ground_truth.py`; the harness reads the manifest, never
+  the `.xml` at test time.
+
 ## §H MD5 manifest
 
 Committed fixtures (under `tests/data/`, `tests/data/`):
@@ -260,6 +291,10 @@ Committed fixtures (under `tests/data/`, `tests/data/`):
 | `tests/data/wal_places.db-wal` | `84b08a77d90914c917d92e60a6c8eeab` | 4152 |
 | `tests/data/deleted_places.db` | `16682d7df99b1e8a89287a508d95eb47` | 53248 |
 | `tests/data/updated_messages.db` | `e1edbb56bf37efa6a7c1e738040f1360` | 8192 |
+
+The 32 committed Nemetz databases under `tests/data/nemetz/` (CC0, §I) have their
+own md5 manifest in [`../tests/data/nemetz/README.md`](../tests/data/nemetz/README.md)
+to avoid duplicating it here.
 
 Not committed (provenance only — see §F, §G and the per-directory READMEs):
 `tools/undark`, the fqlite tap under `tools/fqlite/` (source, jars, built classes

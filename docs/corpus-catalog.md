@@ -272,8 +272,8 @@ of `docs/recovery-comparison.md`.
   (`*_antifor.db` — manipulated page/cell pointers, a no-phantom robustness test
   with no deleted ground truth). Per-file md5 manifest, the category table, and
   the `gen_ground_truth.py` regeneration recipe live in
-  [`../tests/data/nemetz/README.md`](../tests/data/nemetz/README.md) — the single
-  detailed index for this dataset (cross-referenced, not duplicated here).
+  `tests/data/nemetz/README.md` — the single detailed index for this dataset
+  (cross-referenced, not duplicated here).
 - Ground-truth manifest `tests/data/nemetz/nemetz_ground_truth.json` is generated
   from the `.xml` answer keys by the committed
   `tests/data/nemetz/gen_ground_truth.py`; the harness reads the manifest, never
@@ -293,8 +293,7 @@ Committed fixtures (under `tests/data/`, `tests/data/`):
 | `tests/data/updated_messages.db` | `e1edbb56bf37efa6a7c1e738040f1360` | 8192 |
 
 The 32 committed Nemetz databases under `tests/data/nemetz/` (CC0, §I) have their
-own md5 manifest in [`../tests/data/nemetz/README.md`](../tests/data/nemetz/README.md)
-to avoid duplicating it here.
+own md5 manifest in `tests/data/nemetz/README.md` to avoid duplicating it here.
 
 Not committed (provenance only — see §F, §G and the per-directory READMEs):
 `tools/undark`, the fqlite tap under `tools/fqlite/` (source, jars, built classes

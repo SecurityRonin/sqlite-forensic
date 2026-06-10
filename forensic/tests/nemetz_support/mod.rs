@@ -22,18 +22,15 @@ use std::sync::OnceLock;
 /// future normalization (trimming, case, encoding) stays symmetric by
 /// construction.
 #[must_use]
-pub fn normalize_row(_cells: &[String]) -> String {
-    // RED stub — the real normalization is implemented in GREEN. Until then every
-    // call yields a fresh, never-colliding key, so NO carved row can match any
-    // answer-key row: the true-positive count collapses to zero and the pinned
-    // recall floor fails. This proves the harness measures real carver↔truth
-    // matching rather than a tautology, and that the test was written first.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    format!(
-        "\u{0}UNIMPLEMENTED-{}",
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
+pub fn normalize_row(cells: &[String]) -> String {
+    // The answer-key row content and the carved row's decoded values both pass
+    // through here, so the comparison is symmetric by construction: the carver
+    // side stringifies a `Value` to the same shape the corpus's CSV/XML export
+    // uses (integers in decimal, reals at 5 dp, text verbatim, NULL as empty),
+    // and this join supplies the only column-boundary delimiter both sides share.
+    // The unit separator (U+001F) cannot occur in the corpus's decimal/text
+    // content, so distinct column boundaries never collide into a false match.
+    cells.join("\u{1f}")
 }
 
 // --- manifest model ----------------------------------------------------------

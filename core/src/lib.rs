@@ -749,6 +749,28 @@ impl Database {
         rows
     }
 
+    /// Decode every **currently-live** `sqlite_master` row (the schema table
+    /// rooted at page 1) into its column values: `(type, name, tbl_name,
+    /// rootpage, sql)`. This is the schema-table companion to
+    /// [`Database::live_rows`], which collects only USER-table b-trees and so
+    /// never sees the schema rows themselves.
+    ///
+    /// The forensic carver folds these into the same value-based live set it uses
+    /// to drop stale copies of live user rows: a record carved from a materialized
+    /// page 1 whose values equal a CURRENT schema row is the live schema entry
+    /// re-surfaced (drop it), whereas a genuinely-deleted PRIOR schema version has
+    /// different values (e.g. an old `CREATE TABLE`) and is still recovered.
+    ///
+    /// Best-effort, bounded, and panic-free: an unreadable schema yields an empty
+    /// vector rather than an error.
+    #[must_use]
+    pub fn live_schema_rows(&self) -> Vec<Vec<Value>> {
+        match self.read_table(1, 5) {
+            Ok(rows) => rows.into_iter().map(|row| row.values).collect(),
+            Err(_) => Vec::new(), // cov:unreachable: a validly-opened DB has a readable page-1 schema
+        }
+    }
+
     /// Walk the table b-tree rooted at `page`, decoding every live leaf cell's
     /// values (column count inferred per cell) into `rows` keyed by rowid.
     /// Best-effort and bounded, mirroring [`Database::collect_rowids`].

@@ -136,6 +136,36 @@ pub struct Database {
 struct WalOverlay {
     /// page number (1-based) → that page's newest committed contents.
     pages: std::collections::BTreeMap<u32, Vec<u8>>,
+    /// Every committed frame's page image, in file order, with provenance. Unlike
+    /// `pages` (newest version per page, the consistent view), this keeps EACH
+    /// committed frame so the carver can recover deleted residue that a later
+    /// frame for the same page superseded in `pages` but that still survives in an
+    /// earlier frame's slack — the genuinely-different records an on-disk-only
+    /// carve cannot see.
+    frames: Vec<WalFramePage>,
+}
+
+/// One committed WAL frame's full page image plus its provenance, exposed by
+/// [`Database::wal_frame_pages`] so the deleted-record carver can scan the
+/// uncheckpointed WAL frames the main file does not yet reflect.
+///
+/// The `(salt1, salt2, frame_index)` triple is the WAL log-sequence identity that
+/// task #55 will formalize: `salt1`/`salt2` pin the checkpoint generation and
+/// `frame_index` the position within it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalFramePage {
+    /// 0-based position of this frame within the `-wal` file (its LSN ordinal).
+    pub frame_index: usize,
+    /// 1-based database page number this frame rewrites.
+    pub page_no: u32,
+    /// WAL header salt-1 (checkpoint generation), shared by every live frame.
+    pub salt1: u32,
+    /// WAL header salt-2 (checkpoint generation), shared by every live frame.
+    pub salt2: u32,
+    /// Whether this is a COMMIT frame (`db_size_after_commit != 0`).
+    pub is_commit: bool,
+    /// The frame's full page image (`page_size` bytes).
+    pub page: Vec<u8>,
 }
 
 /// Hard cap on b-tree pages visited in one table walk, to bound work on a
@@ -211,6 +241,18 @@ impl Database {
     #[must_use]
     pub fn wal_applied(&self) -> bool {
         self.wal.as_ref().is_some_and(|w| !w.pages.is_empty())
+    }
+
+    /// Every committed `-wal` frame's page image, in file order, with provenance.
+    ///
+    /// Empty when the database was opened without a WAL (or the WAL held no
+    /// committed frames). The carver scans these page images for deleted-cell
+    /// residue that lives ONLY in the uncheckpointed WAL — the genuinely-different
+    /// records the on-disk pages do not hold — tagging each with the
+    /// `(salt1, salt2, frame_index)` log-sequence identity.
+    #[must_use]
+    pub fn wal_frame_pages(&self) -> &[WalFramePage] {
+        self.wal.as_ref().map_or(&[], |w| w.frames.as_slice())
     }
 
     #[must_use]
@@ -367,6 +409,51 @@ impl Database {
                 out.push(cell);
             } else {
                 off += 1;
+            }
+        }
+        out
+    }
+
+    /// Decode **every cell present in a table-leaf page image** (type `0x0D`) by
+    /// walking its cell-pointer array, inferring each record's column count from
+    /// its own serial-type array. Unlike [`Database::carve_free_regions`] (which
+    /// scans only free space and excludes live cells), this returns the cells the
+    /// page itself records as allocated.
+    ///
+    /// This is the primitive WAL-frame recovery needs: a `-wal` frame is a full
+    /// page snapshot at one point in time, so a cell that is allocated in an
+    /// EARLIER frame's image but absent from the final WAL-applied view is a row
+    /// that was deleted later and survives ONLY in that superseded frame. The
+    /// caller filters the returned cells against the final live view to isolate
+    /// exactly those genuinely-deleted rows (so a still-live row is never
+    /// re-surfaced — the filter is the caller's responsibility, mirroring the
+    /// freeblock-reconstruction discipline).
+    ///
+    /// Bounded and panic-free: a malformed cell pointer or record simply yields
+    /// fewer cells. Non-leaf pages yield nothing.
+    #[must_use]
+    pub fn carve_leaf_cells(&self, page_bytes: &[u8]) -> Vec<CarvedCell> {
+        let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
+            SQLITE_HEADER_SIZE
+        } else {
+            0
+        };
+        let Some(&page_type) = page_bytes.get(hdr_off) else {
+            return Vec::new();
+        };
+        if page_type != 0x0d {
+            return Vec::new(); // only table-leaf pages hold decodable cells here
+        }
+        let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
+        let cell_ptr_array = hdr_off + 8; // leaf b-tree header is 8 bytes
+        let mut out = Vec::new();
+        for i in 0..cell_count {
+            let cell_off = be_u16(page_bytes, cell_ptr_array + i * 2) as usize;
+            if cell_off == 0 || cell_off >= page_bytes.len() {
+                continue; // cov:unreachable: a valid leaf points cells within page
+            }
+            if let Some(cell) = try_carve_cell_at(page_bytes, cell_off, None) {
+                out.push(cell);
             }
         }
         out
@@ -955,6 +1042,11 @@ impl WalOverlay {
             std::collections::BTreeMap::new();
         let mut pending: std::collections::BTreeMap<u32, Vec<u8>> =
             std::collections::BTreeMap::new();
+        // Every committed frame's page image (file order), and the pending frames
+        // not yet promoted by a COMMIT. Mirrors the page promotion above so
+        // uncommitted trailing frames are dropped from BOTH the view and the carve.
+        let mut frames: Vec<WalFramePage> = Vec::new();
+        let mut pending_frames: Vec<WalFramePage> = Vec::new();
 
         let mut off = SQLITE_WAL_HEADER_SIZE;
         // One frame per page in the file is the natural breadth cap; allow a
@@ -983,12 +1075,24 @@ impl WalOverlay {
                 .get(SQLITE_WAL_FRAME_HEADER_SIZE..)
                 .ok_or(Error::TruncatedCell)?;
             pending.insert(page_no, data.to_vec());
+            let is_commit = db_size != 0;
+            pending_frames.push(WalFramePage {
+                frame_index: frame_no - 1, // 0-based file order
+                page_no,
+                salt1,
+                salt2,
+                is_commit,
+                page: data.to_vec(),
+            });
 
-            if db_size != 0 {
-                // COMMIT frame: promote everything pending into the snapshot.
+            if is_commit {
+                // COMMIT frame: promote everything pending into the snapshot AND
+                // into the committed frame list (keeping every frame, not just the
+                // newest version of each page).
                 for (p, d) in std::mem::take(&mut pending) {
                     committed.insert(p, d);
                 }
+                frames.append(&mut pending_frames);
             }
             off += frame_stride;
         }
@@ -996,7 +1100,10 @@ impl WalOverlay {
         if committed.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(WalOverlay { pages: committed }))
+            Ok(Some(WalOverlay {
+                pages: committed,
+                frames,
+            }))
         }
     }
 }
@@ -1590,6 +1697,26 @@ mod tests {
         assert!(db.carve_free_regions(&[0x05u8; 4096], 6).is_empty());
         // An empty / too-short slice yields nothing (no panic).
         assert!(db.carve_free_regions(&[], 6).is_empty());
+    }
+
+    #[test]
+    fn carve_leaf_cells_reads_allocated_cells_and_rejects_non_leaf() {
+        let db = Database::open(DELETED_DB.to_vec()).unwrap();
+        // Page 8 is an allocated table-leaf (live ids 181..=200); carve_leaf_cells
+        // decodes every cell the page records as allocated, so the live ids appear
+        // (unlike carve_free_regions, which excludes them).
+        let page = db.raw_page(8).unwrap();
+        let cells = db.carve_leaf_cells(page);
+        assert!(
+            cells.iter().any(|c| c.rowid == 181),
+            "must read the allocated cells of the leaf"
+        );
+        // Page 1 is passed whole (starts with the file magic) → header read at 100.
+        let _ = db.carve_leaf_cells(db.raw_page(1).unwrap());
+        // A non-leaf page (interior 0x05) and an empty/too-short slice yield nothing
+        // (no panic) — the same defensive arms carve_free_regions guards.
+        assert!(db.carve_leaf_cells(&[0x05u8; 4096]).is_empty());
+        assert!(db.carve_leaf_cells(&[]).is_empty());
     }
 
     #[test]

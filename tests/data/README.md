@@ -149,6 +149,53 @@ IS the provenance; there is no download URL.
   WAL-applied view = id=1 title `Rust (EDITED IN WAL)`, visit_count 777, plus id=3
   `WAL-ONLY ROW`, 3 rows. WAL = 1 COMMIT frame for page 2.
 
+#### wal_carve.db + wal_carve.db-wal
+
+- **Source:** SYNTHETIC — Python `sqlite3` module, snapshotted mid-transaction.
+- **Identity:** a main DB + persistent `-wal` sidecar where the genuinely-different
+  deleted rows live **only in the uncheckpointed WAL frames**, never on the main
+  file's pages. A `wal_checkpoint(TRUNCATE)` flushes a clean baseline (rows 1..=50)
+  to the main file and empties the WAL; then, with a held reader blocking any
+  further checkpoint, rows 101..=150 are inserted (COMMIT) and 121..=140 deleted
+  (COMMIT) with **no checkpoint**. Used by the WAL-frame carving tests in
+  `core/tests/wal.rs` and `forensic/tests/carve_all.rs` (#60). Cross-referenced in
+  `docs/corpus-catalog.md` §J.
+- **Generator:**
+
+  ```sh
+  python3 - <<'PY'
+  import sqlite3, shutil, os
+  for f in ('walcarve.db','walcarve.db-wal','walcarve.db-shm'):
+      if os.path.exists(f): os.remove(f)
+  con = sqlite3.connect('walcarve.db')
+  con.execute("PRAGMA page_size=4096")
+  con.execute("PRAGMA journal_mode=WAL")
+  con.execute("PRAGMA wal_autocheckpoint=0")
+  con.execute("CREATE TABLE msg(id INTEGER PRIMARY KEY, sender TEXT, body TEXT)")
+  for i in range(1, 51):
+      con.execute("INSERT INTO msg VALUES (?,?,?)", (i, f"alice{i}", f"baseline message {i}"))
+  con.commit()
+  con.execute("PRAGMA wal_checkpoint(TRUNCATE)"); con.commit()   # baseline -> main file, WAL emptied
+  reader = sqlite3.connect('walcarve.db')                        # hold a read txn (blocks checkpoint)
+  reader.execute("BEGIN"); reader.execute("SELECT count(*) FROM msg").fetchone()
+  con.execute("PRAGMA wal_autocheckpoint=0")
+  for i in range(101, 151):
+      con.execute("INSERT INTO msg VALUES (?,?,?)", (i, f"bob{i}", f"secret WAL body {i}"))
+  con.commit()                                                   # INSERT commit -> WAL frame 0
+  con.execute("DELETE FROM msg WHERE id BETWEEN 121 AND 140"); con.commit()  # DELETE commit -> WAL frame 1
+  shutil.copy('walcarve.db','wal_carve.db')          # snapshot while WAL is live
+  shutil.copy('walcarve.db-wal','wal_carve.db-wal')
+  reader.close(); con.close()
+  PY
+  ```
+
+- **md5:** `wal_carve.db` = `6747389de0fefcc4c23543353a31325a` (8192 bytes);
+  `wal_carve.db-wal` = `598e80ad38536f4b7a6cb51ddaedc767` (8272 bytes).
+- **Notable contents:** on-disk-only carve recovers 0 of the WAL-resident deleted
+  rows; WAL-frame carve recovers 20/20 rows 121..=140 (tagged
+  `RecoverySource::WalFrame` with `(salt1, salt2, frame_index)` provenance) and
+  re-surfaces 0 surviving (live) rows. WAL = 2 COMMIT frames for page 2.
+
 #### updated_messages.db
 
 - **Source:** SYNTHETIC — Python `sqlite3` module.

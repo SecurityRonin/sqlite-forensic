@@ -100,8 +100,14 @@ fn wal_frame_pages_exposes_each_frames_image_and_provenance() {
         // LSN that #55 will formalize); both frames share the WAL header salts.
         assert!(f.salt1 != 0 && f.salt2 != 0, "frame carries WAL salts");
     }
-    assert_eq!(frames[0].salt1, frames[1].salt1, "same checkpoint generation");
-    assert_eq!(frames[0].salt2, frames[1].salt2, "same checkpoint generation");
+    assert_eq!(
+        frames[0].salt1, frames[1].salt1,
+        "same checkpoint generation"
+    );
+    assert_eq!(
+        frames[0].salt2, frames[1].salt2,
+        "same checkpoint generation"
+    );
 
     // The newest frame (the DELETE commit) is a commit frame.
     assert!(frames[1].is_commit, "the DELETE frame is a COMMIT frame");

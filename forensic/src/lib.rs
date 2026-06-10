@@ -302,6 +302,26 @@ pub enum RecoverySource {
     /// rowid is destroyed (surfaced as `0`), so this is the weakest in-page class
     /// — a low-confidence "consistent with a deleted row" lead.
     FreeblockReconstructed,
+    /// Residue carved from an **uncheckpointed WAL frame's page image** rather
+    /// than the on-disk pages. A `-wal` frame holds a committed page version the
+    /// main file does not yet reflect; deleted cells freed within that version
+    /// survive in the frame's slack and exist NOWHERE on disk. The record carries
+    /// the `(salt1, salt2, frame_index)` log-sequence provenance in
+    /// [`CarvedRecord::wal`].
+    WalFrame,
+}
+
+/// Provenance for a record carved from a `-wal` frame: the
+/// `(salt1, salt2, frame_index)` log-sequence identity of the frame it came from
+/// (the LSN task #55 will formalize).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalProvenance {
+    /// 0-based position of the source frame within the `-wal` file.
+    pub frame_index: usize,
+    /// WAL header salt-1 (checkpoint generation) of the source frame.
+    pub salt1: u32,
+    /// WAL header salt-2 (checkpoint generation) of the source frame.
+    pub salt2: u32,
 }
 
 /// A deleted record recovered from unallocated space — the headline capability
@@ -324,6 +344,10 @@ pub struct CarvedRecord {
     pub allocated: bool,
     /// Which class of free space this record was recovered from.
     pub source: RecoverySource,
+    /// WAL log-sequence provenance, present **only** for
+    /// [`RecoverySource::WalFrame`] records (the frame the residue was carved
+    /// from); `None` for every on-disk class.
+    pub wal: Option<WalProvenance>,
 }
 
 /// Recover deleted records by carving the database's free (unallocated) pages.
@@ -356,6 +380,7 @@ pub fn carve_deleted_records(db: &Database, column_count: usize) -> Vec<CarvedRe
                 confidence: cell.confidence,
                 allocated: false,
                 source: RecoverySource::FreelistPage,
+                wal: None,
             });
         }
     }
@@ -410,6 +435,7 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
                     confidence: cell.confidence,
                     allocated: false,
                     source,
+                    wal: None,
                 });
             }
         }
@@ -430,6 +456,7 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
                 confidence: cell.confidence,
                 allocated: false,
                 source: RecoverySource::InPageFreeBlock,
+                wal: None,
             });
         }
         // (2b) Freeblock reconstruction: the freed cells whose first four bytes
@@ -446,6 +473,54 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
                 confidence: cell.confidence,
                 allocated: false,
                 source: RecoverySource::FreeblockReconstructed,
+                wal: None,
+            });
+        }
+    }
+
+    // (3) WAL-frame carving (additive — runs ONLY when a `-wal` overlay is in
+    // effect). The on-disk path above reads only the main file's pages, so it
+    // finds the SAME residue whether or not a WAL was supplied; the genuinely-
+    // different deleted records live in the uncheckpointed WAL frames.
+    //
+    // A `-wal` frame is a FULL page snapshot at one point in the transaction
+    // history. A row deleted late in that history is still a live cell in an
+    // EARLIER frame's image; it exists nowhere on disk and in no later frame.
+    // Three primitives over each committed frame's page image surface it:
+    //
+    //   * `carve_leaf_cells` — every cell the frame records as allocated. A cell
+    //     that is allocated in a superseded frame but ABSENT from the final
+    //     WAL-applied live view is exactly such a deleted row (recovered as a
+    //     clean, intact record — the strongest WAL case).
+    //   * `carve_free_regions` / `reconstruct_freeblock_records` — residue freed
+    //     WITHIN a frame (e.g. the DELETE-commit frame's own freeblocks), matching
+    //     the on-disk in-page classes.
+    //
+    // Every candidate is tagged `WalFrame` with the (salt1, salt2, frame_index)
+    // LSN provenance, and the shared live-row precision filter below drops any
+    // whose values match a currently-live row — so a surviving row is never
+    // re-surfaced (the 0-false-positive guarantee, against the WAL-applied view).
+    for frame in db.wal_frame_pages() {
+        let prov = WalProvenance {
+            frame_index: frame.frame_index,
+            salt1: frame.salt1,
+            salt2: frame.salt2,
+        };
+        let cells = db
+            .carve_leaf_cells(&frame.page)
+            .into_iter()
+            .chain(db.carve_free_regions(&frame.page, 0))
+            .chain(db.reconstruct_freeblock_records(&frame.page));
+        for cell in cells {
+            out.push(CarvedRecord {
+                page: frame.page_no,
+                offset: cell.offset,
+                rowid: cell.rowid,
+                values: cell.values,
+                confidence: cell.confidence,
+                allocated: false,
+                source: RecoverySource::WalFrame,
+                wal: Some(prov),
             });
         }
     }
@@ -475,6 +550,14 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
         // any whose decoded values match a currently-live row (never re-surface a
         // live row), even though we cannot key it by rowid.
         if rec.source == RecoverySource::FreeblockReconstructed {
+            return !live_value_keys.contains(&format!("{:?}", rec.values));
+        }
+        // WAL-frame residue is guarded the same way and KEEPS its WalFrame tag:
+        // drop any record whose values match a currently-live row (the WAL-applied
+        // view's live set), so a row that survived the deletion is never
+        // re-surfaced; a genuinely-deleted WAL row has no live match and is kept
+        // with its frame provenance intact (not reclassified to PriorVersion).
+        if rec.source == RecoverySource::WalFrame {
             return !live_value_keys.contains(&format!("{:?}", rec.values));
         }
         match live.get(&rec.rowid) {

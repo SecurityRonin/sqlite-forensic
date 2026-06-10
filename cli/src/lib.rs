@@ -64,6 +64,7 @@ pub fn recovery_source_token(source: RecoverySource) -> &'static str {
         RecoverySource::DroppedTable => "dropped-table",
         RecoverySource::PriorVersion => "prior-version",
         RecoverySource::FreeblockReconstructed => "freeblock-reconstructed",
+        RecoverySource::WalFrame => "wal-frame",
         // `RecoverySource` is #[non_exhaustive]: a future class renders as its
         // Debug form rather than panicking or mislabelling.
         _ => "other", // cov:unreachable: all RecoverySource variants known at build time are matched above
@@ -351,6 +352,7 @@ mod tests {
             confidence,
             allocated: false,
             source,
+            wal: None,
         }
     }
 

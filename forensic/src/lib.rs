@@ -551,8 +551,15 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
     // Value-level identity of every live row, for collision-checking records whose
     // rowid is unknown (freeblock reconstructions have a destroyed rowid, so the
     // rowid-keyed filter below cannot protect against re-surfacing a live row).
-    let live_value_keys: std::collections::HashSet<String> =
-        live.values().map(|v| format!("{v:?}")).collect();
+    // The live set also includes the CURRENT `sqlite_master` rows: a record carved
+    // from a materialized page 1 (the schema table) whose values equal a live
+    // schema entry is that live row re-surfaced, not deleted residue — drop it.
+    // (Value-based, so a genuinely-deleted PRIOR schema version is still recovered.)
+    let live_value_keys: std::collections::HashSet<String> = live
+        .values()
+        .chain(db.live_schema_rows().iter())
+        .map(|v| format!("{v:?}"))
+        .collect();
     out.retain_mut(|rec| {
         // Freeblock reconstructions carry an unknown rowid → guard by value: drop
         // any whose decoded values match a currently-live row (never re-surface a
@@ -643,10 +650,16 @@ pub fn carve_at_commit(db: &Database, timeline: &WalTimeline, id: CommitId) -> V
 
     // Live-row precision filter (the WAL-applied view): drop any record whose
     // decoded values match a currently-live row, so a row that survives to the
-    // final state is never re-surfaced as "deleted at an earlier commit".
+    // final state is never re-surfaced as "deleted at an earlier commit". The
+    // live set includes the CURRENT `sqlite_master` rows, because a snapshot's
+    // materialized page 1 (the schema table) still holds the live schema cell —
+    // value-based, so a deleted PRIOR schema version is still recovered.
     let live = db.live_rows();
-    let live_value_keys: std::collections::HashSet<String> =
-        live.values().map(|v| format!("{v:?}")).collect();
+    let live_value_keys: std::collections::HashSet<String> = live
+        .values()
+        .chain(db.live_schema_rows().iter())
+        .map(|v| format!("{v:?}"))
+        .collect();
     out.retain(|rec| !live_value_keys.contains(&format!("{:?}", rec.values)));
 
     dedup_keep_best(out)

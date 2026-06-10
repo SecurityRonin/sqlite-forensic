@@ -317,10 +317,11 @@ fn phantom_fp_ceiling() {
 // is re-run to confirm). See docs/recovery-comparison.md for the full table.
 //
 // 0C true-positive total measured across the ten 0C databases (sum of the TP
-// column): the freeblock-prefix-clobber FN keeps this far below the 101 deleted
-// rows present — only records whose cell header survived the freeblock
-// conversion are recoverable by a forward parse.
-const NEMETZ_0C_TP_FLOOR: usize = 24;
+// column). Freeblock-aware reconstruction (task #56) recovers the freed cells
+// whose first four bytes were clobbered by freeblock conversion, by rebuilding
+// each record from its surviving serial-type tail plus the schema-derived header
+// template — raising this floor far above the forward-parse-only value (24).
+const NEMETZ_0C_TP_FLOOR: usize = 55;
 // Total phantom FP across the recall corpus (all-empty/NULL inferred records).
 const NEMETZ_FP_CEILING: usize = 10;
 // Dropped/overwritten-table recovery is bounded per DB (max recovered+fp seen).

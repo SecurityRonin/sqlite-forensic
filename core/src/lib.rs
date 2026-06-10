@@ -6,7 +6,9 @@
 //! ([`Database::freelist_pages`]), and applies a read-only `-wal` overlay
 //! ([`Database::open_with_wal`]) — all bounds-checked and panic-free on crafted
 //! input. [`Database::carve_cells`] recognizes record-shaped cells in
-//! free/unallocated space for the analyzer's deleted-record recovery.
+//! free/unallocated space for the analyzer's deleted-record recovery. The bespoke
+//! [`WalTimeline`] ([`Database::wal_timeline`]) models a `-wal` as a salt-bounded
+//! segment of materializable [`CommitSnapshot`]s for "carve all snapshots".
 //!
 //! Format constants are consumed from [`forensicnomicon::sqlite`] (the KNOWLEDGE
 //! leaf) where exposed; a few not-yet-promoted offsets (reserved-space 20,
@@ -143,6 +145,10 @@ struct WalOverlay {
     /// earlier frame's slack — the genuinely-different records an on-disk-only
     /// carve cannot see.
     frames: Vec<WalFramePage>,
+    /// The original `-wal` sidecar bytes, retained so [`Database::wal_timeline`]
+    /// can re-parse them into the richer segmented temporal model without the
+    /// caller re-supplying the file. Held read-only; never mutated.
+    raw: Vec<u8>,
 }
 
 /// One committed WAL frame's full page image plus its provenance, exposed by
@@ -253,6 +259,39 @@ impl Database {
     #[must_use]
     pub fn wal_frame_pages(&self) -> &[WalFramePage] {
         self.wal.as_ref().map_or(&[], |w| w.frames.as_slice())
+    }
+
+    /// Build the bespoke, format-exact [`WalTimeline`] for this database's `-wal`
+    /// sidecar, if one was supplied to [`Database::open_with_wal`].
+    ///
+    /// Returns `None` when the database was opened without a WAL, or the WAL held
+    /// no committed frame (no materializable state). The timeline enumerates the
+    /// segment's [`CommitSnapshot`]s — the only materializable database states —
+    /// each addressable by [`CommitId`]; see [`WalTimeline`].
+    ///
+    /// This consults the original `-wal` bytes retained at open time, re-parsing
+    /// them into the richer temporal model (the on-open [`WalOverlay`] keeps only
+    /// the consistent-view pages; the timeline keeps every segment, snapshot, and
+    /// residue tail). A page-size mismatch or malformed header surfaces as `None`
+    /// here — use [`Database::wal_timeline_from`] when you need the typed
+    /// [`WalValidationError`].
+    #[must_use]
+    pub fn wal_timeline(&self) -> Option<WalTimeline> {
+        let raw = self.wal.as_ref()?.raw.as_slice();
+        WalTimeline::parse(&self.bytes, raw, self.header.page_size).ok()
+    }
+
+    /// Parse a main database + `-wal` sidecar directly into a [`WalTimeline`],
+    /// surfacing the typed [`WalValidationError`] when the WAL is malformed.
+    ///
+    /// This is the validation-tier entry point: a page-size mismatch between the DB
+    /// header and the WAL header is a HARD STOP ([`WalValidationError::PageSizeMismatch`]),
+    /// not a silently mis-sliced overlay; a bad magic / unparsable header is
+    /// [`WalValidationError::BadMagic`]. Both are caught at the physical-validation
+    /// tier before any replay.
+    pub fn wal_timeline_from(bytes: &[u8], wal: &[u8]) -> Result<WalTimeline, WalValidationError> {
+        let header = parse_header(bytes).map_err(WalValidationError::Header)?;
+        WalTimeline::parse(bytes, wal, header.page_size)
     }
 
     #[must_use]
@@ -1103,8 +1142,536 @@ impl WalOverlay {
             Ok(Some(WalOverlay {
                 pages: committed,
                 frames,
+                raw: wal.to_vec(),
             }))
         }
+    }
+}
+
+// ===========================================================================
+// Bespoke, format-exact WAL temporal model (task #55)
+// ===========================================================================
+//
+// A `-wal` sidecar is NOT an open-ended event log. It is a BOUNDED SEGMENT under a
+// single salt epoch: every live frame shares the WAL header's (salt1, salt2). A
+// checkpoint reset renumbers frames and rolls the salts — a DISCONTINUITY, not a
+// continuation. The only materializable database states are the COMMIT snapshots:
+// the replay of all valid frames up to a commit frame. A frame BETWEEN commits is
+// not independently materializable, so it is never surfaced as a snapshot. Tails
+// past the last commit, or after a salt reset, are WAL residue — forensic leads,
+// never committed history.
+//
+// This model is self-contained in sqlite-core. The future state-history-forensic
+// [H] adapter attaches at the seam exposed here (WalLsn + CohortTopology +
+// `checksums_are_tamper_evident`), but sqlite-core does NOT depend on it.
+
+/// Cap on the number of salt segments and frames the timeline parser will walk on a
+/// crafted `-wal`, bounding work against an attacker-supplied file. A real WAL holds
+/// one segment with at most a few frames per database page.
+const MAX_WAL_SEGMENTS: usize = 1024;
+
+/// Identity of one salt epoch within a `-wal` file: its 0-based segment ordinal.
+/// A fresh segment begins at file start and after every checkpoint salt reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WalSegmentId(pub usize);
+
+/// One salt epoch of a `-wal` file — a single bounded segment.
+///
+/// A `-wal` is a bounded segment, not an open-ended log: every live frame here shares
+/// `(salt1, salt2)`. A checkpoint reset (salt change + frame renumber) starts a NEW
+/// `WalSegment`; it is a discontinuity, never another epoch of the same segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalSegment {
+    /// This segment's ordinal within the WAL (0 = the segment at file start).
+    pub id: WalSegmentId,
+    /// WAL salt-1 (checkpoint generation), shared by every frame in the segment.
+    pub salt1: u32,
+    /// WAL salt-2 (checkpoint generation), shared by every frame in the segment.
+    pub salt2: u32,
+    /// Page size declared by the segment's frames (bytes).
+    pub page_size: u32,
+    /// Number of frames belonging to this segment.
+    pub frame_count: usize,
+    /// The checkpoint sequence number recorded in the WAL header (offset 12). For a
+    /// segment discovered after a reset within the same file this is the header's
+    /// value; per-segment sequence is otherwise not separately recorded.
+    pub checkpoint_seq: u32,
+}
+
+/// Address of a materializable database state: the replay of all valid frames up to
+/// a COMMIT frame. `CommitId = (segment, commit_frame_index, db_size_after_commit)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CommitId {
+    /// The salt segment this commit belongs to.
+    pub segment: WalSegmentId,
+    /// 0-based file-order index of the COMMIT frame within the segment.
+    pub commit_frame_index: usize,
+    /// `db_size_after_commit` recorded in the COMMIT frame header — the database's
+    /// page count once this commit is materialized.
+    pub db_size_after_commit: u32,
+}
+
+/// The salt-qualified log-sequence identity of a WAL position — the seam the future
+/// `state-history-forensic` `[H]` adapter maps onto `LsnKind::SqliteWal`.
+///
+/// A bare `frame_index` is meaningless across checkpoint resets (frames renumber), so
+/// ordering is ALWAYS qualified by `(salt1, salt2)`. The adapter must reconstruct
+/// `LsnKind::SqliteWal { salt1, salt2, frame_index }` from exactly this triple — never
+/// from a bare index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WalLsn {
+    /// Salt-1 of the owning segment (checkpoint generation).
+    pub salt1: u32,
+    /// Salt-2 of the owning segment (checkpoint generation).
+    pub salt2: u32,
+    /// 0-based frame index within that segment.
+    pub frame_index: usize,
+}
+
+/// Topology of the temporal cohort the WAL exposes — the shape the `[H]` adapter maps
+/// to `state-history-forensic::CohortTopology`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CohortTopology {
+    /// A single salt epoch: the commit snapshots form one linearly-ordered chain.
+    LinearSegment,
+    /// Multiple salt epochs (checkpoint resets) with no replay continuity between
+    /// them — each segment is linear internally but the segments are disconnected.
+    Disconnected,
+}
+
+/// One page's image at a particular [`CommitSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedPageVersion {
+    /// 1-based database page number.
+    pub page_no: u32,
+    /// The page's full image (`page_size` bytes) as of this commit.
+    pub bytes: Vec<u8>,
+}
+
+/// A materializable database state: the replay of all valid frames up to a COMMIT.
+///
+/// This is the ONLY independently-materializable WAL state. `page_version` resolves a
+/// page to its image as of this commit (the newest frame ≤ this commit that rewrote
+/// the page, else the acquired base image). A frame between commits is never a
+/// snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitSnapshot {
+    id: CommitId,
+    /// Salt-1 of the owning segment, carried so [`CommitSnapshot::lsn`] is
+    /// self-contained without a back-reference to the segment.
+    salt1: u32,
+    /// Salt-2 of the owning segment.
+    salt2: u32,
+    /// The materialized page images at this commit: base image overlaid with every
+    /// committed frame up to and including this commit (newest version per page),
+    /// capped to `db_size_after_commit` pages. `page_version` reads from this map.
+    overlaid: std::collections::BTreeMap<u32, Vec<u8>>,
+}
+
+impl CommitSnapshot {
+    /// This snapshot's [`CommitId`].
+    #[must_use]
+    pub fn id(&self) -> CommitId {
+        self.id
+    }
+
+    /// The database page count once this commit is materialized.
+    #[must_use]
+    pub fn db_size_after_commit(&self) -> u32 {
+        self.id.db_size_after_commit
+    }
+
+    /// The salt-qualified [`WalLsn`] of this commit (the `[H]` adapter seam).
+    #[must_use]
+    pub fn lsn(&self) -> WalLsn {
+        WalLsn {
+            salt1: self.salt1,
+            salt2: self.salt2,
+            frame_index: self.id.commit_frame_index,
+        }
+    }
+
+    /// The image of `page_no` as of this commit, or `None` for a page beyond the
+    /// committed database size that the WAL never rewrote.
+    #[must_use]
+    pub fn page_version(&self, page_no: u32) -> Option<CommittedPageVersion> {
+        let bytes = self.overlaid.get(&page_no)?.clone();
+        Some(CommittedPageVersion { page_no, bytes })
+    }
+}
+
+/// A page-level delta between two materialized states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalDiff {
+    changed: Vec<u32>,
+}
+
+impl WalDiff {
+    /// The 1-based page numbers whose bytes differ between the two states, ascending.
+    #[must_use]
+    pub fn changed_pages(&self) -> &[u32] {
+        &self.changed
+    }
+}
+
+/// A stale WAL tail surfaced for forensics — NOT committed history.
+///
+/// Frames past the last COMMIT of a segment, frames after a salt reset that cannot be
+/// replayed into the current segment, or a header/page-size break: all are residue.
+/// The examiner weighs them; they are never part of a consistent snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalResidue {
+    /// The segment the residue trails (the segment whose last commit it follows).
+    pub segment: WalSegmentId,
+    /// 0-based frame index (within the file) of the first residual frame.
+    pub first_frame_index: usize,
+    /// Number of residual frames.
+    pub frame_count: usize,
+    /// Why these frames are residue rather than committed history.
+    pub reason: ResidueReason,
+}
+
+/// Why a WAL tail is [`WalResidue`] (an invalidated-frame candidate), not history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidueReason {
+    /// Frames written after the segment's last COMMIT (uncommitted tail).
+    BeyondLastCommit,
+    /// Frames whose salt no longer matches the segment header (post-reset residue).
+    SaltReset,
+}
+
+/// Validation tier a WAL has cleared — strictly increasing assurance.
+///
+/// `PhysicalValidation` < `CommitValidation` < `ReplaySafe`. The timeline reports the
+/// highest tier reached; a page-size mismatch never even produces a timeline (it is a
+/// hard stop at parse, surfaced as [`WalValidationError::PageSizeMismatch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MaterializationSafety {
+    /// Header magic / format / page-size / salts / frame boundaries are well-formed,
+    /// but no committed snapshot was found (nothing to replay).
+    PhysicalValidated,
+    /// A last valid commit and committed frame ranges were established, but the
+    /// read-only replay overlay was not (or could not be) built.
+    CommitValidated,
+    /// A read-only replay overlay to the last commit is available — safe to
+    /// materialize without mutating either file.
+    ReplaySafe,
+}
+
+/// A WAL that cannot be admitted to the timeline at all (physical-validation hard
+/// stops). Distinct from "no committed snapshot", which is a valid empty timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalValidationError {
+    /// The `-wal` is shorter than its 32-byte header, or carries the wrong magic.
+    BadMagic,
+    /// The WAL header's page size disagrees with the DB header's — a HARD STOP, since
+    /// every frame would be mis-sliced. `db` and `wal` are the two declared sizes.
+    PageSizeMismatch { db: u32, wal: u32 },
+    /// The main database header itself failed to parse.
+    Header(Error),
+}
+
+/// The bespoke, format-exact temporal model of a `-wal` sidecar.
+///
+/// Enumerates the salt segments, the materializable [`CommitSnapshot`]s within them
+/// (CommitId-addressable), and the [`WalResidue`] tails. Materialize a snapshot's page
+/// images via [`CommitSnapshot::page_version`]; diff the acquired base against the last
+/// valid commit via [`WalTimeline::diff_base_to_last_commit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalTimeline {
+    page_size: u32,
+    base_pages: std::collections::BTreeMap<u32, Vec<u8>>,
+    segments: Vec<WalSegment>,
+    snapshots: Vec<CommitSnapshot>,
+    residue: Vec<WalResidue>,
+    safety: MaterializationSafety,
+}
+
+impl WalTimeline {
+    /// Physical-validation tier: header magic + format check.
+    ///
+    /// Parses `bytes` (the acquired main DB) and `wal` (the `-wal` sidecar) into the
+    /// segmented temporal model. A page-size mismatch between the DB header and the
+    /// WAL header is a HARD STOP; a bad/short header is [`WalValidationError::BadMagic`].
+    fn parse(bytes: &[u8], wal: &[u8], page_size: u32) -> Result<Self, WalValidationError> {
+        use forensicnomicon::sqlite::{SQLITE_WAL_FRAME_HEADER_SIZE, SQLITE_WAL_HEADER_SIZE};
+
+        // --- PhysicalValidation: header magic / format / page-size / salts -------
+        let hdr = wal
+            .get(..SQLITE_WAL_HEADER_SIZE)
+            .ok_or(WalValidationError::BadMagic)?;
+        let magic = be_u32(hdr, 0);
+        if magic != WAL_MAGIC_BE && magic != WAL_MAGIC_LE {
+            return Err(WalValidationError::BadMagic);
+        }
+        let wal_page_size = be_u32(hdr, 8);
+        if wal_page_size != page_size {
+            return Err(WalValidationError::PageSizeMismatch {
+                db: page_size,
+                wal: wal_page_size,
+            });
+        }
+        let checkpoint_seq = be_u32(hdr, 12);
+        let mut salt1 = be_u32(hdr, 16);
+        let mut salt2 = be_u32(hdr, 20);
+
+        let ps = page_size as usize;
+        let frame_stride = SQLITE_WAL_FRAME_HEADER_SIZE + ps;
+
+        // The acquired main DB image: the pre-WAL base for replay within the current
+        // validated segment (NOT "epoch 0" — just the base each commit overlays onto).
+        let mut base_pages: std::collections::BTreeMap<u32, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        // `chunks_exact` yields only whole pages (infallible by construction — no
+        // out-of-bounds slice to guard); cap at `u32::MAX` pages so the 1-based page
+        // number never overflows on a pathologically large image.
+        for (idx, page) in bytes
+            .chunks_exact(ps)
+            .take(u32::MAX as usize - 1)
+            .enumerate()
+        {
+            let pno = idx as u32 + 1; // 1-based page number
+            base_pages.insert(pno, page.to_vec());
+        }
+
+        let mut segments: Vec<WalSegment> = Vec::new();
+        let mut snapshots: Vec<CommitSnapshot> = Vec::new();
+        let mut residue: Vec<WalResidue> = Vec::new();
+
+        // Per-segment running state.
+        let mut seg_ordinal = 0usize;
+        let mut seg_frame_count = 0usize;
+        // Cumulative newest-page map across all COMMITTED frames of the segment, so a
+        // snapshot's `overlaid` is base ∪ committed-up-to-this-commit.
+        let mut committed_pages: std::collections::BTreeMap<u32, Vec<u8>> = base_pages.clone();
+        let mut pending: std::collections::BTreeMap<u32, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut last_commit_global_frame: Option<usize> = None;
+        let mut uncommitted_tail_start: Option<usize> = None;
+
+        let mut off = SQLITE_WAL_HEADER_SIZE;
+        let max_frames = wal.len() / frame_stride + 1;
+        let mut frame_no = 0usize;
+
+        while let Some(frame) = wal.get(off..off + frame_stride) {
+            if frame_no >= max_frames {
+                break; // cov:unreachable: the slice walk already bounds frame_no
+            }
+            let page_no = be_u32(frame, 0);
+            let db_size = be_u32(frame, 4);
+            let fsalt1 = be_u32(frame, 8);
+            let fsalt2 = be_u32(frame, 12);
+
+            // A salt change opens a NEW segment (checkpoint reset = discontinuity).
+            // Anything between the prior segment's last commit and here is residue.
+            if fsalt1 != salt1 || fsalt2 != salt2 {
+                if segments.len() >= MAX_WAL_SEGMENTS {
+                    break; // cov:unreachable: real WALs hold far fewer than 1024 salt epochs
+                }
+                // Close the current segment, recording its residue tail (if any).
+                Self::close_segment(
+                    &mut segments,
+                    &mut residue,
+                    WalSegmentId(seg_ordinal),
+                    salt1,
+                    salt2,
+                    page_size,
+                    checkpoint_seq,
+                    seg_frame_count,
+                    uncommitted_tail_start,
+                );
+                // Begin the next segment under the new salts. Its base for replay is
+                // the prior committed view (a checkpoint would have flushed it, but on
+                // a forensic image we keep what we can replay).
+                seg_ordinal += 1;
+                salt1 = fsalt1;
+                salt2 = fsalt2;
+                seg_frame_count = 0;
+                pending.clear();
+                uncommitted_tail_start = None;
+                // The post-reset frames replay onto the latest committed view.
+                // committed_pages carries forward.
+            }
+
+            if page_no == 0 {
+                break; // malformed frame; stop rather than mis-index
+            }
+            let data = match frame.get(SQLITE_WAL_FRAME_HEADER_SIZE..) {
+                Some(d) => d.to_vec(),
+                None => break, // cov:unreachable: frame slice is exactly frame_stride
+            };
+
+            let frame_index_in_seg = seg_frame_count;
+            seg_frame_count += 1;
+            pending.insert(page_no, data);
+            let is_commit = db_size != 0;
+
+            if is_commit {
+                for (p, d) in std::mem::take(&mut pending) {
+                    committed_pages.insert(p, d);
+                }
+                // Drop base/committed pages beyond the committed size so a snapshot
+                // reflects the database's page count at that commit. `db_size` is
+                // non-zero here (that is what makes this a COMMIT frame).
+                committed_pages.retain(|&p, _| p <= db_size);
+                let id = CommitId {
+                    segment: WalSegmentId(seg_ordinal),
+                    commit_frame_index: frame_index_in_seg,
+                    db_size_after_commit: db_size,
+                };
+                snapshots.push(CommitSnapshot {
+                    id,
+                    overlaid: committed_pages.clone(),
+                    salt1,
+                    salt2,
+                });
+                last_commit_global_frame = Some(frame_no);
+                uncommitted_tail_start = None;
+            } else if uncommitted_tail_start.is_none() {
+                uncommitted_tail_start = Some(frame_index_in_seg);
+            }
+
+            frame_no += 1;
+            off += frame_stride;
+        }
+
+        // Close the final segment (it may have an uncommitted tail).
+        Self::close_segment(
+            &mut segments,
+            &mut residue,
+            WalSegmentId(seg_ordinal),
+            salt1,
+            salt2,
+            page_size,
+            checkpoint_seq,
+            seg_frame_count,
+            uncommitted_tail_start,
+        );
+
+        let safety = if snapshots.is_empty() {
+            MaterializationSafety::PhysicalValidated
+        } else if last_commit_global_frame.is_some() {
+            MaterializationSafety::ReplaySafe
+        } else {
+            MaterializationSafety::CommitValidated // cov:unreachable: a snapshot implies a commit
+        };
+
+        Ok(Self {
+            page_size,
+            base_pages,
+            segments,
+            snapshots,
+            residue,
+            safety,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn close_segment(
+        segments: &mut Vec<WalSegment>,
+        residue: &mut Vec<WalResidue>,
+        id: WalSegmentId,
+        salt1: u32,
+        salt2: u32,
+        page_size: u32,
+        checkpoint_seq: u32,
+        frame_count: usize,
+        uncommitted_tail_start: Option<usize>,
+    ) {
+        if frame_count == 0 {
+            return;
+        }
+        segments.push(WalSegment {
+            id,
+            salt1,
+            salt2,
+            page_size,
+            frame_count,
+            checkpoint_seq,
+        });
+        if let Some(start) = uncommitted_tail_start {
+            residue.push(WalResidue {
+                segment: id,
+                first_frame_index: start,
+                frame_count: frame_count - start,
+                reason: ResidueReason::BeyondLastCommit,
+            });
+        }
+    }
+
+    /// The salt segments of this WAL, in file order (one per salt epoch).
+    #[must_use]
+    pub fn segments(&self) -> &[WalSegment] {
+        &self.segments
+    }
+
+    /// Every materializable [`CommitSnapshot`] across all segments, in commit order.
+    #[must_use]
+    pub fn commit_snapshots(&self) -> &[CommitSnapshot] {
+        &self.snapshots
+    }
+
+    /// The stale WAL tails surfaced for forensics (not committed history).
+    #[must_use]
+    pub fn residue(&self) -> &[WalResidue] {
+        &self.residue
+    }
+
+    /// Resolve a [`CommitId`] back to its [`CommitSnapshot`].
+    #[must_use]
+    pub fn snapshot_at(&self, id: CommitId) -> Option<&CommitSnapshot> {
+        self.snapshots.iter().find(|s| s.id == id)
+    }
+
+    /// The highest validation tier this WAL cleared (see [`MaterializationSafety`]).
+    #[must_use]
+    pub fn safety(&self) -> MaterializationSafety {
+        self.safety
+    }
+
+    /// The temporal-cohort topology — `LinearSegment` for one salt epoch, else
+    /// `Disconnected` across checkpoint resets. The `[H]` adapter maps this onto
+    /// `state-history-forensic::CohortTopology`.
+    #[must_use]
+    pub fn topology(&self) -> CohortTopology {
+        if self.segments.len() <= 1 {
+            CohortTopology::LinearSegment
+        } else {
+            CohortTopology::Disconnected
+        }
+    }
+
+    /// Whether the WAL's integrity checks are tamper-EVIDENT. Always `false`: WAL
+    /// frame checksums are non-cryptographic (corruption detection, not tamper proof),
+    /// so the `[H]` adapter must record `tamper_resistance = LOW`.
+    #[must_use]
+    pub fn checksums_are_tamper_evident(&self) -> bool {
+        false
+    }
+
+    /// Diff the acquired base image against the last valid commit snapshot, returning
+    /// the page numbers whose bytes changed. `None` when there is no committed snapshot.
+    #[must_use]
+    pub fn diff_base_to_last_commit(&self) -> Option<WalDiff> {
+        let last = self.snapshots.last()?;
+        let mut changed = Vec::new();
+        let mut pages: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        pages.extend(self.base_pages.keys().copied());
+        pages.extend(last.overlaid.keys().copied());
+        for p in pages {
+            let base = self.base_pages.get(&p);
+            let now = last.overlaid.get(&p);
+            if base != now {
+                changed.push(p);
+            }
+        }
+        Some(WalDiff { changed })
+    }
+
+    /// The page size (bytes) common to the base image and the WAL frames.
+    #[must_use]
+    pub fn page_size(&self) -> u32 {
+        self.page_size
     }
 }
 

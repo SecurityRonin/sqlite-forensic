@@ -489,3 +489,86 @@ fn dc3_corpus_agrees_with_undark() {
     }
     assert!(ran > 0, "no DC3 corpus DB was available to test");
 }
+
+/// How many lines a raw tool dump contains a given substring on (e.g. the
+/// pre-update body marker). Used to reconcile prior-version recovery against the
+/// oracles without imposing a column projection (the oracles disagree on layout).
+fn tool_marker_lines(out: &str, marker: &str) -> usize {
+    out.lines().filter(|l| l.contains(marker)).count()
+}
+
+/// Prior-version recovery (the false-negative → true-positive fix), reconciled
+/// against undark and fqlite on `tests/data/updated_messages.db`.
+///
+/// Ground truth: row 7's `body` was edited (grow then shrink), leaving an
+/// intermediate version `"PRIORVERSION secret …"` in slack while the live row
+/// holds `"EDITED final body"`. Our value-aware carver recovers that prior
+/// version (rowid 7, source `PriorVersion`) WITHOUT re-surfacing the live row.
+///
+/// Honest, page-diagnosed reconciliation (see `docs/recovery-comparison.md`):
+///   * ours: recovers the 1 genuine prior version, 0 false positives.
+///   * undark: recovers 0 from this fixture (it does not carve the freed slack
+///     here) — we EXCEED it.
+///   * fqlite: recovers the same genuine prior version (we MATCH it) plus two
+///     records we deliberately do NOT emit: a freed `sqlite_master` schema row
+///     (a different recovery class) and a truncated `"…ORIGI"` fragment (a
+///     partial, clobbered recovery our 0-false-positive parser correctly
+///     rejects — the full original body survives nowhere in the file).
+#[test]
+fn prior_version_reconciled_with_oracles() {
+    let db_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/data/updated_messages.db");
+    let db = Database::open(std::fs::read(&db_path).unwrap()).unwrap();
+    let carved = carve_all_deleted_records(&db);
+
+    // Ours: exactly the prior version of row 7, never the live "EDITED" row.
+    let prior_count = carved
+        .iter()
+        .filter(
+            |c| matches!(c.values.get(2), Some(Value::Text(t)) if t.starts_with("PRIORVERSION")),
+        )
+        .count();
+    assert_eq!(
+        prior_count, 1,
+        "ours must recover the single genuine prior version"
+    );
+    assert!(
+        !carved
+            .iter()
+            .any(|c| matches!(c.values.get(2), Some(Value::Text(t)) if t.starts_with("EDITED"))),
+        "ours must NOT re-surface the live (edited) row — 0 false positives"
+    );
+
+    // undark: recovers nothing here; we exceed it. (Gated; skips without the bin.)
+    if let Some(undark) = undark_bin() {
+        let out = Command::new(&undark)
+            .arg("-i")
+            .arg(&db_path)
+            .output()
+            .expect("undark must execute");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            tool_marker_lines(&text, "PRIORVERSION"),
+            0,
+            "undark does not recover the prior version from this fixture (we exceed it)"
+        );
+    } else {
+        eprintln!("SKIP undark leg: set UNDARK_BIN");
+    }
+
+    // fqlite: recovers the SAME genuine prior version (we match it). It also emits
+    // a truncated "…ORIGI" fragment we correctly decline; assert only that the
+    // genuine prior version is present in fqlite's output.
+    if let Some(tap) = fqlite_tap() {
+        let out = Command::new(&tap)
+            .arg(&db_path)
+            .output()
+            .expect("fqlite tap must execute");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            tool_marker_lines(&text, "PRIORVERSION") >= 1,
+            "fqlite must also recover the genuine prior version (we match it)"
+        );
+    } else {
+        eprintln!("SKIP fqlite leg: set FQLITE_TAP");
+    }
+}

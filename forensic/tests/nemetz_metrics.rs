@@ -40,11 +40,13 @@
 //! # What the numbers do and do NOT claim
 //!
 //! They are an honest measurement of *this* carver against *this* corpus. A low
-//! recall on a category is a true statement about a capability gap (e.g. the
-//! freeblock-prefix-clobber FN documented in `docs/recovery-comparison.md`), not
-//! a defect in the harness. The assertions below pin the *currently measured*
-//! matrix so a regression (recall drop or a new FP class) fails CI; raising recall
-//! by improving the carver is expected to *update* these numbers upward.
+//! recall on a category (e.g. `0E` overflow, where the in-page freeblock template
+//! does not apply — see "Freeblock reconstruction" in
+//! `docs/recovery-comparison.md`) is a true statement about a capability
+//! boundary, not a defect in the harness. The assertions below pin the *currently
+//! measured* matrix so a regression (recall drop or a new FP class) fails CI;
+//! raising recall by improving the carver is expected to *update* these numbers
+//! upward.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::pedantic)]
 
@@ -275,14 +277,14 @@ fn dropped_table_recovery_is_bounded() {
 }
 
 /// On the clean in-page-deletion category (0C: `secure_delete=0`, no later
-/// overwrite, so every deleted row's bytes survive) the carver must recover at
-/// least the rows whose cell header survived the freeblock conversion. This pins
-/// the measured 0C true-positive total so a recall regression fails CI. The
-/// number is LOW by design (see the freeblock-prefix-clobber FN in
-/// `docs/recovery-comparison.md`): SQLite overwrites a freed cell's first four
-/// bytes (its payload-length + rowid varints) with the freeblock next/size
-/// pointers, so a forward parse from the freeblock offset cannot reconstruct
-/// those rows. We recover only the subset whose header survived.
+/// overwrite, so every deleted row's bytes survive) the carver must recover the
+/// freeblock-clobbered rows via freeblock reconstruction (task #56). This pins
+/// the measured 0C true-positive total so a recall regression fails CI. SQLite
+/// overwrites a freed cell's first four bytes (payload-length + rowid varints,
+/// `header_len`, leading serial) with the freeblock next/size pointers;
+/// `reconstruct_freeblock_records` rebuilds each record from its surviving
+/// serial tail plus the page's schema template (see "Freeblock reconstruction"
+/// in `docs/recovery-comparison.md`), raising this floor from 24 to 79.
 #[test]
 fn category_0c_true_positive_floor() {
     let total_tp: usize = all_matrices()
@@ -321,7 +323,7 @@ fn phantom_fp_ceiling() {
 // whose first four bytes were clobbered by freeblock conversion, by rebuilding
 // each record from its surviving serial-type tail plus the schema-derived header
 // template — raising this floor far above the forward-parse-only value (24).
-const NEMETZ_0C_TP_FLOOR: usize = 55;
+const NEMETZ_0C_TP_FLOOR: usize = 79;
 // Total phantom FP across the recall corpus (all-empty/NULL inferred records).
 const NEMETZ_FP_CEILING: usize = 10;
 // Dropped/overwritten-table recovery is bounded per DB (max recovered+fp seen).

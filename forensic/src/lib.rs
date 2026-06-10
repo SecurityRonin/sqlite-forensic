@@ -9,14 +9,19 @@
 //! Each anomaly is an *observation* ("consistent with …"); the examiner draws
 //! the conclusions.
 //!
-//! # Scope
+//! # Capabilities
 //!
-//! This skeleton grades exactly one anomaly the spike reader can already
-//! surface from the 100-byte file header: a non-zero **reserved-space-per-page**
-//! field. WS-E (`sqlite-forensic` proper) expands this into the real analyzer —
-//! b-tree free-cell / unallocated carving, deleted-record recovery, freelist
-//! anomalies, WAL-overlay honesty, and overflow-chain validation — on top of an
-//! expanded `sqlite-core` reader surface.
+//! - [`carve_deleted_records`] — recover deleted rows from free (unallocated)
+//!   pages, the headline capability rusqlite structurally cannot provide. Each
+//!   recovered row is confidence-graded, flagged `allocated: false`, and carries
+//!   page/offset/rowid provenance.
+//! - [`audit`] grades header reserved-space, a non-empty freelist (prior
+//!   deletions), an active WAL overlay (uncheckpointed state), and a header/file
+//!   page-count mismatch into severity-ranked
+//!   [`forensicnomicon::report::Finding`]s.
+//!
+//! Deferred: a full anomaly suite (overflow-chain integrity, schema-format /
+//! text-encoding checks) and a fuzz harness.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 

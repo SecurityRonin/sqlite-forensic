@@ -299,6 +299,57 @@ fn category_0c_true_positive_floor() {
     );
 }
 
+/// On the deleted-then-overwritten category (0D) the freed cells are coalesced
+/// back-to-back inside a single free span — a chained freeblock OR the page's
+/// unallocated gap — where every cell's leading four bytes are clobbered by a
+/// stale freeblock header (`next`/`size`), not just the span's first cell. The
+/// span-walking freeblock reconstruction rebuilds **each** such clobbered cell
+/// (template tail + body, fits-in-span validated), so the carver recovers the
+/// trailing intact records a single-shot head reconstruction missed. This pins
+/// the measured 0D true-positive total so the recovery does not regress.
+///
+/// Byte-evidence for the mechanism (task #66): e.g. 0D-07 page 3 freeblock
+/// `[0xf79,0xfe0)` holds three coalesced cells (`Luca|Schumacher`,
+/// `Kurt|Schubert`, `Georg|Schulz`) each prefixed by a `00 00 00 NN` stale
+/// header; 0D-06 page 2 packs four such cells in its unallocated gap. The general
+/// rule — iterate template reconstruction across the whole free span — recovers
+/// all of them, with no per-database constant.
+#[test]
+fn category_0d_true_positive_floor() {
+    let total_tp: usize = all_matrices()
+        .iter()
+        .filter(|m| m.category == "0D")
+        .map(|m| m.tp)
+        .sum();
+    assert!(
+        total_tp >= NEMETZ_0D_TP_FLOOR,
+        "0D true-positive total {total_tp} dropped below the measured floor {NEMETZ_0D_TP_FLOOR}"
+    );
+}
+
+/// The substrate-recoverable denominator (`D_recoverable`) must count a deleted
+/// 0D row only when its **scored identity** — the `(col1,col2)` key the recall
+/// matcher uses — physically survives as a *contiguous* run in the file. A row
+/// whose name+surname were overwritten by a later same-id INSERT, leaving only a
+/// coincidental narrow-integer byte match, is NOT recoverable by any carver and
+/// must not inflate the denominator (task #66 Drec audit: the prior
+/// any-distinctive-column rule counted 36 of 45 0D rows recoverable, but only 20
+/// have their scored identity physically present — fqlite, the reference carver,
+/// recovers exactly those 20, confirming 20 is the true substrate ceiling).
+#[test]
+fn category_0d_drecoverable_is_contiguous_identity() {
+    let total_drec: usize = all_matrices()
+        .iter()
+        .filter(|m| m.category == "0D")
+        .map(|m| m.d_recoverable)
+        .sum();
+    assert_eq!(
+        total_drec, NEMETZ_0D_DRECOVERABLE,
+        "0D D_recoverable {total_drec} != the contiguous-identity substrate count {NEMETZ_0D_DRECOVERABLE} \
+         (a row counts as recoverable only when its scored (col1,col2) identity survives contiguously)"
+    );
+}
+
 /// The total phantom-FP count across the recall corpus, pinned so a new
 /// systematic FP class fails CI. Phantoms here are low-confidence all-empty/NULL
 /// records the inferred carver matches on a run of zero bytes (documented in
@@ -324,6 +375,15 @@ fn phantom_fp_ceiling() {
 // each record from its surviving serial-type tail plus the schema-derived header
 // template — raising this floor far above the forward-parse-only value (24).
 const NEMETZ_0C_TP_FLOOR: usize = 79;
+// 0D true-positive total measured across the eight 0D databases. Span-walking
+// freeblock reconstruction (task #66) recovers every coalesced clobbered cell in
+// a free span (chained freeblock or unallocated gap), not just the span's head,
+// matching the reference carver's recovery of all substrate-present 0D rows.
+const NEMETZ_0D_TP_FLOOR: usize = 20;
+// 0D substrate-recoverable total: deleted rows whose scored (col1,col2) identity
+// physically survives as a contiguous run (the honest denominator — see
+// category_0d_drecoverable_is_contiguous_identity and gen_ground_truth.py).
+const NEMETZ_0D_DRECOVERABLE: usize = 20;
 // Total phantom FP across the recall corpus (all-empty/NULL inferred records).
 const NEMETZ_FP_CEILING: usize = 10;
 // Dropped/overwritten-table recovery is bounded per DB (max recovered+fp seen).

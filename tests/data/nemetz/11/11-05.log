@@ -1,0 +1,20 @@
+# Welcome to sqlite_antifor. #
+## Database filename is: 14/14-05.db ##
+# Filename of manipulated database: 14/14-05_antifor.db #
+## Size of database page: 4096 ##
+## Database has 21 pages. ##
+## Created recovery file: 14/14-05.db_recovery ##
+# Selected option --invalid-table-rootpage. #
+## First page has 4 cell(s). ##
+## Cell #0 starts at offset 3870. ##
+## Rootpage is page #2. ##
+## Table members starts at page #2. ##
+## Cell #2 starts at offset 3667. ##
+## Rootpage is page #4. ##
+## Table users starts at page #4. ##
+## Found 2 tables: ##
+### Offset: 3899, tbl_name: members, root page: #2 ###
+### Offset: 3692, tbl_name: users, root page: #4 ###
+## Changed rootpage of table members from #2 to #20. ##
+# Changed rootpages of 1 tables. #
+# Exited sqlite_antifor. #

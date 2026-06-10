@@ -1,0 +1,20 @@
+# Welcome to sqlite_antifor. #
+## Database filename is: 14/14-02.db ##
+# Filename of manipulated database: 14/14-02_antifor.db #
+## Size of database page: 4096 ##
+## Database has 5 pages. ##
+## Created recovery file: 14/14-02.db_recovery ##
+# Selected option --switch-table-rootpage. #
+## First page has 4 cell(s). ##
+## Cell #0 starts at offset 3882. ##
+## Rootpage is page #2. ##
+## Table users starts at page #2. ##
+## Cell #2 starts at offset 3664. ##
+## Rootpage is page #4. ##
+## Table members starts at page #4. ##
+## Found 2 tables (only 2 possible): ##
+### Offset: 3907, tbl_name: users, root page: #2 ###
+### Offset: 3693, tbl_name: members, root page: #4 ###
+## Changed pointer from table users to members (and vice versa). ##
+# Switched pointer to two tables’ contents 1 time(s). #
+# Exited sqlite_antifor. #

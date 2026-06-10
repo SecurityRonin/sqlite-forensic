@@ -148,3 +148,39 @@ IS the provenance; there is no download URL.
 - **Notable contents:** main-only view = id=1 title `Rust`, visit_count 5, 2 rows;
   WAL-applied view = id=1 title `Rust (EDITED IN WAL)`, visit_count 777, plus id=3
   `WAL-ONLY ROW`, 3 rows. WAL = 1 COMMIT frame for page 2.
+
+#### updated_messages.db
+
+- **Source:** SYNTHETIC — Python `sqlite3` module.
+- **Identity:** a `messages` table where row 7's `body` is `UPDATE`d twice (grow
+  then shrink) under `secure_delete=OFF`, so the pre-edit version survives in freed
+  slack with the **same rowid as the live row but different values** — the
+  version-aware (prior-version) carving fixture. Drives
+  `forensic/tests/prior_version.rs` and the prior-version leg of
+  `forensic/tests/oracle_differential.rs`.
+- **Generator:**
+
+  ```sh
+  python3 - <<'PY'
+  import sqlite3
+  con = sqlite3.connect('updated_messages.db')
+  con.executescript("""
+  PRAGMA page_size=4096; PRAGMA auto_vacuum=NONE; PRAGMA secure_delete=OFF;
+  CREATE TABLE messages(id INTEGER PRIMARY KEY, sender TEXT, body TEXT, amount INTEGER);
+  """)
+  con.executemany("INSERT INTO messages VALUES(?,?,?,?)",
+                  [(n, f"user{n}", f"ORIGINAL message body number {n} ZZZ", 707) for n in range(1, 51)])
+  con.commit()
+  con.execute("UPDATE messages SET body=? WHERE id=7",
+              ("PRIORVERSION secret message body that was later edited " + ("Q" * 120),))
+  con.execute("UPDATE messages SET body='EDITED final body' WHERE id=7")
+  con.commit(); con.close()
+  PY
+  ```
+
+- **md5:** `e1edbb56bf37efa6a7c1e738040f1360` (8192 bytes).
+- **Notable contents:** 50 live rows (ids 1..=50); live row 7 body =
+  `EDITED final body`. The recoverable prior version is rowid 7, body
+  `PRIORVERSION secret …`, amount 707 — genuine deleted content whose rowid is still
+  live with different values. The full original body survives nowhere (overwritten);
+  only the intermediate `PRIORVERSION` version is cleanly carvable.

@@ -125,6 +125,46 @@ PY
 - md5 `wal_places.db` = `bad96eb068359bcb142533696b6515fc`, 8192 bytes.
 - md5 `wal_places.db-wal` = `84b08a77d90914c917d92e60a6c8eeab`, 4152 bytes.
 
+## §E `tests/data/updated_messages.db`  (prior-version / version-aware carving)
+
+A `messages` table where row 7's `body` is **`UPDATE`d twice** (grow then shrink)
+under `secure_delete=OFF`, so the intermediate pre-edit version survives in freed
+slack with **the same rowid as the live row but different values** — the
+edited-message / changed-amount evidence. Drives `forensic/tests/prior_version.rs`
+and the prior-version leg of `forensic/tests/oracle_differential.rs`.
+
+```sh
+python3 - <<'PY'
+import sqlite3
+con = sqlite3.connect('updated_messages.db')
+con.executescript("""
+PRAGMA page_size=4096; PRAGMA auto_vacuum=NONE; PRAGMA secure_delete=OFF;
+CREATE TABLE messages(id INTEGER PRIMARY KEY, sender TEXT, body TEXT, amount INTEGER);
+""")
+con.executemany("INSERT INTO messages VALUES(?,?,?,?)",
+                [(n, f"user{n}", f"ORIGINAL message body number {n} ZZZ", 707) for n in range(1, 51)])
+con.commit()
+# Edit row 7's body twice: grow forces the cell to relocate (freeing the old slot),
+# then shrink leaves the intermediate version recoverable in freed space.
+con.execute("UPDATE messages SET body=? WHERE id=7",
+            ("PRIORVERSION secret message body that was later edited " + ("Q" * 120),))
+con.execute("UPDATE messages SET body='EDITED final body' WHERE id=7")
+con.commit(); con.close()
+PY
+```
+
+- Ground truth: 50 live rows (ids 1..=50); live row 7 body = `EDITED final body`.
+  The recoverable prior version is rowid 7, body `PRIORVERSION secret …`, amount 707
+  — a genuine deleted record whose rowid is still live with different values. The
+  full original body (`ORIGINAL message body number 7 ZZZ`) survives nowhere (it was
+  overwritten); only the intermediate `PRIORVERSION` version is cleanly carvable.
+- md5 `e1edbb56bf37efa6a7c1e738040f1360`, 8192 bytes.
+
+> Note: a same-size in-place `UPDATE` overwrites the cell without freeing the old
+> version, so no prior version survives. The grow-then-shrink edit forces a
+> relocation (freed old cell) whose prefix survives intact in slack — the realistic
+> shape of an edited message in a chat/SQLite store.
+
 ## §F Independent oracle tools (VENDORED, not committed)
 
 Two independent reference carvers validate `carve_deleted_records` (differential
@@ -219,6 +259,7 @@ Committed fixtures (under `tests/data/`, `tests/data/`):
 | `tests/data/wal_places.db` | `bad96eb068359bcb142533696b6515fc` | 8192 |
 | `tests/data/wal_places.db-wal` | `84b08a77d90914c917d92e60a6c8eeab` | 4152 |
 | `tests/data/deleted_places.db` | `16682d7df99b1e8a89287a508d95eb47` | 53248 |
+| `tests/data/updated_messages.db` | `e1edbb56bf37efa6a7c1e738040f1360` | 8192 |
 
 Not committed (provenance only — see §F, §G and the per-directory READMEs):
 `tools/undark`, the fqlite tap under `tools/fqlite/` (source, jars, built classes

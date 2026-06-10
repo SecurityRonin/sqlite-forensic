@@ -2446,6 +2446,35 @@ mod tests {
             .all(|c| c.rowid == 0 && c.confidence <= 0.5));
     }
 
+    /// Real-corpus span-walking reconstruction (task #66): 0D-07 page 3 coalesces
+    /// three deleted cells into a single freeblock `[0xf79,0xfe0)` —
+    /// `Luca|Schumacher` (the head), then `Kurt|Schubert`, then `Georg|Schulz`,
+    /// each prefixed by a stale `00 00 00 NN` freeblock header that clobbers its
+    /// leading four bytes. A single-shot head reconstruction recovers only the
+    /// first; walking the template across the whole span recovers all three.
+    const NEMETZ_0D_07: &[u8] = include_bytes!("../../tests/data/nemetz/0D/0D-07.db");
+
+    #[test]
+    fn reconstruct_freeblock_records_walks_coalesced_cells() {
+        let db = Database::open(NEMETZ_0D_07.to_vec()).unwrap();
+        let page = db.raw_page(3).unwrap();
+        let recovered = db.reconstruct_freeblock_records(page);
+        let has = |name: &str, surname: &str| {
+            recovered.iter().any(|c| {
+                matches!(c.values.get(1), Some(Value::Text(t)) if t == name)
+                    && matches!(c.values.get(2), Some(Value::Text(t)) if t == surname)
+            })
+        };
+        // The span-head cell a single-shot reconstruction already reached.
+        assert!(has("Luca", "Schumacher"), "head cell must be recovered");
+        // The two trailing cells deeper inside the same freeblock — only a
+        // span-walk reaches these.
+        assert!(has("Kurt", "Schubert"), "second coalesced cell must be recovered");
+        assert!(has("Georg", "Schulz"), "third coalesced cell must be recovered");
+        // Every reconstruction carries a destroyed rowid and low confidence.
+        assert!(recovered.iter().all(|c| c.rowid == 0 && c.confidence <= 0.5));
+    }
+
     /// Helper: a real opened DB to call the page-slice methods against crafted
     /// page byte slices (the methods take `page_bytes` explicitly).
     fn opened() -> Database {

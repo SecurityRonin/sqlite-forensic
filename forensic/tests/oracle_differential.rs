@@ -59,6 +59,72 @@ fn undark_bin() -> Option<PathBuf> {
     std::env::var_os("UNDARK_BIN").map(PathBuf::from)
 }
 
+fn fqlite_tap() -> Option<PathBuf> {
+    std::env::var_os("FQLITE_TAP").map(PathBuf::from)
+}
+
+/// Run the headless fqlite tap on `db` and parse its CSV dump.
+///
+/// The tap (`tools/fqlite/run-tap.sh`) boots fqlite's recovery engine
+/// (`fqlite.base.Job`) headlessly — no `JavaFX` GUI — and emits one CSV line per
+/// recovered DELETED record: `rowid,col1,col2,...`. fqlite cannot always recover
+/// the rowid for a carved record (emits `-1`), so we key this oracle by the two
+/// text columns' content (url at field 1, title at field 2), not by rowid.
+/// Returns a map keyed by url -> (rowid, url, title).
+fn fqlite_recover(tap: &Path, db: &Path) -> BTreeMap<String, (i64, String, String)> {
+    let out = Command::new(tap)
+        .arg(db)
+        .output()
+        .expect("fqlite tap must execute");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut set = BTreeMap::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = split_csv(line);
+        let rowid = fields
+            .first()
+            .and_then(|f| f.trim().parse::<i64>().ok())
+            .unwrap_or(-1);
+        let url = fields.get(1).map(|s| unquote(s)).unwrap_or_default();
+        let title = fields.get(2).map(|s| unquote(s)).unwrap_or_default();
+        if url.is_empty() {
+            continue;
+        }
+        // Prefer a known rowid if the same row appears twice (freelist vs in-page).
+        set.entry(url.clone())
+            .and_modify(|e: &mut (i64, String, String)| {
+                if e.0 == -1 && rowid != -1 {
+                    e.0 = rowid;
+                }
+            })
+            .or_insert((rowid, url, title));
+    }
+    set
+}
+
+/// Project our carver's output keyed by url, for the fqlite (content-keyed)
+/// comparison: url -> (rowid, url, title).
+fn ours_recover_by_url(db: &Database, cols: usize) -> BTreeMap<String, (i64, String, String)> {
+    let mut set = BTreeMap::new();
+    for rec in carve_deleted_records(db, cols) {
+        let url = match rec.values.get(1) {
+            Some(Value::Text(s)) => s.clone(),
+            _ => String::new(),
+        };
+        let title = match rec.values.get(2) {
+            Some(Value::Text(s)) => s.clone(),
+            _ => String::new(),
+        };
+        if url.is_empty() {
+            continue;
+        }
+        set.insert(url.clone(), (rec.rowid, url, title));
+    }
+    set
+}
+
 /// Run undark on `db` and parse its CSV dump into rowid -> (col1, col2).
 ///
 /// undark emits one CSV line per recovered record: `rowid,id,col1,col2,...`.
@@ -228,6 +294,42 @@ fn our_fixture_agrees_with_undark() {
             "Title for record number 300 SECRETMARKER".to_string()
         )),
         "row 300 must be recovered verbatim and agree with undark"
+    );
+}
+
+/// OUR fixture, reconciled against the SECOND independent oracle: fqlite.
+///
+/// RED claim: our carver and fqlite recover the *identical* deleted-row set
+/// (same url/title content). Deliberately strict so the harness is proven able
+/// to fail before GREEN relaxes it to the honest, page-diagnosed criterion.
+#[test]
+fn our_fixture_agrees_with_fqlite() {
+    let Some(tap) = fqlite_tap() else {
+        eprintln!("SKIP our_fixture_agrees_with_fqlite: set FQLITE_TAP to tools/fqlite/run-tap.sh");
+        return;
+    };
+    let db_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/data/deleted_places.db");
+    let db = Database::open(std::fs::read(&db_path).unwrap()).unwrap();
+
+    let ours = ours_recover_by_url(&db, 6);
+    let oracle = fqlite_recover(&tap, &db_path);
+
+    // Restrict both to the deleted-range urls (site-201..=site-400).
+    let in_del = |url: &str| {
+        url.strip_prefix("https://site-")
+            .and_then(|s| s.split('.').next())
+            .and_then(|n| n.parse::<u32>().ok())
+            .is_some_and(|n| (201..=400).contains(&n))
+    };
+    let ours_urls: std::collections::BTreeSet<&String> =
+        ours.keys().filter(|u| in_del(u)).collect();
+    let oracle_urls: std::collections::BTreeSet<&String> =
+        oracle.keys().filter(|u| in_del(u)).collect();
+
+    // RED: demand exact set equality on the recovered urls.
+    assert_eq!(
+        ours_urls, oracle_urls,
+        "our carved deleted-row set must equal fqlite's exactly"
     );
 }
 

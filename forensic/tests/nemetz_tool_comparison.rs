@@ -329,8 +329,14 @@ fn precision(m: &ToolMatrix) -> f64 {
 /// precision; `beta > 1` weights recall. Returns 0 when both inputs are 0 (the
 /// harmonic mean of two zeros), the forensically correct "recovered nothing
 /// useful" reading.
-fn f_beta(_p: f64, _r: f64, _beta: f64) -> f64 {
-    unimplemented!("RED: f_beta")
+fn f_beta(p: f64, r: f64, beta: f64) -> f64 {
+    let b2 = beta * beta;
+    let denom = b2 * p + r;
+    if denom == 0.0 {
+        0.0
+    } else {
+        (1.0 + b2) * p * r / denom
+    }
 }
 
 /// F1 = harmonic mean of precision and recall (`beta = 1`): `2PR / (P + R)`.
@@ -424,17 +430,55 @@ fn emit_three_tool_comparison() {
             precision(m),
         );
     };
+    // Rows accumulated for the committed CSV that drives `docs/plot_comparison.py`.
+    // Each is `category,tool,recall_substrate,precision,f1,f0_5` — recall_substrate
+    // and precision are the same numbers printed in the table, and f1/f0_5 are
+    // derived from exactly those two so the chart and the table are provably the
+    // same data.
+    let mut csv_rows: Vec<String> = Vec::new();
+    let mut push_csv = |cat: &str, tool: &str, t: &CatTotals| {
+        let r = recall_substrate(&t.matrix, t.d_recoverable);
+        let p = precision(&t.matrix);
+        csv_rows.push(format!(
+            "{cat},{tool},{r:.6},{p:.6},{:.6},{:.6}",
+            f1(p, r),
+            f0_5(p, r)
+        ));
+    };
+
     for cat in ["0C", "0D", "0E"] {
         let (o, u, f) = category_totals(cat, undark.as_deref(), fqlite.as_deref());
         print_row(cat, "ours", &o);
+        push_csv(cat, "ours", &o);
         if let Some(u) = &u {
             print_row(cat, "undark", u);
+            push_csv(cat, "undark", u);
         }
         if let Some(f) = &f {
             print_row(cat, "fqlite", f);
+            push_csv(cat, "fqlite", f);
         }
     }
     println!("\nExcluded (FLOAT key columns, no cross-tool identity): {FLOAT_KEY_EXCLUSIONS:?}");
+
+    // Only (re)write the committed CSV when BOTH oracle tools ran, so the file
+    // always carries the full ours/undark/fqlite matrix and never a partial one.
+    // CI without the tools still passes — it just skips the write.
+    if undark.is_some() && fqlite.is_some() {
+        let csv_path = format!(
+            "{}/../docs/img/comparison_metrics.csv",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut body = String::from("category,tool,recall_substrate,precision,f1,f0_5\n");
+        for row in &csv_rows {
+            body.push_str(row);
+            body.push('\n');
+        }
+        std::fs::write(&csv_path, body).expect("write comparison_metrics.csv");
+        eprintln!("WROTE {csv_path}");
+    } else {
+        eprintln!("NOTE comparison_metrics.csv not rewritten: set both UNDARK_BIN and FQLITE_TAP");
+    }
 }
 
 /// The F-beta family is computed by the harness (never hand-typed into the doc),

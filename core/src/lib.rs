@@ -1,16 +1,18 @@
 //! `sqlite-core` — native, read-only, panic-free `SQLite` file-format reader.
 //!
-//! WS-C feasibility spike. Proves the native path: parse the 100-byte file
-//! header (validate magic + page size) and walk one table b-tree, yielding its
-//! rows as typed [`Value`]s — bounds-checked and panic-free on crafted input.
+//! Parses the 100-byte file header (magic + page size), walks table b-trees
+//! (interior + leaf) yielding rows as typed [`Value`]s, reassembles
+//! overflow-page chains for large payloads, walks the freelist
+//! ([`Database::freelist_pages`]), and applies a read-only `-wal` overlay
+//! ([`Database::open_with_wal`]) — all bounds-checked and panic-free on crafted
+//! input. [`Database::carve_cells`] recognizes record-shaped cells in
+//! free/unallocated space for the analyzer's deleted-record recovery.
 //!
 //! Format constants are consumed from [`forensicnomicon::sqlite`] (the KNOWLEDGE
-//! leaf) rather than re-hardcoded here.
-//!
-//! Scope of the spike: file header + a single table b-tree walk (interior +
-//! leaf). Index b-trees, overflow pages, WAL overlay, and freelist/unallocated
-//! carving are deliberately OUT of scope — they are what WS-E (`sqlite-forensic`)
-//! would build on top of this reader.
+//! leaf) where exposed; a few not-yet-promoted offsets (reserved-space 20,
+//! in-header DB-size 28, freelist-count 36) are held locally and flagged for
+//! promotion. Still out of scope: index b-trees, `WITHOUT ROWID` tables,
+//! UTF-16 text, and WAL frame-checksum verification.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 

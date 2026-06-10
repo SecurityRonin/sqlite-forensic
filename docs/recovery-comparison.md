@@ -86,6 +86,23 @@ as defined under "[How the matrix is computed](#how-the-matrix-is-computed)".
 Regenerate with `cargo test -p sqlite-forensic --test nemetz_tool_comparison --
 --nocapture`, with `UNDARK_BIN` and `FQLITE_TAP` set.)
 
+![Precision-recall plane plus F1 and F0.5 grouped bars for ours, undark, and
+fqlite across categories 0C/0D/0E](img/recovery-comparison.png)
+
+The figure plots the **same harness-computed numbers** as the table above:
+`forensic/tests/nemetz_tool_comparison.rs` writes the per-(tool, category)
+`recall_substrate`, `precision`, `F1`, and `F0.5` to
+[`img/comparison_metrics.csv`](img/comparison_metrics.csv) when run with the
+undark/fqlite oracles, and `docs/plot_comparison.py` renders the chart straight
+from that CSV — chart and table are the same dataset by construction. By **F1**
+(balanced), sqlite-forensic leads `0C` (0.840 vs fqlite 0.802) and `0E` (0.500 vs
+fqlite 0.308, undark 0.333); under **F0.5** (precision-weighted — the forensic β,
+since a phantom row costs an examiner more than a missed low-confidence one) those
+leads widen (`0C` 0.905 vs 0.805; `0E` 0.714 vs 0.400). fqlite leads `0D` on raw
+substrate recall (0.556 vs 0.306) and therefore on both F-scores there. To
+refresh: rerun the test with `UNDARK_BIN`/`FQLITE_TAP` set to rewrite the CSV,
+then `python3 docs/plot_comparison.py` to rerender the PNG.
+
 ### Honest read — who wins where, and why
 
 - **In-page deletion (`0C`): ours and fqlite now lead together; undark trails.**

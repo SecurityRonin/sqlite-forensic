@@ -7,6 +7,9 @@
 //! i.e. a differential cross-check of the native reader against libsqlite.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// The module doc embeds a literal SQL command line; backticking its tokens
+// would mangle the reproducer, so the pedantic doc lint is opted out here.
+#![allow(clippy::doc_markdown)]
 
 use sqlite_core::{Database, Value};
 
@@ -54,26 +57,33 @@ fn walks_moz_places_rows_matching_sqlite3() {
     );
     assert_eq!(rows[0].values[3], Value::Integer(5));
     assert_eq!(rows[0].values[4], Value::Integer(1_700_000_000_000_000));
+    // frecency 2000.5 has a fraction → stored as IEEE float (serial 7).
     assert_eq!(rows[0].values[5], Value::Real(2000.5));
 
-    // Row 2 — larger integers.
+    // Row 2 — frecency inserted as 5500.0 but stored on disk as an INTEGER
+    // (serial 2). This is a genuine forensic distinction: rusqlite applies the
+    // column's REAL *affinity* and returns 5500.0; the native reader faithfully
+    // reports the on-disk *storage class*. typeof(frecency) in sqlite3 returns
+    // 'real' (affinity), yet the serial type on disk is integer.
     assert_eq!(rows[1].values[1], Value::Text("https://github.com/".into()));
     assert_eq!(rows[1].values[3], Value::Integer(12));
-    assert_eq!(rows[1].values[5], Value::Real(5500.0));
+    assert_eq!(rows[1].values[5], Value::Integer(5500));
 
-    // Row 3 — NULL last_visit_date, negative REAL.
+    // Row 3 — NULL last_visit_date; frecency -1.0 stored as INTEGER (serial 1).
     assert_eq!(rows[2].values[2], Value::Text("Hacker News".into()));
     assert_eq!(rows[2].values[4], Value::Null);
-    assert_eq!(rows[2].values[5], Value::Real(-1.0));
+    assert_eq!(rows[2].values[5], Value::Integer(-1));
 
-    // Row 4 — NULL frecency (trailing NULL column).
+    // Row 4 — NULL frecency (trailing NULL column); visit_count 1.
     assert_eq!(rows[3].values[2], Value::Text("SQLite - Wikipedia".into()));
+    assert_eq!(rows[3].values[3], Value::Integer(1));
     assert_eq!(rows[3].values[5], Value::Null);
 
-    // Row 5 — NULL title, zero visit_count, REAL 0.0.
+    // Row 5 — NULL title; visit_count 0 stored via serial-type-8 literal;
+    // frecency 0.0 stored as INTEGER (serial 8 → literal 0).
     assert_eq!(rows[4].values[2], Value::Null);
     assert_eq!(rows[4].values[3], Value::Integer(0));
-    assert_eq!(rows[4].values[5], Value::Real(0.0));
+    assert_eq!(rows[4].values[5], Value::Integer(0));
 }
 
 #[test]

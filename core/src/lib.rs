@@ -14,12 +14,25 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use forensicnomicon::sqlite::{SQLITE_HEADER_SIZE, SQLITE_MAGIC, SQLITE_PAGE_SIZE_OFFSET};
+use forensicnomicon::sqlite::{
+    SQLITE_FREELIST_TRUNK_OFFSET, SQLITE_HEADER_SIZE, SQLITE_MAGIC, SQLITE_PAGE_SIZE_OFFSET,
+};
 
 /// Byte offset of the 1-byte "reserved space per page" field in the file header
 /// (file-format §1.3.4). forensicnomicon does not yet expose this; WS-E should
 /// promote it into `forensicnomicon::sqlite`.
 const RESERVED_SPACE_OFFSET: usize = 20;
+
+/// Byte offset of the in-header database size, in pages (file-format §1.3.6).
+/// 4-byte big-endian. Valid only when it equals the change counter at offset 24
+/// (a "size is valid" sentinel); the file-length fallback covers the rest.
+/// forensicnomicon does not yet expose this — promote it in a later pass.
+const DB_SIZE_IN_PAGES_OFFSET: usize = 28;
+
+/// Byte offset of the freelist page **count** in the file header (file-format
+/// §1.3.5). 4-byte big-endian. The trunk pointer lives at
+/// [`SQLITE_FREELIST_TRUNK_OFFSET`] (32); this count is the next field (36).
+const FREELIST_COUNT_OFFSET: usize = 36;
 
 /// Errors that can arise while reading a `SQLite` database, all recoverable —
 /// the reader never panics on malformed input.
@@ -39,6 +52,10 @@ pub enum Error {
     TruncatedCell,
     /// The b-tree was deeper / wider than the safety cap allows.
     TooManyPages,
+    /// The freelist trunk chain cycled or exceeded the file's page count.
+    MalformedFreelist,
+    /// An overflow-page chain cycled or exceeded the file's page count.
+    MalformedOverflow,
 }
 
 /// A single decoded column value from a table row. Mirrors `SQLite`'s storage
@@ -100,6 +117,89 @@ impl Database {
     #[must_use]
     pub fn header(&self) -> Header {
         self.header
+    }
+
+    /// Number of pages in the database file.
+    ///
+    /// Prefers the in-header DB size (offset 28) when it is a valid, non-zero
+    /// value that is consistent with the file length; otherwise falls back to
+    /// `file_len / page_size`. A mismatch between the two is itself a forensic
+    /// signal (see [`Database::header_page_count`] / [`Database::file_page_count`]).
+    #[must_use]
+    pub fn page_count(&self) -> u32 {
+        let header = self.header_page_count();
+        let file = self.file_page_count();
+        if header != 0 && header == file {
+            header
+        } else {
+            file
+        }
+    }
+
+    /// The page count recorded in the file header (offset 28). May be 0 (legacy
+    /// "size not valid" sentinel) or disagree with the file length after an
+    /// out-of-band truncation/extension.
+    #[must_use]
+    pub fn header_page_count(&self) -> u32 {
+        be_u32(&self.bytes, DB_SIZE_IN_PAGES_OFFSET)
+    }
+
+    /// The page count implied by the raw file length (`file_len / page_size`).
+    #[must_use]
+    pub fn file_page_count(&self) -> u32 {
+        let ps = self.header.page_size as usize;
+        u32::try_from(self.bytes.len() / ps).unwrap_or(u32::MAX)
+    }
+
+    /// The freelist page **count** recorded in the file header (offset 36).
+    #[must_use]
+    pub fn freelist_count(&self) -> u32 {
+        be_u32(&self.bytes, FREELIST_COUNT_OFFSET)
+    }
+
+    /// Walk the freelist trunk/leaf chain and return every free (unallocated)
+    /// page number, in trunk order. Free pages retain the bytes of whatever they
+    /// last held — on a `secure_delete=OFF` database that includes deleted
+    /// records, which the analyzer can carve.
+    ///
+    /// Bounded against crafted cyclic trunk chains: a page already visited, an
+    /// out-of-range page, or a leaf-pointer count larger than a trunk page can
+    /// hold aborts with [`Error::MalformedFreelist`] rather than looping.
+    pub fn freelist_pages(&self) -> Result<Vec<u32>, Error> {
+        let mut free = Vec::new();
+        let mut trunk = be_u32(&self.bytes, SQLITE_FREELIST_TRUNK_OFFSET);
+        let total_pages = self.file_page_count();
+        // Each trunk page holds at most (page_size/4 - 2) leaf pointers.
+        let max_leaves = (self.header.page_size as usize / 4).saturating_sub(2);
+        let mut visited = 0usize;
+        let cap = total_pages as usize + 1;
+
+        while trunk != 0 {
+            visited += 1;
+            if visited > cap {
+                return Err(Error::MalformedFreelist);
+            }
+            if trunk > total_pages {
+                return Err(Error::MalformedFreelist);
+            }
+            let slice = self.page_slice(trunk)?;
+            let next = be_u32(slice, 0);
+            let leaf_count = be_u32(slice, 4) as usize;
+            if leaf_count > max_leaves {
+                return Err(Error::MalformedFreelist);
+            }
+            for i in 0..leaf_count {
+                let leaf = be_u32(slice, 8 + i * 4);
+                if leaf == 0 || leaf > total_pages {
+                    return Err(Error::MalformedFreelist);
+                }
+                free.push(leaf);
+            }
+            // The trunk page itself is also a free page.
+            free.push(trunk);
+            trunk = next;
+        }
+        Ok(free)
     }
 
     /// Walk a single table b-tree rooted at `root_page` (1-based) and collect

@@ -3,9 +3,9 @@
 //! generator). The fixture has `secure_delete=OFF` and a contiguous high-id
 //! `DELETE` that frees whole leaf pages onto the freelist.
 //!
-//! Ground truth (cross-checked with `PRAGMA freelist_count` / `page_count`):
-//!   live rows = 200 (ids 1..=200), deleted ids 201..=400, freelist_count = 5,
-//!   page_count = 13.
+//! Ground truth (cross-checked with `PRAGMA freelist_count`/`page_count`):
+//!   live rows = 200 (ids 1..=200), deleted ids 201..=400, `freelist_count` = 5,
+//!   `page_count` = 13.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -21,7 +21,7 @@ fn freelist_pages_match_pragma_freelist_count() {
     assert_eq!(free.len(), 5, "freelist page count must match PRAGMA");
     // Every freed page number is in-range for the 13-page file.
     for &p in &free {
-        assert!(p >= 1 && p <= 13, "free page {p} out of file range");
+        assert!((1..=13).contains(&p), "free page {p} out of file range");
     }
 }
 

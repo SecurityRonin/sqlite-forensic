@@ -15,8 +15,8 @@
 
 use sqlite_core::{Database, Value};
 
-const MAIN: &[u8] = include_bytes!("data/wal_places.db");
-const WAL: &[u8] = include_bytes!("data/wal_places.db-wal");
+const MAIN: &[u8] = include_bytes!("../../tests/data/wal_places.db");
+const WAL: &[u8] = include_bytes!("../../tests/data/wal_places.db-wal");
 const MOZ_PLACES_ROOT: u32 = 2;
 const MOZ_PLACES_COLS: usize = 6;
 

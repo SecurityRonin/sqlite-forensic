@@ -10,7 +10,7 @@
 
 use sqlite_core::{Database, Value};
 
-const DB: &[u8] = include_bytes!("data/overflow.db");
+const DB: &[u8] = include_bytes!("../../tests/data/overflow.db");
 const NOTES_ROOT: u32 = 2;
 const NOTES_COLS: usize = 2;
 

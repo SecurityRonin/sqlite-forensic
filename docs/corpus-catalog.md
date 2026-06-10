@@ -1,11 +1,13 @@
 # `sqlite-forensic` Test Corpus Catalog
 
-This is the per-repo record of the SQLite test fixtures under `core/tests/data/`
-and `forensic/tests/data/`. It mirrors the fleet-wide catalog discipline
+This is the per-repo record of the SQLite test fixtures under the repo-root
+`tests/data/` (shared by both workspace members; co-located detail in
+`tests/data/README.md`). It mirrors the fleet-wide catalog discipline
 (`issen/docs/corpus-catalog.md`); the verbatim generator for each synthetic
-fixture is recorded here so the corpus is reproducible. Unlike most fleet repos,
-these fixtures **are committed** (only `/target` is gitignored), but the
-generators are kept here regardless so anyone can rebuild or vary them.
+fixture is recorded here so the corpus is reproducible. The committed fixtures
+**are** in git (only `/target`, `/tools`, and `/tests-fqlite-corpus` are
+gitignored), but the generators are kept here regardless so anyone can rebuild or
+vary them.
 
 All fixtures were built with the system `sqlite3` CLI / Python `sqlite3` module:
 `SQLite 3.45.3 2024-04-15` (CLI version string above).
@@ -22,14 +24,14 @@ All fixtures were built with the system `sqlite3` CLI / Python `sqlite3` module:
 synthetic data). Confidence `✓` (confirmed: each generator below was run and the
 resulting file inspected, not just named).
 
-## §A `core/tests/data/places.db`  (pre-existing, WS-C spike)
+## §A `tests/data/places.db`  (pre-existing, WS-C spike)
 
 Single-table `moz_places` DB exercising every storage class + the rowid-alias
 rule. Generator is documented in `docs/ws-c-sqlite-core-spike.md` §generator.
 
 - md5 `f07a69d05358f227e2120080370bbb6b`, 8192 bytes (2 pages, 4096-byte page).
 
-## §B `core/tests/data/overflow.db`  (overflow-page chain)
+## §B `tests/data/overflow.db`  (overflow-page chain)
 
 One `notes` row whose ~12 KB TEXT body spills onto an overflow-page chain, plus
 one small row that fits on the leaf. Drives `core/tests/overflow.rs`.
@@ -50,7 +52,7 @@ PY
 - `notes` root page = 2; row id=1 body length = 12017; 4 pages total.
 - md5 `1c17320320a173fb5968c598f9df7373`, 16384 bytes.
 
-## §C `forensic/tests/data/deleted_places.db`  (deleted-record carving)
+## §C `tests/data/deleted_places.db`  (deleted-record carving)
 
 `moz_places` with 400 rows inserted, ids 201..=400 `DELETE`d **without VACUUM**,
 under `secure_delete=OFF` so the freed leaf pages retain the deleted records.
@@ -86,7 +88,7 @@ PY
 > carvable. Many real-world browser DBs run with secure_delete off, so this is a
 > realistic — not contrived — recovery scenario.
 
-## §D `core/tests/data/wal_places.db` + `…-wal`  (read-only WAL overlay)
+## §D `tests/data/wal_places.db` + `…-wal`  (read-only WAL overlay)
 
 A main DB + persistent `-wal` sidecar captured **mid-transaction**: a held reader
 connection blocks the checkpoint so the WAL survives on disk with one committed
@@ -123,12 +125,80 @@ PY
 - md5 `wal_places.db` = `bad96eb068359bcb142533696b6515fc`, 8192 bytes.
 - md5 `wal_places.db-wal` = `84b08a77d90914c917d92e60a6c8eeab`, 4152 bytes.
 
-## §E MD5 manifest
+## §F Independent oracle tool — `undark` (VENDORED, not committed)
+
+The independent reference carver used to validate `carve_deleted_records`
+(differential methodology in `docs/validation.md`; harness in
+`forensic/tests/fqlite_oracle.rs`). `tools/` is gitignored — the binary is **not
+committed**; this entry is its provenance record.
+
+- Classification: `VENDORED` (third-party tool), confidence `✓` (built and run).
+- Tool: `undark` 0.7.1, Paul L. Daniels.
+- Upstream: <https://github.com/inflex/undark>
+- Source tarball (master): <https://github.com/inflex/undark/archive/refs/heads/master.tar.gz>
+- Source tarball sha256 `c0a9ee7ebd180727deef52fbafe0ef0e2b7c9b43c5604761bfeb86bc9306912a`.
+- Build (macOS/clang): hoist the nested `swap64`/`ntohll` out of `decode_row` to
+  file scope and rename `ntohll` → `u_ntohll` (collides with the macOS
+  `<sys/_endian.h>` macro), then `make`. Patched source kept at
+  `tools/undark.c.patched` (gitignored). See `docs/validation.md` for the exact
+  recipe.
+- CLI: `undark -i <db>` dumps all reconstructable records as CSV
+  (`rowid,id,col1,col2,…`); deleted rows = recovered rowids absent from the live
+  b-tree.
+
+> Why not fqlite: fqlite has been GUI-only since v2.0 ("command line mode was
+> cancelled"), ships only ~440 MB `jpackage` installers (no CLI jar), is not on
+> Maven Central, and ships no test databases in its repo — so it cannot serve as
+> a headless oracle or supply a corpus. `undark` is the substitute oracle; the
+> DC3 corpus below supplies independent input. Full evidence in
+> `docs/validation.md`.
+
+## §G `tests-fqlite-corpus/dc3-sqlite-dissect/`  (REAL-ext, not committed)
+
+Independent third-party SQLite databases authored by the Department of Defense
+Cyber Crime Center (DC3) as the `sqlite_dissect` project's test corpus. Used as
+**independent input** for the differential carving validation: neither the input
+DB nor the oracle (`undark`) is ours. `tests-fqlite-corpus/` is gitignored — the
+DBs are **not committed**; this entry + `tests-fqlite-corpus/README.md` are their
+provenance record.
+
+- Classification: `REAL-ext` (externally-authored real artifacts), confidence `✓`
+  (downloaded and inspected; SQLite magic + schema confirmed per file).
+- Source: <https://github.com/dod-cyber-crime-center/sqlite-dissect> →
+  `sqlite_dissect/tests/test_files/` (raw base
+  <https://raw.githubusercontent.com/dod-cyber-crime-center/sqlite-dissect/master/sqlite_dissect/tests/test_files/>).
+- Forensic cases exercised (the load-bearing point — these reach scenarios our
+  whole-freed-page fixture cannot): `corpus_01-01.db`/`corpus_01-02.db`,
+  `corpus_03-02.db`, `corpus_07-01.db` are **in-page free-block deletions**
+  (`freelist_count = 0` — deleted rows live inside still-allocated b-tree pages);
+  `corpus_0A-01.db`/`corpus_0A-02.db` are **dropped tables** (no table in
+  `sqlite_master`). Our freelist-only carver recovers 0 from all of these — the
+  documented scope boundary in `docs/validation.md`.
+
+sha256 (full list in `tests-fqlite-corpus/README.md`); the six DBs wired into the
+differential test:
+
+| file | sha256 | md5 | bytes |
+|---|---|---|---|
+| `corpus_01-01.db` | `8438a5533586e7e0f38628330d615aeaa057ebb9698c1103424d8128e417875e` | `4ac52776c7d21f0beb38d456452ca2f6` | 8192 |
+| `corpus_01-02.db` | `508fb80ce083bc6ad79d2921b1d35d998724e808a72d05476671010b1265043b` | `57f88570e289df9919bd900f24b7a026` | 8192 |
+| `corpus_03-02.db` | `7ea933d7082d3ec0cdc9f5ca3e39624d80c0da495a365d520424a69a1937f138` | `9c0a90eeb78cd24d5b4004c157d8618f` | 12288 |
+| `corpus_07-01.db` | `6e110c0663be9500e817ab0d6153f0f1aaa7d8831e7e17a05e2565abbbf9e4da` | `7f8f9e9b4d6aa971b9f0c5d16b6c2419` | 81920 |
+| `corpus_0A-01.db` | `c640727d2fe3e269d196e64c25cf896e9fa21c2626d4f6b88398274c4e1691d1` | `a174174a3f98fe7733e4a32e7aab86b7` | 8192 |
+| `corpus_0A-02.db` | `030fd0a82fa37707f448e90a21bc178f120b018b009999daaefdc61d04b24d24` | `c1be2eb3388bc294ec0deecb334180b9` | 8192 |
+
+## §H MD5 manifest
+
+Committed fixtures (under `tests/data/`, `tests/data/`):
 
 | file | md5 | bytes |
 |---|---|---|
-| `core/tests/data/places.db` | `f07a69d05358f227e2120080370bbb6b` | 8192 |
-| `core/tests/data/overflow.db` | `1c17320320a173fb5968c598f9df7373` | 16384 |
-| `core/tests/data/wal_places.db` | `bad96eb068359bcb142533696b6515fc` | 8192 |
-| `core/tests/data/wal_places.db-wal` | `84b08a77d90914c917d92e60a6c8eeab` | 4152 |
-| `forensic/tests/data/deleted_places.db` | `16682d7df99b1e8a89287a508d95eb47` | 53248 |
+| `tests/data/places.db` | `f07a69d05358f227e2120080370bbb6b` | 8192 |
+| `tests/data/overflow.db` | `1c17320320a173fb5968c598f9df7373` | 16384 |
+| `tests/data/wal_places.db` | `bad96eb068359bcb142533696b6515fc` | 8192 |
+| `tests/data/wal_places.db-wal` | `84b08a77d90914c917d92e60a6c8eeab` | 4152 |
+| `tests/data/deleted_places.db` | `16682d7df99b1e8a89287a508d95eb47` | 53248 |
+
+Not committed (provenance only — see §F, §G and the per-directory READMEs):
+`tools/undark`, and the DC3 corpus under `tests-fqlite-corpus/dc3-sqlite-dissect/`
+(full sha256/md5 list in `tests-fqlite-corpus/README.md`).

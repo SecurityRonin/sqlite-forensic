@@ -11,7 +11,7 @@
 
 use sqlite_core::Database;
 
-const DB: &[u8] = include_bytes!("../../forensic/tests/data/deleted_places.db");
+const DB: &[u8] = include_bytes!("../../tests/data/deleted_places.db");
 
 #[test]
 fn freelist_pages_match_pragma_freelist_count() {
@@ -35,7 +35,7 @@ fn page_count_matches_header_and_file() {
 #[test]
 fn empty_freelist_on_clean_db() {
     // The original spike fixture has no deletions → empty freelist.
-    let clean: &[u8] = include_bytes!("data/places.db");
+    let clean: &[u8] = include_bytes!("../../tests/data/places.db");
     let db = Database::open(clean.to_vec()).expect("open clean");
     assert!(
         db.freelist_pages().expect("walk").is_empty(),

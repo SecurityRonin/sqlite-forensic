@@ -8,10 +8,10 @@ use forensicnomicon::report::{Category, Severity, Source};
 use sqlite_core::Database;
 use sqlite_forensic::{audit, audit_carved_findings, AnomalyKind};
 
-const DELETED: &[u8] = include_bytes!("data/deleted_places.db");
-const WAL_MAIN: &[u8] = include_bytes!("../../core/tests/data/wal_places.db");
-const WAL_SIDE: &[u8] = include_bytes!("../../core/tests/data/wal_places.db-wal");
-const CLEAN: &[u8] = include_bytes!("../../core/tests/data/places.db");
+const DELETED: &[u8] = include_bytes!("../../tests/data/deleted_places.db");
+const WAL_MAIN: &[u8] = include_bytes!("../../tests/data/wal_places.db");
+const WAL_SIDE: &[u8] = include_bytes!("../../tests/data/wal_places.db-wal");
+const CLEAN: &[u8] = include_bytes!("../../tests/data/places.db");
 
 fn src() -> Source {
     Source {

@@ -13,7 +13,7 @@
 
 use sqlite_core::{Database, Value};
 
-const DB: &[u8] = include_bytes!("data/places.db");
+const DB: &[u8] = include_bytes!("../../tests/data/places.db");
 
 /// `moz_places` is the first user table; with the sqlite_schema on page 1 its
 /// root page is page 2 in this single-table DB. Confirmed below by reading the

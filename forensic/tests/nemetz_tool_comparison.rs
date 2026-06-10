@@ -325,6 +325,24 @@ fn precision(m: &ToolMatrix) -> f64 {
     }
 }
 
+/// The F-beta score over precision `p` and recall `r`. `beta < 1` weights
+/// precision; `beta > 1` weights recall. Returns 0 when both inputs are 0 (the
+/// harmonic mean of two zeros), the forensically correct "recovered nothing
+/// useful" reading.
+fn f_beta(_p: f64, _r: f64, _beta: f64) -> f64 {
+    unimplemented!("RED: f_beta")
+}
+
+/// F1 = harmonic mean of precision and recall (`beta = 1`): `2PR / (P + R)`.
+fn f1(p: f64, r: f64) -> f64 {
+    f_beta(p, r, 1.0)
+}
+
+/// F0.5 = precision-weighted F-beta (`beta = 0.5`): `1.25PR / (0.25P + R)`.
+fn f0_5(p: f64, r: f64) -> f64 {
+    f_beta(p, r, 0.5)
+}
+
 /// Compute per-category totals for ours/undark/fqlite. The `undark`/`fqlite`
 /// closures are `None` when the tool is gated off.
 fn category_totals(
@@ -417,6 +435,30 @@ fn emit_three_tool_comparison() {
         }
     }
     println!("\nExcluded (FLOAT key columns, no cross-tool identity): {FLOAT_KEY_EXCLUSIONS:?}");
+}
+
+/// The F-beta family is computed by the harness (never hand-typed into the doc),
+/// so it must be correct for a known precision/recall pair. With P = 0.8 and
+/// R = 0.5: F1 = 2·0.8·0.5/(0.8+0.5) = 0.8/1.3 ≈ 0.6153846; F0.5 =
+/// 1.25·0.8·0.5/(0.25·0.8+0.5) = 0.5/0.7 ≈ 0.7142857 (precision-weighted, so it
+/// sits above F1 when precision exceeds recall). The degenerate all-zero case is
+/// 0, and a perfect (1,1) tool scores 1 on both.
+#[test]
+fn f_beta_family_matches_known_values() {
+    let (p, r) = (0.8_f64, 0.5_f64);
+    assert!((f1(p, r) - 0.8 / 1.3).abs() < 1e-9, "F1 = {}", f1(p, r));
+    assert!(
+        (f0_5(p, r) - 0.5 / 0.7).abs() < 1e-9,
+        "F0.5 = {}",
+        f0_5(p, r)
+    );
+    // Precision-weighting: with P > R, F0.5 > F1 > R-weighted-low side.
+    assert!(f0_5(p, r) > f1(p, r), "F0.5 must exceed F1 when P > R");
+    // Degenerate and perfect anchors.
+    assert_eq!(f1(0.0, 0.0), 0.0);
+    assert_eq!(f0_5(0.0, 0.0), 0.0);
+    assert!((f1(1.0, 1.0) - 1.0).abs() < 1e-12);
+    assert!((f0_5(1.0, 1.0) - 1.0).abs() < 1e-12);
 }
 
 /// fqlite's freeblock-aware reconstruction leads on the clean in-page-deletion

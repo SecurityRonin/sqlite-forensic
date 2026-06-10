@@ -275,6 +275,23 @@ impl Observation for Anomaly {
     }
 }
 
+/// Which class of free space a deleted record was carved from. Records the
+/// recovery provenance so the examiner can weigh reliability by class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecoverySource {
+    /// A whole page that was freed onto the freelist (the strongest case: the
+    /// page holds only deallocated content).
+    FreelistPage,
+    /// The in-page free space (unallocated gap / freeblock slack) of a page that
+    /// is still allocated. The record is genuinely deleted but more likely to be
+    /// partially overwritten, so it is graded lower.
+    InPageFreeBlock,
+    /// A page whose table was `DROP`ped — on the freelist with no `sqlite_master`
+    /// schema, so the column count was inferred from the record itself.
+    DroppedTable,
+}
+
 /// A deleted record recovered from unallocated space — the headline capability
 /// rusqlite cannot provide. Carries the decoded row plus provenance so the
 /// examiner can weigh it as a "consistent with a deleted row" observation.
@@ -293,6 +310,8 @@ pub struct CarvedRecord {
     /// Always `false`: a carved record lives in unallocated space, never in the
     /// live b-tree. Present so callers cannot mistake it for an allocated row.
     pub allocated: bool,
+    /// Which class of free space this record was recovered from.
+    pub source: RecoverySource,
 }
 
 /// Recover deleted records by carving the database's free (unallocated) pages.
@@ -324,10 +343,120 @@ pub fn carve_deleted_records(db: &Database, column_count: usize) -> Vec<CarvedRe
                 values: cell.values,
                 confidence: cell.confidence,
                 allocated: false,
+                source: RecoverySource::FreelistPage,
             });
         }
     }
     out
+}
+
+/// Recover deleted records across **every** free-space class — the full-coverage
+/// carver. Drives, in order:
+///
+/// 1. **Freelist pages** (whole pages freed onto the freelist), with the column
+///    count inferred per record so it also recovers **dropped-table** pages whose
+///    `sqlite_master` schema is gone (e.g. a `DROP TABLE` left the page on the
+///    freelist with no recorded column count).
+/// 2. **In-page free space** of still-allocated table-leaf pages (the unallocated
+///    gap and inter-cell slack), via [`Database::carve_free_regions`], which
+///    carves only the complement of the live cells — so a live (allocated) row is
+///    **never** re-surfaced (the 0-false-positive guarantee, enforced
+///    structurally).
+///
+/// Records are de-duplicated by `(rowid, values)` keeping the highest-confidence
+/// copy, since a row can survive in more than one place. Every record is graded:
+/// freelist-page recovery highest, dropped-table next, in-page residue lowest.
+///
+/// Read-only and panic-free; a malformed structure yields fewer records, never an
+/// error or panic.
+#[must_use]
+pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
+    let mut out: Vec<CarvedRecord> = Vec::new();
+
+    // (1) Freelist pages, inferring the column count per record. Inference makes
+    // this recover both normal freed pages AND schema-gone dropped-table pages
+    // (a `DROP TABLE` leaves the page on the freelist with no recorded column
+    // count). When the database has no live user table at all, the freed content
+    // is necessarily from a dropped table, so mark those records accordingly.
+    let dropped_table_db = !db.has_user_table();
+    if let Ok(free) = db.freelist_pages() {
+        for page in free {
+            let Some(page_bytes) = db.raw_page(page) else {
+                continue; // cov:unreachable: freelist_pages yields in-range pages
+            };
+            let source = if dropped_table_db {
+                RecoverySource::DroppedTable
+            } else {
+                RecoverySource::FreelistPage
+            };
+            for cell in db.carve_cells_inferred(page_bytes) {
+                out.push(CarvedRecord {
+                    page,
+                    offset: cell.offset,
+                    rowid: cell.rowid,
+                    values: cell.values,
+                    confidence: cell.confidence,
+                    allocated: false,
+                    source,
+                });
+            }
+        }
+    }
+
+    // (2) In-page free space of every still-allocated table-leaf page.
+    let page_count = db.page_count();
+    for page in 1..=page_count {
+        let Some(page_bytes) = db.raw_page(page) else {
+            continue; // cov:unreachable: 1..=page_count is in range
+        };
+        for cell in db.carve_free_regions(page_bytes, 0) {
+            out.push(CarvedRecord {
+                page,
+                offset: cell.offset,
+                rowid: cell.rowid,
+                values: cell.values,
+                confidence: cell.confidence,
+                allocated: false,
+                source: RecoverySource::InPageFreeBlock,
+            });
+        }
+    }
+
+    // 0-FALSE-POSITIVE: a b-tree rebalance can move a still-LIVE row to another
+    // page, leaving a stale byte-copy of it in the old page's free space. That
+    // copy parses as a clean record but is NOT a deleted row — reporting it would
+    // be a false positive. Drop any carved record whose rowid is currently live.
+    // (carve_free_regions already excludes live *cells* structurally; this
+    // additionally excludes live *content* lingering in free space.)
+    let live = db.live_rowids();
+    out.retain(|rec| !live.contains(&rec.rowid));
+
+    dedup_keep_best(out)
+}
+
+/// De-duplicate carved records by content identity, keeping the
+/// highest-confidence copy of each (a row can survive in several free regions).
+///
+/// `Value` carries an `f64` (`Real`) so it is not `Hash`/`Eq`; the identity key
+/// is the record's `rowid` plus a stable `Debug` rendering of its values, which
+/// is sufficient to collapse byte-identical recoveries.
+fn dedup_keep_best(mut records: Vec<CarvedRecord>) -> Vec<CarvedRecord> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut kept: Vec<CarvedRecord> = Vec::new();
+    // Highest confidence first, so the kept copy of each identity is the best one.
+    records.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for rec in records.drain(..) {
+        let key = format!("{}:{:?}", rec.rowid, rec.values);
+        if seen.insert(key) {
+            kept.push(rec);
+        }
+    }
+    kept
 }
 
 /// Audit an opened [`Database`] for forensically-notable anomalies.

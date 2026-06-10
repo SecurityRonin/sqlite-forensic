@@ -1,42 +1,109 @@
 # Deleted-Record Recovery — Measured Capability
 
-What `sqlite_forensic::carve_all_deleted_records` actually recovers, measured
-against **independent third-party ground truth** — the SQLite Forensic Corpus
-(Nemetz, Schmitt & Freiling, DFRWS-EU 2018, CC0), whose authors shipped, per
-database, an `.xml` answer key tagging every deleted row with its full content.
+What `sqlite_forensic::carve_all_deleted_records` actually recovers, and how it
+compares **head-to-head against `undark` and `fqlite`** — every tool scored
+against the **same independent third-party ground truth**: the SQLite Forensic
+Corpus (Nemetz, Schmitt & Freiling, DFRWS-EU 2018, CC0), whose authors shipped,
+per database, an `.xml` answer key tagging every deleted row with its full
+content.
 
-This replaces the earlier prose ("163 of 163 recoverable, 0 false positives"),
-which was measured only against our *own* `deleted_places.db` fixture — a
-Doer-Checker-weak setup where we authored both the deleter and the carver, and
-whose particular deletion shape (whole leaf pages freed onto the freelist)
-happens to be the one case our carver handles well. Against independent ground
-truth that also exercises the common **in-page free-block** deletion, the honest
-recall is **much lower**, and this document reports the true per-database numbers.
-
-The matrix is **computed reproducibly** by `forensic/tests/nemetz_metrics.rs`
-(run it with `--nocapture` to regenerate the table), not hand-written. Corpus and
-oracle provenance are in [`corpus-catalog.md`](corpus-catalog.md) and
-[`validation.md`](validation.md).
+Both matrices below are **harness-computed**, not hand-written: the single-tool
+matrix by `forensic/tests/nemetz_metrics.rs` and the three-tool head-to-head by
+`forensic/tests/nemetz_tool_comparison.rs` (run either with `--nocapture` to
+regenerate its table). Corpus and oracle provenance are in
+[`corpus-catalog.md`](corpus-catalog.md) and [`validation.md`](validation.md).
 
 ## Executive summary
 
-- **Precision is high.** Across the recall corpus the carver emits **0
-  live-re-reads** (a live row is never structurally re-surfaced as deleted) and
-  only a small, low-confidence **phantom** class (all-empty/NULL records the
-  inferred carver matches on a run of zero bytes). This is the carver's real
-  strength and it is confirmed against independent ground truth.
-- **Recall is low on in-page deletion, by a documented mechanism.** On the
-  cleanest category — `0C`, records deleted in place with `secure_delete=0` and no
-  later overwrite, so **every** deleted row's bytes physically survive — the
-  carver recovers only **24 of 101** deleted rows (substrate-limited recall ≈
-  24 %). The cause is structural and is *not* a harness artifact: see
-  "[The freeblock-prefix-clobber FN](#the-freeblock-prefix-clobber-fn)".
-- **Two recall denominators** are reported per database because they answer
-  different questions — substrate-limited (capability) and end-to-end
-  (usefulness).
-- The independent-oracle differential (undark, fqlite) and the DC3 corpus remain
-  as **secondary** checks (inter-tool concordance and a no-false-positive
-  regression set), explicitly labelled *agreement, not correctness*.
+- **fqlite leads on recall; our carver leads on precision; undark trails on
+  both.** Scored against the same Nemetz answer keys, on the in-page-deletion
+  category `0C` fqlite recovers **67** of the recoverable deleted rows, our carver
+  **23**, and undark **14** (of 84). fqlite's freeblock-aware reconstruction is
+  the recall advantage — and the precise gap our forward-parse carver does not yet
+  close (see "[The freeblock-prefix-clobber FN](#the-freeblock-prefix-clobber-fn)").
+- **Our carver never re-surfaces a live row.** Across the in-scope corpus it emits
+  **0 live-re-reads** — a structural 0-false-positive guarantee. fqlite matches
+  this (0 live-re-reads); undark does **not** — on `0D` it re-reads **56** live
+  rows as deleted (precision 0.091) and on `0E` **27** (precision 0.333).
+- **fqlite pays some precision for its recall.** On `0C` it emits 16 phantom rows
+  (precision 0.807) from mangled freeblock reconstructions; our carver's `0C`
+  precision is higher (0.885) and on `0D`/`0E` it is 1.000.
+- **Two recall denominators** are reported because they answer different questions
+  — substrate-limited (carver capability) and end-to-end (examiner usefulness).
+- These are honest measurements of *each tool* against *this* corpus, not a
+  verdict that any tool is "best": each wins on a different axis, stated plainly
+  below.
+
+> The earlier headline ("163 of 163 recoverable, 0 false positives") was a
+> fixture-only measurement against our own `deleted_places.db` (whole-freed-page
+> deletion — the one shape our carver handles well) and has been retracted; the
+> numbers here, against independent ground truth that also exercises in-page
+> deletion, supersede it.
+
+## Head-to-head — ours vs undark vs fqlite (computed)
+
+Every tool's recovered rows are matched against the **same** answer key by a
+format-stable `(col1, col2)` identity (the two integer/text columns at positions
+1 and 2 — `name`/`surname` for the text tables, the two non-id integer columns for
+the integer tables). These columns uniquely identify every deleted row in every
+0C/0D/0E database and are byte-stable across tools; the floating-point columns are
+**excluded from the key** because the three tools render reals at different
+precision (ours 5 dp, undark 6 dp, fqlite 8 dp), which would penalise float
+*formatting* rather than recovery. Two databases — **0C-06** and **0C-07** —
+carry `FLOAT` values *at* positions 1 and 2, so no format-stable cross-tool key
+exists for them; they are **excluded from this table** (our own single-tool matrix
+still scores them, rounding reals symmetrically). Categories `0A`/`0B`
+(dropped/overwritten *tables* — no live-vs-deleted anchor) and `11` (anti-forensic
+tampering — no deleted answer key) carry no clean row-level deleted set and are
+**out of scope** for a recall table.
+
+`Ddel` = rows deleted; `Drec` = of those, byte-present (recoverable substrate);
+`live` = live rows wrongly recovered as deleted (must be 0); recall denominators
+as defined under "[How the matrix is computed](#how-the-matrix-is-computed)".
+
+| cat | tool | Ddel | Drec | TP | FP | FN | live | recall (substrate) | recall (e2e) | precision |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0C | **ours** | 84 | 84 | 23 | 3 | 61 | **0** | 0.274 | 0.274 | 0.885 |
+| 0C | undark | 84 | 84 | 14 | 10 | 70 | 4 | 0.167 | 0.167 | 0.583 |
+| 0C | fqlite | 84 | 84 | **67** | 16 | 17 | **0** | **0.798** | **0.798** | 0.807 |
+| 0D | **ours** | 45 | 36 | 2 | 0 | 34 | **0** | 0.056 | 0.044 | **1.000** |
+| 0D | undark | 45 | 36 | 1 | 10 | 35 | 56 | 0.028 | 0.022 | 0.091 |
+| 0D | fqlite | 45 | 36 | **20** | 0 | 16 | **0** | **0.556** | **0.444** | **1.000** |
+| 0E | **ours** | 12 | 9 | 3 | 0 | 6 | **0** | 0.333 | 0.250 | **1.000** |
+| 0E | undark | 12 | 9 | 3 | 6 | 6 | 27 | 0.333 | 0.250 | 0.333 |
+| 0E | fqlite | 12 | 9 | 2 | 2 | 7 | **0** | 0.222 | 0.167 | 0.500 |
+
+(Totals exclude 0C-06/0C-07; `0C` therefore sums 8 databases, 84 deleted rows.
+Regenerate with `cargo test -p sqlite-forensic --test nemetz_tool_comparison --
+--nocapture`, with `UNDARK_BIN` and `FQLITE_TAP` set.)
+
+### Honest read — who wins where, and why
+
+- **In-page deletion (`0C`): fqlite leads recall decisively (0.798 vs ours 0.274
+  vs undark 0.167).** fqlite carves freeblocks geometrically — it starts parsing
+  at `freeblock_offset + 4` and reconstructs the record without the clobbered
+  payload-length/rowid varints. Our forward parser cannot (the
+  freeblock-prefix-clobber FN below); this is exactly the gap tracked in task #56.
+  fqlite's lead costs precision (16 phantom rows, 0.807) — our carver is more
+  precise (0.885) and re-reads no live row.
+- **Deleted-then-overwritten (`0D`): fqlite leads recall (0.556); ours and fqlite
+  hold perfect precision; undark fails on precision.** undark re-surfaces **56**
+  live rows as deleted here (precision 0.091) — it mis-parses these overwritten
+  tables and re-reads the live cells. Our carver and fqlite both recover only
+  genuine residue (0 live-re-reads). Our recall is low (0.056) because the
+  freeblock clobber compounds with the later `INSERT` overwrites.
+- **Overflow (`0E`): ours and undark tie on recall (0.333), fqlite slightly lower
+  (0.222); only ours holds perfect precision.** undark again re-reads live rows
+  (27, precision 0.333); fqlite emits a couple of phantoms (0.500). Our carver
+  recovers the rows whose first overflow segment + header survived, with no
+  false positive.
+
+The consistent picture: **fqlite recovers the most on in-page/overwrite deletion
+via freeblock reconstruction; our carver recovers less but never re-reads a live
+row and keeps the highest precision on 0D/0E; undark recovers the least and
+frequently re-surfaces live rows as deleted on these tables.** Where undark and
+fqlite beat us on in-page recall, the cause is their freeblock-aware
+reconstruction — a known, recorded capability gap, not a measurement artifact.
 
 ## How the matrix is computed
 
@@ -65,7 +132,17 @@ Recall is reported with two denominators:
 examiner more than discarding a low-confidence phantom), over precision and
 substrate-limited recall.
 
-## Per-database confusion matrix (computed)
+## Our carver — per-database detail (computed)
+
+The head-to-head above totals each tool per category. This section breaks **our
+carver** down per database (from `nemetz_metrics.rs`), so a low category recall
+can be traced to specific files. It differs from the head-to-head in two
+deliberate ways, both of which slightly *raise* the count reported here versus the
+head-to-head's `ours` row: it matches on the **full decoded row** (all columns,
+reals at 5 dp) rather than the `(col1,col2)` projection, and it **includes
+0C-06/0C-07** (whose float key columns the cross-tool table must drop). So our
+0C total here is 24 (over all ten 0C databases) versus 23 in the head-to-head
+(eight databases) — the same carver, two compatible scopings.
 
 Categories: `0C` deleted records (in-page free block); `0D` deleted then
 overwritten; `0E` deleted overflow records. `Ddel` = rows deleted; `Drec` = of
@@ -140,31 +217,31 @@ it.
 
 ## What the numbers do and do NOT claim
 
-- They claim an **honest, reproducible measurement** of *this* carver against
-  *this* independent corpus: high precision (no live-re-read; a small phantom
-  class), low recall on in-page/overflow deletion driven by the documented
-  freeblock-prefix clobber.
-- They do **not** claim parity with freeblock-aware tools on in-page deletion, and
-  they retract the earlier "163/163, 0 FP" framing as fixture-specific.
+- They claim an **honest, reproducible measurement** of all three tools against
+  *this* independent corpus: fqlite leads recall on in-page/overwrite deletion via
+  freeblock reconstruction; our carver leads on precision and never re-reads a live
+  row; undark trails on both and over-reports live rows as deleted on the
+  overwritten and overflow tables.
+- They do **not** claim our carver is "best" or that it has parity with
+  freeblock-aware tools on in-page recall — it does not, by the documented
+  freeblock-prefix clobber. Each tool wins on a different axis.
 - A low per-category recall is a true statement about a capability boundary, not a
   harness artifact — the substrate partition proves the bytes are present and we
   still miss them.
 
-## Secondary checks (agreement, not correctness)
+## Inter-tool concordance on our own fixture (agreement, not correctness)
 
-These corroborate behaviour but are **not** a correctness oracle; the two
-reference tools disagree with each other, so there is no gold standard among them.
+Separate from the head-to-head above (which scores each tool against ground
+truth), `oracle_differential.rs` reconciles our output against undark and fqlite
+as **oracles over our own `deleted_places.db` fixture** — it answers "do we agree
+with them?", not "how does each score?". On that fixture (whole-freed-page
+deletion — the shape our carver handles), our output **matches undark exactly**
+(163 rows) and **matches-or-exceeds fqlite**, and on the prior-version fixture we
+**match fqlite and exceed undark**. This is genuine agreement *on that deletion
+shape*, but it is inter-tool concordance, not ground truth — which is why the
+Nemetz head-to-head (real answer keys) is the headline.
 
-### Inter-tool concordance — undark & fqlite (`oracle_differential.rs`)
-
-On our own `deleted_places.db` fixture (whole-freed-page deletion — the shape our
-carver handles), our output **matches undark exactly** (163 rows) and
-**matches-or-exceeds fqlite**, and on the prior-version fixture we **match fqlite
-and exceed undark**. This is genuine evidence of agreement *on that deletion
-shape*, but it is explicitly inter-tool concordance, not ground truth — which is
-precisely why the Nemetz matrix above (real answer keys) is now the headline.
-
-### DC3 `sqlite_dissect` corpus — a no-false-positive regression set
+## DC3 `sqlite_dissect` corpus — a no-false-positive regression set
 
 The DC3 corpus carries **no deleted-row ground truth**: its `expected_rows` were
 found (independently confirmed: `freelist_count = 0`, contiguous rowids,

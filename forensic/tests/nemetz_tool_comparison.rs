@@ -216,18 +216,51 @@ fn ours_recover(db: &Database) -> BTreeSet<RowId> {
 /// so the two identity columns are CSV fields 2 and 3 (same projection as
 /// `oracle_differential.rs`). Whatever undark emits is taken verbatim — a mangled
 /// row simply will not match the answer key (an honest miss/phantom, not hidden).
-fn undark_recover(_undark: &Path, _db: &Path) -> BTreeSet<RowId> {
-    // RED: not yet implemented — the undark runner is wired in the GREEN commit.
-    BTreeSet::new()
+fn undark_recover(undark: &Path, db: &Path) -> BTreeSet<RowId> {
+    let out = Command::new(undark)
+        .arg("-i")
+        .arg(db)
+        .output()
+        .expect("undark must execute");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut set = BTreeSet::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f = split_csv(line);
+        if f.len() >= 4 {
+            set.insert((unquote(&f[2]), unquote(&f[3])));
+        }
+    }
+    set
 }
 
 /// fqlite's recovered `(col1,col2)` set via the headless tap. The tap emits
 /// `rowid,offset,id,col1,col2,...` for data records (rowid is often `-1`) and
 /// `n,[page|..],..,table|index|..,..` lines for the freed schema records — the
 /// latter are skipped. The two identity columns are CSV fields 3 and 4.
-fn fqlite_recover(_tap: &Path, _db: &Path) -> BTreeSet<RowId> {
-    // RED: not yet implemented — the fqlite tap runner is wired in the GREEN commit.
-    BTreeSet::new()
+fn fqlite_recover(tap: &Path, db: &Path) -> BTreeSet<RowId> {
+    let out = Command::new(tap)
+        .arg(db)
+        .output()
+        .expect("fqlite tap must execute");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut set = BTreeSet::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f = split_csv(line);
+        // Skip freed-schema records: field 4 is the sqlite_master "type".
+        if f.len() >= 5 && matches!(f[4].as_str(), "table" | "index" | "trigger" | "view") {
+            continue;
+        }
+        if f.len() >= 5 {
+            set.insert((unquote(&f[3]), unquote(&f[4])));
+        }
+    }
+    set
 }
 
 /// The in-scope databases for the head-to-head: 0C/0D/0E minus the float-key
@@ -383,9 +416,7 @@ fn emit_three_tool_comparison() {
             print_row(cat, "fqlite", f);
         }
     }
-    println!(
-        "\nExcluded (FLOAT key columns, no cross-tool identity): {FLOAT_KEY_EXCLUSIONS:?}"
-    );
+    println!("\nExcluded (FLOAT key columns, no cross-tool identity): {FLOAT_KEY_EXCLUSIONS:?}");
 }
 
 /// fqlite's freeblock-aware reconstruction leads on the clean in-page-deletion

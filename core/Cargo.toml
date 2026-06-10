@@ -2,7 +2,7 @@
 name = "sqlite-core"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 description = "Native, read-only, panic-free SQLite file-format reader for forensics (WS-C spike prototype)."
 
 [lib]

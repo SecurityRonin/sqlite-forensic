@@ -115,9 +115,13 @@ impl Observation for Anomaly {
 /// has validated magic + page size by the time a [`Database`] exists, so the
 /// remaining gradable header observation is the reserved-space field.
 #[must_use]
-pub fn audit(_db: &Database) -> Vec<Anomaly> {
-    // RED: not yet implemented — the GREEN commit grades the reserved-space field.
-    Vec::new()
+pub fn audit(db: &Database) -> Vec<Anomaly> {
+    let mut out = Vec::new();
+    let reserved = db.header().reserved;
+    if reserved != 0 {
+        out.push(Anomaly::new(AnomalyKind::NonZeroReservedSpace { reserved }));
+    }
+    out
 }
 
 /// Audit an opened [`Database`] and convert each anomaly to the canonical

@@ -27,7 +27,7 @@
 //!
 //! 1. `tests/data/deleted_places.db` — OUR fixture. undark is an
 //!    independent *oracle* over our input.
-//! 2. `tests-fqlite-corpus/dc3-sqlite-dissect/*.db` — the DC3 (Department of
+//! 2. `tests-oracle-corpus/dc3-sqlite-dissect/*.db` — the DC3 (Department of
 //!    Defense Cyber Crime Center) `sqlite_dissect` test corpus. Authored by
 //!    neither us nor undark's author, so neither the input DB nor the oracle is
 //!    ours — the strongest form of Doer-Checker validation. These DBs exercise
@@ -129,7 +129,7 @@ fn ours_recover(db: &Database, cols: usize) -> RowSet {
 
 fn corpus_db(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../tests-fqlite-corpus/dc3-sqlite-dissect")
+        .join("../tests-oracle-corpus/dc3-sqlite-dissect")
         .join(name)
 }
 
@@ -300,7 +300,7 @@ fn dc3_corpus_agrees_with_undark() {
         let path = corpus_db(case.name);
         if !path.exists() {
             eprintln!(
-                "SKIP {}: DC3 corpus DB absent (gitignored — see tests-fqlite-corpus/README.md)",
+                "SKIP {}: DC3 corpus DB absent (gitignored — see tests-oracle-corpus/README.md)",
                 case.name
             );
             continue;

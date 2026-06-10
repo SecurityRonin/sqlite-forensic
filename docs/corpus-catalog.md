@@ -5,7 +5,7 @@ This is the per-repo record of the SQLite test fixtures under the repo-root
 `tests/data/README.md`). It mirrors the fleet-wide catalog discipline
 (`issen/docs/corpus-catalog.md`); the verbatim generator for each synthetic
 fixture is recorded here so the corpus is reproducible. The committed fixtures
-**are** in git (only `/target`, `/tools`, and `/tests-fqlite-corpus` are
+**are** in git (only `/target`, `/tools`, and `/tests-oracle-corpus` are
 gitignored), but the generators are kept here regardless so anyone can rebuild or
 vary them.
 
@@ -129,7 +129,7 @@ PY
 
 The independent reference carver used to validate `carve_deleted_records`
 (differential methodology in `docs/validation.md`; harness in
-`forensic/tests/fqlite_oracle.rs`). `tools/` is gitignored — the binary is **not
+`forensic/tests/oracle_differential.rs`). `tools/` is gitignored — the binary is **not
 committed**; this entry is its provenance record.
 
 - Classification: `VENDORED` (third-party tool), confidence `✓` (built and run).
@@ -153,13 +153,13 @@ committed**; this entry is its provenance record.
 > DC3 corpus below supplies independent input. Full evidence in
 > `docs/validation.md`.
 
-## §G `tests-fqlite-corpus/dc3-sqlite-dissect/`  (REAL-ext, not committed)
+## §G `tests-oracle-corpus/dc3-sqlite-dissect/`  (REAL-ext, not committed)
 
 Independent third-party SQLite databases authored by the Department of Defense
 Cyber Crime Center (DC3) as the `sqlite_dissect` project's test corpus. Used as
 **independent input** for the differential carving validation: neither the input
-DB nor the oracle (`undark`) is ours. `tests-fqlite-corpus/` is gitignored — the
-DBs are **not committed**; this entry + `tests-fqlite-corpus/README.md` are their
+DB nor the oracle (`undark`) is ours. `tests-oracle-corpus/` is gitignored — the
+DBs are **not committed**; this entry + `tests-oracle-corpus/README.md` are their
 provenance record.
 
 - Classification: `REAL-ext` (externally-authored real artifacts), confidence `✓`
@@ -175,7 +175,7 @@ provenance record.
   `sqlite_master`). Our freelist-only carver recovers 0 from all of these — the
   documented scope boundary in `docs/validation.md`.
 
-sha256 (full list in `tests-fqlite-corpus/README.md`); the six DBs wired into the
+sha256 (full list in `tests-oracle-corpus/README.md`); the six DBs wired into the
 differential test:
 
 | file | sha256 | md5 | bytes |
@@ -200,5 +200,5 @@ Committed fixtures (under `tests/data/`, `tests/data/`):
 | `tests/data/deleted_places.db` | `16682d7df99b1e8a89287a508d95eb47` | 53248 |
 
 Not committed (provenance only — see §F, §G and the per-directory READMEs):
-`tools/undark`, and the DC3 corpus under `tests-fqlite-corpus/dc3-sqlite-dissect/`
-(full sha256/md5 list in `tests-fqlite-corpus/README.md`).
+`tools/undark`, and the DC3 corpus under `tests-oracle-corpus/dc3-sqlite-dissect/`
+(full sha256/md5 list in `tests-oracle-corpus/README.md`).

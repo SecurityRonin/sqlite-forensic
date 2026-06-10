@@ -5,7 +5,7 @@
 /tools/
 
 # Third-party validation corpus: the DBs are NOT committed (provenance + hashes
-# recorded in tests-fqlite-corpus/README.md and docs/corpus-catalog.md), but the
+# recorded in tests-oracle-corpus/README.md and docs/corpus-catalog.md), but the
 # README that records that provenance IS committed.
-/tests-fqlite-corpus/*
-!/tests-fqlite-corpus/README.md
+/tests-oracle-corpus/*
+!/tests-oracle-corpus/README.md

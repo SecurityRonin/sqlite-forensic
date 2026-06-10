@@ -14,7 +14,7 @@
 //! are all ours, so it can only smoke-test that the pipeline runs and that a
 //! couple of known rows come back verbatim — it cannot prove correctness against
 //! an independent reference. The authoritative, Doer-Checker validation lives in
-//! `forensic/tests/fqlite_oracle.rs` (differential reconciliation against the
+//! `forensic/tests/oracle_differential.rs` (differential reconciliation against the
 //! independent `undark` carver and the DC3 `sqlite_dissect` corpus) and is
 //! written up in `docs/validation.md`. The former magic-number assertion
 //! (`carved.len() >= 150`) is intentionally gone: it dressed an arbitrary
@@ -35,7 +35,7 @@ fn smoke_recovers_deleted_rows_from_freed_pages() {
 
     // Smoke bound only: the carver must produce a non-trivial result on a fixture
     // known to hold ~200 deleted rows. The actual completeness claim (vs. the
-    // undark oracle) is asserted in `fqlite_oracle.rs`, NOT here — do not treat
+    // undark oracle) is asserted in `oracle_differential.rs`, NOT here — do not treat
     // this loose lower bound as validation.
     assert!(
         !carved.is_empty(),

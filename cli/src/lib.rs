@@ -520,6 +520,94 @@ mod tests {
         Anomaly::new(AnomalyKind::NonEmptyFreelist { free_pages: 4 })
     }
 
+    fn wal_rec(source: RecoverySource, frame_index: usize) -> CarvedRecord {
+        CarvedRecord {
+            page: 2,
+            offset: 64,
+            rowid: 130,
+            values: vec![Value::Text("secret WAL body 130".into())],
+            confidence: 0.9,
+            allocated: false,
+            source,
+            wal: Some(sqlite_forensic::WalProvenance {
+                frame_index,
+                salt1: 3_131_615_003,
+                salt2: 3_836_839_008,
+            }),
+        }
+    }
+
+    #[test]
+    fn snapshot_label_distinguishes_on_disk_commit_and_wal_frame() {
+        // On-disk record: no WAL provenance → the on-disk base-image view.
+        let on_disk = rec(7, 0.9, RecoverySource::FreelistPage, vec![]);
+        assert_eq!(snapshot_label(&on_disk), "on-disk");
+
+        // Commit-snapshot record: labelled commit:(salt1,salt2,commit_frame_index).
+        let commit = wal_rec(RecoverySource::CommitSnapshot, 0);
+        assert_eq!(snapshot_label(&commit), "commit:(3131615003,3836839008,0)");
+
+        // WAL-frame residue (#60): labelled wal-frame:(salt1,salt2,frame_index).
+        let frame = wal_rec(RecoverySource::WalFrame, 1);
+        assert_eq!(snapshot_label(&frame), "wal-frame:(3131615003,3836839008,1)");
+    }
+
+    #[test]
+    fn carve_with_snapshot_table_has_snapshot_column() {
+        let records = vec![
+            wal_rec(RecoverySource::CommitSnapshot, 0),
+            wal_rec(RecoverySource::WalFrame, 1),
+        ];
+        let lines = render_carve_with_snapshot(&records, OutputFormat::Table, false);
+        assert!(lines[0].contains("snapshot"), "header has snapshot col: {}", lines[0]);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].contains("commit:(3131615003,3836839008,0)"), "{}", lines[1]);
+        assert!(lines[2].contains("wal-frame:(3131615003,3836839008,1)"), "{}", lines[2]);
+    }
+
+    #[test]
+    fn carve_with_snapshot_csv_has_snapshot_header_and_value() {
+        let records = vec![wal_rec(RecoverySource::CommitSnapshot, 0)];
+        let lines = render_carve_with_snapshot(&records, OutputFormat::Csv, false);
+        assert_eq!(
+            lines[0],
+            "page,offset,rowid,recovery_source,confidence,snapshot,values"
+        );
+        assert!(
+            lines[1].contains("\"commit:(3131615003,3836839008,0)\"")
+                || lines[1].contains("commit:(3131615003,3836839008,0)"),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn carve_with_snapshot_jsonl_carries_snapshot_field() {
+        let records = vec![wal_rec(RecoverySource::WalFrame, 1)];
+        let lines = render_carve_with_snapshot(&records, OutputFormat::Jsonl, false);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("\"snapshot\":\"wal-frame:(3131615003,3836839008,1)\""),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn carve_with_snapshot_rowid_only_still_projects_rowids() {
+        let records = vec![wal_rec(RecoverySource::CommitSnapshot, 0)];
+        let lines = render_carve_with_snapshot(&records, OutputFormat::Jsonl, true);
+        assert_eq!(lines, vec!["130".to_string()]);
+    }
+
+    #[test]
+    fn snapshot_recovery_source_token_is_stable() {
+        assert_eq!(
+            recovery_source_token(RecoverySource::CommitSnapshot),
+            "commit-snapshot"
+        );
+    }
+
     #[test]
     fn severity_tokens_are_stable() {
         use forensicnomicon::report::Severity;

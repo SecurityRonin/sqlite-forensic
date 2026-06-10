@@ -6,17 +6,26 @@ reference tool** so that correctness is not asserted only by tests we wrote agai
 fixture we generated. The machine-checkable form of this evidence is
 `forensic/tests/oracle_differential.rs`.
 
-> **Post-#49 update.** The page-level *differential findings* below remain the record
-> of how each tool draws the freelist/allocated boundary. But the **carver scope
-> boundaries they describe are now closed**: `sqlite_forensic::carve_all_deleted_records`
-> added in-page free-block carving and dropped-table carving, so on the fixture it now
-> recovers the in-page remnant (rowid 237) and **exactly matches undark**, and it
-> recovers the DC3 dropped-table rows. The post-#49 capability matrix (per
-> deletion-scenario class, with the new numbers) is
-> [`recovery-comparison.md`](recovery-comparison.md); the differential test asserts
-> agreement now rather than the former exemptions. Where this document says "our
-> freelist-only carver recovers none" of the in-page / dropped-table cases, read it as
-> the *pre-#49* state.
+> **This document is the historical *differential* record; the current capability
+> matrix lives in [`recovery-comparison.md`](recovery-comparison.md).** The page-level
+> findings below remain accurate as the record of how each tool draws the
+> freelist/allocated boundary, but several carver *scope boundaries* they describe are
+> now closed — so read the per-scenario **numbers and the "Summary" section below as
+> the pre-fix snapshot** and defer to `recovery-comparison.md` for current numbers:
+>
+> - `carve_all_deleted_records` added **in-page free-block carving** and
+>   **dropped-table carving**, so on the fixture it recovers the in-page remnant
+>   (rowid 237) and **exactly matches undark**, and it recovers the DC3 dropped-table
+>   rows. Where this doc says "our freelist-only carver recovers none" of those cases,
+>   that is the *pre-fix* state.
+> - It then added **value-aware prior-version recovery**: an `UPDATE`'s freed old
+>   version (same rowid, *different* values) is recovered (tagged `PriorVersion`), not
+>   dropped. The differential test (`oracle_differential.rs`) asserts agreement now,
+>   plus a prior-version reconciliation, rather than the former exemptions.
+>
+> The Summary's "consistent with / agree exactly" statements describe the
+> **freelist-page differential** specifically and still hold for that scenario; they
+> are not the whole-corpus capability claim — for that, see `recovery-comparison.md`.
 
 ## Summary
 

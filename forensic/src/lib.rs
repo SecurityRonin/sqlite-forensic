@@ -665,17 +665,8 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
 pub fn carve_with_fragments(db: &Database) -> CarveTiers {
     let full = carve_all_deleted_records(db);
 
-    // RED stub: Tier-2 salvage wired in the GREEN commit.
-    if full.is_empty() || !full.is_empty() {
-        return CarveTiers {
-            full,
-            fragments: Vec::new(),
-        };
-    }
-
     // Salvage Tier-2 fragments from every on-disk table-leaf page. The core
     // walker emits a fragment only where full reconstruction failed (layer 1).
-    #[allow(unreachable_code)]
     let mut fragments: Vec<CarvedFragment> = Vec::new();
     let page_count = db.page_count();
     for page in 1..=page_count {

@@ -3083,4 +3083,135 @@ mod tests {
             .iter()
             .any(|v| matches!(v, Value::Text(t) if t == "Anja"))));
     }
+
+    // ---- task #73: chain-aware overflow recovery — spilled-cell recognition ----
+
+    /// Encode a SQLite varint (minimal big-endian 7-bit groups).
+    fn enc_varint(mut n: u64) -> Vec<u8> {
+        if n == 0 {
+            return vec![0];
+        }
+        let mut groups = Vec::new();
+        while n > 0 {
+            groups.push((n & 0x7f) as u8);
+            n >>= 7;
+        }
+        groups.reverse();
+        let last = groups.len() - 1;
+        for (i, g) in groups.iter_mut().enumerate() {
+            if i != last {
+                *g |= 0x80;
+            }
+        }
+        groups
+    }
+
+    /// Build the **local prefix** bytes of a freed spilled table-leaf cell:
+    /// `payload_len varint, rowid varint, record header, local payload bytes,
+    /// 4-byte big-endian first-overflow pointer`. Returns `(bytes, P, local,
+    /// serials)`. The record is `(id INTEGER, name TEXT, code TEXT)` with `code`
+    /// large enough to force a spill past `usable - 35`.
+    fn synth_spilled_prefix(
+        rowid: i64,
+        id: i64,
+        name: &str,
+        code_len: usize,
+        usable: usize,
+        first_overflow: u32,
+    ) -> (Vec<u8>, usize, usize, Vec<i64>) {
+        let id_serial = 1i64; // 1-byte integer
+        let name_serial = 13 + 2 * name.len() as i64; // TEXT
+        let code_serial = 13 + 2 * code_len as i64; // TEXT
+        let serials = vec![id_serial, name_serial, code_serial];
+        let mut serial_bytes = Vec::new();
+        for &s in &serials {
+            serial_bytes.extend(enc_varint(s as u64));
+        }
+        // header_len varint counts itself — solve the fixed point.
+        let mut header_len = serial_bytes.len() + 1;
+        while enc_varint(header_len as u64).len() + serial_bytes.len() != header_len {
+            header_len += 1;
+        }
+        let mut header = enc_varint(header_len as u64);
+        header.extend(&serial_bytes);
+        let body_len = 1 + name.len() + code_len;
+        let payload_len = header.len() + body_len;
+        let local = local_payload_len(payload_len, usable);
+
+        // Full payload = header ++ id-body ++ name-body ++ code-body.
+        let mut payload = header.clone();
+        payload.push(id as u8); // 1-byte id
+        payload.extend(name.as_bytes());
+        payload.extend(std::iter::repeat_n(b'C', code_len));
+        assert_eq!(payload.len(), payload_len);
+
+        // Cell = prefix varints ++ local payload prefix ++ 4-byte overflow ptr.
+        let mut cell = enc_varint(payload_len as u64);
+        cell.extend(enc_varint(rowid as u64));
+        cell.extend(&payload[..local]);
+        cell.extend(first_overflow.to_be_bytes());
+        (cell, payload_len, local, serials)
+    }
+
+    #[test]
+    fn spilled_recognizer_reads_intact_prefix() {
+        let usable = 4096usize;
+        let (cell, p, local, serials) =
+            synth_spilled_prefix(20012, 42, "Ella", 4000, usable, 13);
+        assert!(p > usable - 35, "this record must spill");
+        // Place the cell inside a larger scanned slice at a nonzero offset.
+        let off = 50usize;
+        let mut buf = vec![0u8; off];
+        buf.extend(&cell);
+        let sc = try_carve_spilled_cell_at(&buf, off, usable, Some(3))
+            .expect("must recognize the intact-prefix spilled cell");
+        assert_eq!(sc.payload_len, p);
+        assert_eq!(sc.local_len, local);
+        assert_eq!(sc.rowid, 20012);
+        assert_eq!(sc.first_overflow, 13);
+        assert_eq!(sc.serials, serials);
+        assert_eq!(sc.offset, off);
+    }
+
+    #[test]
+    fn spilled_recognizer_abstains_for_in_page_payload() {
+        let usable = 4096usize;
+        // A small (in-page) payload: the existing carve path owns it.
+        let (cell, p, _local, _s) = {
+            // header (3 serials) + body for a tiny code -> P <= usable-35.
+            let r = synth_spilled_prefix(7, 1, "Bob", 10, usable, 9);
+            r
+        };
+        assert!(p <= usable - 35, "this record must NOT spill");
+        assert!(try_carve_spilled_cell_at(&cell, 0, usable, Some(3)).is_none());
+    }
+
+    #[test]
+    fn spilled_recognizer_abstains_on_truncated_pointer() {
+        let usable = 4096usize;
+        let (cell, _p, _local, _s) =
+            synth_spilled_prefix(20012, 42, "Ella", 4000, usable, 13);
+        // Drop the final 2 bytes so the 4-byte overflow pointer is out of bounds.
+        let truncated = &cell[..cell.len() - 2];
+        assert!(try_carve_spilled_cell_at(truncated, 0, usable, Some(3)).is_none());
+    }
+
+    #[test]
+    fn spilled_recognizer_abstains_on_column_mismatch() {
+        let usable = 4096usize;
+        let (cell, _p, _local, _s) =
+            synth_spilled_prefix(20012, 42, "Ella", 4000, usable, 13);
+        // Expect 5 columns but the record has 3.
+        assert!(try_carve_spilled_cell_at(&cell, 0, usable, Some(5)).is_none());
+        // Inferred (None) still recognizes it.
+        assert!(try_carve_spilled_cell_at(&cell, 0, usable, None).is_some());
+    }
+
+    #[test]
+    fn spilled_recognizer_abstains_on_nonpositive_rowid() {
+        let usable = 4096usize;
+        let (cell, _p, _local, _s) =
+            synth_spilled_prefix(0, 42, "Ella", 4000, usable, 13);
+        assert!(try_carve_spilled_cell_at(&cell, 0, usable, Some(3)).is_none());
+    }
 }

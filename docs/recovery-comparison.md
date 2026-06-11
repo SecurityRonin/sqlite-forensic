@@ -43,6 +43,11 @@ regenerate its table). Corpus and oracle provenance are in
   template derived from a live cell on the same page; the destroyed rowid is
   surfaced as unknown (`0`), never invented. See
   "[Freeblock reconstruction](#freeblock-reconstruction)".
+- **An opt-in Tier-2 fragment surface** salvages partial rows where a full identity
+  is destroyed but a distinctive cell survives (`carve --fragments`). It is kept
+  strictly separate from the full-row tier — it has an expected non-zero
+  false-positive rate, so the default output never includes it. See
+  "[Two-tier recovery](#two-tier-recovery--tier-2-fragments)".
 - **Two recall denominators** are reported because they answer different questions
   — substrate-limited (carver capability) and end-to-end (examiner usefulness).
 - These are honest measurements of *each tool* against *this* corpus, not a
@@ -223,6 +228,21 @@ Recall is reported with two denominators:
 examiner more than discarding a low-confidence phantom), over precision and
 substrate-limited recall.
 
+The Tier-2 fragment surface (see "[Two-tier recovery](#two-tier-recovery--tier-2-fragments)")
+is measured with its own counts, never blended into the full-row matrix above:
+
+- **fragment-recoverable** = the denominator: deleted rows whose full identity is
+  destroyed (not substrate-recoverable) yet at least one *distinctive* cell — TEXT
+  of ≥ 4 UTF-8 bytes, or REAL — still survives contiguously somewhere in the file.
+  Bare integers are excluded (a 1–8-byte integer pattern coincides too often to
+  anchor identity), so numerator and denominator share one distinctiveness rule.
+- **fragment-TP** = a salvaged fragment whose surviving distinctive cells equal the
+  corresponding columns of an answer-key deleted row.
+- **fragment-FP** = a fragment matching neither a deleted nor a live row (phantom)
+  or matching a live row (live-re-read). Measured and reported separately, because
+  the fragment surface — unlike the full-row tier — has an **expected non-zero**
+  false-positive rate; that is precisely why it is opt-in.
+
 ## Our carver — per-database detail (computed)
 
 The head-to-head above totals each tool per category. This section breaks **our
@@ -326,6 +346,60 @@ the rowid is gone). The result: 0C recall 0.274 → 0.833 with **0 new phantoms 
 This is the published forensic technique (Nemetz et al. 2018; Pawlaszczyk &
 Hummert 2021), implemented from the SQLite file-format spec — not adapted from any
 GPL tool's source.
+
+## Two-tier recovery — Tier-2 fragments
+
+Recovery is split into two strictly separated tiers:
+
+- **Tier 1 — full rows** (the matrix above): `carve_all_deleted_records` rebuilds
+  complete, scored identities and keeps the structural 0-false-positive guarantee.
+  This is the default, zero-config output.
+- **Tier 2 — fragments** (opt-in, `carve --fragments`): where a freed cell's full
+  row cannot be reconstructed but a *distinctive* cell survives at the same
+  structural anchor, the maximal decodable column prefix is salvaged as a
+  `CarvedFragment` — a separate type with no rowid and an incomplete column set,
+  rendered in its own section so it can never be mistaken for a recovered row.
+
+The honest read of the deleted-then-overwritten category `0D` is three buckets:
+
+| of 45 deleted 0D rows | count | meaning |
+|---|---|---|
+| fully reconstructable | 19 | full identity survives; all recovered (Tier-1 substrate recall 1.000) |
+| yield a genuine fragment | 5 | full identity destroyed, but a distinctive TEXT cell survives |
+| destroyed / undecidable | 21 | nothing distinctive survives a later overwrite |
+
+Of the 5 fragment-recoverable 0D rows, the on-disk freeblock/gap extractor reaches
+**1** (`0D-01`, id 20004: `name='Anja' surname='Frank'`, the `codeB` REAL tail
+clobbered). The other 4 survive only *inside live-cell extents the carver must
+never scan* (re-surfacing them would break the never-touch-a-live-row guarantee)
+or at offsets no freeblock/gap anchor walks — so fragment recall < 1.0 is expected
+and honest, not a defect. `0E` adds 4 fragment-recoverable rows (long TEXT split
+across overflow pages), none yet reached by the flat-contiguity extractor
+(chain-aware overflow fragments are future work). `0C` is fully reconstructable,
+so it yields no fragments.
+
+Because a lone surviving cell *can* be a coincidental byte run that satisfies the
+serial + UTF-8 checks, the fragment surface carries an **expected non-zero
+false-positive rate** and is therefore opt-in — the full-row tier's 0-false-positive
+claim is **never** extended to it. On this corpus the *measured* fragment false
+positive count is **0** (every emitted fragment matched a real deleted row, none a
+live row), but the mechanism permits more, which is why the default output never
+includes fragments.
+
+| category | deleted | full-recoverable | fragment-recoverable | fragment-TP (extractor) | fragment-FP |
+|---|---|---|---|---|---|
+| 0C | 101 | 101 | 0 | 0 | 0 |
+| 0D | 45 | 19 | 5 | 1 | 0 |
+| 0E | 12 | 3 | 4 | 0 | 0 |
+
+(The legacy any-distinctive-column proxy would count 17 "fragment-only" 0D rows,
+but 12 of those survive only as 1–4-byte integer patterns indistinguishable from
+coincidence — an integer-pattern-inflated upper bound, not the metric. The honest
+distinctive-cell denominator is 5.)
+
+fqlite and undark have no comparable fragment tier, so the head-to-head matrix
+stays full-row-only (apples-to-apples); fragments are an ours-only capability
+reported here.
 
 ## What the numbers do and do NOT claim
 

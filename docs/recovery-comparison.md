@@ -122,11 +122,13 @@ The figure plots the **same harness-computed numbers** as the table above:
 [`img/comparison_metrics.csv`](img/comparison_metrics.csv) when run with the
 undark/fqlite oracles, and `docs/plot_comparison.py` renders the chart straight
 from that CSV — chart and table are the same dataset by construction. By **F1**
-(balanced), sqlite-forensic leads `0C` (0.892 vs fqlite 0.802) and `0E` (1.000 vs
-undark 0.500, fqlite 0.400); under **F0.5** (precision-weighted — the forensic β,
-since a phantom row costs an examiner more than a missed low-confidence one) the
-`0C` lead widens (0.931 vs 0.805) and `0E` stays a clean lead (1.000 vs undark
-0.385, fqlite 0.455). On `0D`, ours and fqlite both score **1.000** on substrate
+(balanced), sqlite-forensic leads `0C` (0.892 vs fqlite 0.802); under **F0.5**
+(precision-weighted — the forensic β, since a phantom row costs an examiner more
+than a missed low-confidence one) the `0C` lead widens (0.931 vs 0.805). The `0E`
+F-scores (ours 1.000 vs undark 0.500/0.385, fqlite 0.400/0.455) are computed on the
+tiny 3-row contiguous substrate only — with end-to-end `0E` recall at 0.250, that is
+a substrate-level edge, not an overflow-recovery win. On `0D`, ours and fqlite both
+score **1.000** on substrate
 recall, precision, and therefore both F-scores — each recovers every row whose full
 identity survives. To refresh: rerun the test with `UNDARK_BIN`/`FQLITE_TAP` set to
 rewrite the CSV, then `python3 docs/plot_comparison.py` to rerender the PNG. (The
@@ -150,14 +152,15 @@ committed CSV/PNG were produced by that oracle run; `FQLITE_TAP` =
   projects **20** TPs under the cross-tool `(col1,col2)` projection against the
   denominator of 19 substrate-recoverable rows; that extra projected row is not
   part of the recoverable substrate.)
-- **Overflow (`0E`): ours leads — substrate recall 1.000 at precision 1.000.**
-  Against the honest denominator (3 of the 12 deleted overflow rows survive
-  in-page and contiguously; **end-to-end `0E` recall is therefore only 0.250**),
-  our carver recovers all 3 with no false positive. undark also recovers 3/3 on the
-  substrate but re-reads **27** live rows (precision 0.333); fqlite recovers 1 of
-  the 3 (substrate recall 0.333) and emits phantoms (precision 0.500). (Freeblock
-  reconstruction adds nothing on `0E` — these records spill to overflow, so the
-  residue is not a simple in-page freeblock.)
+- **Overflow (`0E`): substrate-only partial, not a lead.** End-to-end `0E` recall
+  is only **0.250** — most deleted overflow rows are not recovered. Against the
+  honest denominator (3 of the 12 deleted overflow rows survive in-page and
+  contiguously) our carver recovers all 3 with no false positive. undark also
+  recovers 3/3 on the substrate but re-reads **27** live rows (precision 0.333);
+  fqlite recovers 2 deleted overflow rows end-to-end (the table's `TP = 2`) but only
+  1 falls within the 3-row recoverable substrate, so its substrate recall is
+  1/3 = 0.333 (precision 0.500). (Freeblock reconstruction adds nothing on `0E` —
+  these records spill to overflow, so the residue is not a simple in-page freeblock.)
 
 The consistent picture (per the committed oracle run): **our carver leads fqlite
 on in-page recall (`0C`, 0.833 vs 0.798) while keeping the highest precision of all
@@ -347,8 +350,9 @@ GPL tool's source.
 - They do **not** claim our carver is "best" overall. On `0D` end-to-end, fqlite's
   cross-tool `(col1,col2)` projection counts **20** TPs to our 19 (against a
   denominator of 19 substrate-recoverable rows); on `0C` we lead fqlite by raw
-  recall, and on `0E` we lead it. We hold a structural 0-false-positive guarantee
-  and the lowest phantom rate of the three throughout.
+  recall; on `0E` end-to-end recovery is weak for both (ours 0.250, fqlite 0.167) —
+  not a meaningful lead. We hold a structural 0-false-positive guarantee and the
+  lowest phantom rate of the three throughout.
 - A low per-category end-to-end recall is a true statement about a capability
   boundary, not a harness artifact — the two-denominator split separates "the bytes
   did not survive" (substrate) from "the bytes survived and we missed them"

@@ -626,109 +626,12 @@ impl Database {
     /// schema template yield an empty result.
     #[must_use]
     pub fn reconstruct_freeblock_records(&self, page_bytes: &[u8]) -> Vec<CarvedCell> {
-        let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
-            SQLITE_HEADER_SIZE
-        } else {
-            0
-        };
-        let Some(&page_type) = page_bytes.get(hdr_off) else {
-            return Vec::new();
-        };
-        if page_type != 0x0d {
-            return Vec::new(); // only table-leaf pages have freeblock residue
-        }
-        // Derive the record-header template from the first live cell on the page.
-        // Without it we cannot know the serial types of the leading columns that
-        // the freeblock header clobbered, so reconstruction is not attempted.
-        let Some(template) = freeblock_template(page_bytes, hdr_off) else {
-            return Vec::new();
-        };
-
-        // Walk the page's **freeblock chain** (file-format §1.6): `firstFreeblock`
-        // in the page header, then each freeblock's 2-byte `next` pointer. Each
-        // freeblock spans `[fb, fb + size)`. When SQLite frees adjacent cells it
-        // coalesces them into ONE freeblock whose interior still holds the freed
-        // records back-to-back, each prefixed by a stale 4-byte freeblock header
-        // that clobbers its leading bytes — so the span-walk reconstructs *every*
-        // coalesced cell in the freeblock, not just its head.
-        //
-        // Walking only the freeblock chain (the precise, page-recorded boundaries
-        // of freed space) — rather than every free byte range — is the precision
-        // discipline: the chain entries are exactly where freed cells begin, so no
-        // reconstruction is ever anchored in the page's unallocated gap, where a
-        // run of arbitrary bytes could coincidentally satisfy the legal-serial +
-        // fits-in-span checks and manufacture a phantom row.
-        //
-        // Bounded and panic-free: every `next`/`size` is range-checked against the
-        // page before use, visited offsets break a cyclic `next`, and the walk is
-        // capped at [`MAX_FREEBLOCKS_PER_PAGE`].
-        let first_freeblock = be_u16(page_bytes, hdr_off + 1) as usize;
-        let mut out = Vec::new();
-        let mut fb = first_freeblock;
-        let mut walked = 0usize;
-        let mut visited = std::collections::BTreeSet::new();
-        while fb != 0 && walked < MAX_FREEBLOCKS_PER_PAGE {
-            walked += 1;
-            if !visited.insert(fb) {
-                break; // cyclic next pointer
-            }
-            // Each freeblock header is 4 bytes: next(2) + size(2).
-            let next = be_u16(page_bytes, fb) as usize;
-            let size = be_u16(page_bytes, fb + 2) as usize;
-            let Some(fb_end) = fb.checked_add(size) else {
-                break; // cov:unreachable: usize add of two u16-range values
-            };
-            // A valid freeblock is at least its own 4-byte header and stays on page.
-            if size >= 4 && fb_end <= page_bytes.len() {
-                template.reconstruct_span(page_bytes, fb, fb_end, false, &mut out);
-            }
-            fb = next;
-        }
-
-        // (2) The page's **unallocated gap** `[cellPointerArrayEnd, cellContentArea)`.
-        // When cells are deleted and the page is later partially rewritten, SQLite
-        // may clear `firstFreeblock` (the deleted-then-overwritten 0D case), so the
-        // freed cells linger in the gap UNLINKED from any freeblock chain — the
-        // chain walk above cannot reach them. They sit packed back-to-back just
-        // above `cellContentArea`, headed by the most-recently-freed cell, which
-        // still carries an INTACT cell prefix (its 4 bytes were never reused).
-        //
-        // The precision discipline is to anchor on that intact cell — never to
-        // slide blindly through the gap (most of which is zero-fill that decodes as
-        // phantom all-NULL records). `try_carve_cell_at` accepts an offset only when
-        // it forward-parses as a fully self-consistent record with the table's exact
-        // column count, a positive rowid, and real text content; that is the
-        // structural anchor. From the anchor's end the coalesced followers (whose
-        // prefixes WERE clobbered) are reconstructed by the same template span-walk.
-        // The anchor cell itself is left to the in-page free-region carve (it has a
-        // live rowid and is recovered there); this pass contributes only the
-        // clobbered followers the forward carve cannot reach.
-        let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
-        let cptr_end = hdr_off + 8 + cell_count * 2;
-        let cca = be_u16(page_bytes, hdr_off + 5) as usize;
-        if cca > cptr_end && cca <= page_bytes.len() {
-            for anchor_off in cptr_end..cca {
-                let Some(anchor) =
-                    try_carve_cell_at(page_bytes, anchor_off, Some(template.column_count))
-                else {
-                    continue;
-                };
-                // Require real text content on the anchor: a coincidental
-                // all-integer/all-NULL record is not a credible run head.
-                let has_text = anchor.values.iter().any(
-                    |v| matches!(v, Value::Text(t) if !t.is_empty() && !t.contains('\u{FFFD}')),
-                );
-                if !has_text {
-                    continue;
-                }
-                // Span-walk the clobbered followers from the anchor's end to the
-                // cell-content boundary. The anchor itself is NOT pushed here.
-                let tail_start = anchor.offset + anchor.byte_len;
-                template.reconstruct_span(page_bytes, tail_start, cca, true, &mut out);
-                break; // one anchored run per page — the contiguous freed tail
-            }
-        }
-        out
+        // Tier-1 cells are the `.0` of the shared two-tier walker, so the full-row
+        // output and the fragment output ([`Database::reconstruct_freeblock_fragments`])
+        // can never diverge. The walk (freeblock-chain pass + unallocated-gap pass)
+        // and its precision discipline live in [`reconstruct_freeblock_inner`].
+        let _ = self;
+        reconstruct_freeblock_inner(page_bytes).0
     }
 
     /// Tier-2 partial salvage: the [`CellFragment`]s abandoned by
@@ -2228,42 +2131,15 @@ impl FreeblockTemplate {
     /// the interior followers (whose clobbered bytes are the original record's own
     /// varints, not necessarily `00 00 …`) are accepted on the fit-in-span check
     /// alone.
-    fn reconstruct_span(
-        &self,
-        page: &[u8],
-        lo: usize,
-        hi: usize,
-        enforce_follower_mark: bool,
-        out: &mut Vec<CarvedCell>,
-    ) {
-        let mut cell_start = lo;
-        let mut built = 0usize;
-        while cell_start < hi && built < MAX_FREEBLOCKS_PER_PAGE {
-            // Gap pass only: every coalesced follower carries the terminal-freeblock
-            // `next == 0` mark — the signature that separates a real freed-cell run
-            // from a byte-shifted remnant in the unbounded gap.
-            if enforce_follower_mark && be_u16(page, cell_start) != 0 {
-                break; // not a coalesced freeblock follower — the contiguous run ends
-            }
-            let Some((cell, record_end)) = self.reconstruct_one(page, cell_start, hi) else {
-                break; // not a coalesced cell boundary — the contiguous run ends here
-            };
-            out.push(cell);
-            built += 1;
-            // The next coalesced cell begins exactly at this record's end.
-            // record_end is strictly greater than cell_start (a record is
-            // non-empty: surviving_serials_off > 0), so the walk always advances.
-            cell_start = record_end;
-        }
-    }
-
-    /// Tiered variant of [`FreeblockTemplate::reconstruct_span`]: identical full-
-    /// cell walk, but at the anchor where `reconstruct_one` would `break` it
-    /// salvages the maximal decodable column prefix as a [`CellFragment`] (when
-    /// the §3.1 distinctiveness gate passes) before stopping. Fragment salvage
-    /// does NOT extend the walk — it stops at exactly the same position
-    /// [`FreeblockTemplate::reconstruct_span`] does, preserving Tier-1's phantom
-    /// discipline.
+    ///
+    /// Tiered walk: it pushes each reconstructed full cell into `cells`, and at the
+    /// anchor where `reconstruct_one` would `break` it salvages the maximal
+    /// decodable column prefix into `frags` as a [`CellFragment`] (when the §3.1
+    /// distinctiveness gate passes) before stopping. Fragment salvage does NOT
+    /// extend the walk — it stops at exactly the position the full walk does,
+    /// preserving Tier-1's phantom discipline. Callers that want only the full
+    /// cells (the Tier-1 [`Database::reconstruct_freeblock_records`]) discard
+    /// `frags`; both tiers therefore come from one walk and can never diverge.
     fn reconstruct_span_tiered(
         &self,
         page: &[u8],
@@ -2317,10 +2193,10 @@ impl FreeblockTemplate {
         let mut pos = tail_start;
         for _ in 0..surviving_count {
             let Ok((s, used)) = read_varint(page, pos) else {
-                break;
+                break; // cov:unreachable: the surviving serials sit near the cell start, inside the freeblock/gap span the inner walker already bounds to the page; this read mirrors reconstruct_one's bounds guard so a truncated tail ends the prefix rather than panicking
             };
             if serial_body_len(s).is_none() {
-                break; // illegal serial type: surviving serial array ends here
+                break; // cov:unreachable: serial_body_len is None only for a negative serial, which read_varint yields only from a crafted 9-byte varint; kept as a defence-in-depth guard so a malformed surviving tail ends the prefix rather than mis-decoding
             }
             let Some(next) = pos.checked_add(used) else {
                 break; // cov:unreachable: usize add of an in-page varint width
@@ -3021,6 +2897,20 @@ mod tests {
     }
 
     // ---- Tier-2 fragment salvage (task #72) --------------------------------
+
+    #[test]
+    fn is_distinctive_classifies_every_storage_class() {
+        // TEXT >= 4 UTF-8 bytes and REAL are distinctive; everything else is not.
+        assert!(is_distinctive(&Value::Text("Anja".into())));
+        assert!(is_distinctive(&Value::Text("\u{00e4}\u{00f6}".into()))); // 4 UTF-8 bytes
+        assert!(is_distinctive(&Value::Real(3.5)));
+        assert!(!is_distinctive(&Value::Text("abc".into()))); // 3 bytes
+        assert!(!is_distinctive(&Value::Text(String::new())));
+        assert!(!is_distinctive(&Value::Text("ab\u{fffd}x".into()))); // replacement char
+        assert!(!is_distinctive(&Value::Integer(20004)));
+        assert!(!is_distinctive(&Value::Null));
+        assert!(!is_distinctive(&Value::Blob(vec![1, 2, 3, 4, 5])));
+    }
 
     /// Build a synthetic 256-byte table-leaf (0x0d) page for the fragment tests.
     ///

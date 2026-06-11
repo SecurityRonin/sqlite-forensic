@@ -232,27 +232,47 @@ fn run_audit(args: &AuditArgs) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{CarveArgs, Cli, Commands};
     use clap::Parser;
 
-    /// `--rowid-only --fragments` is a usage error (fragments have no rowid), so
-    /// clap rejects the combination — fail loud, not silently ignore one flag.
-    #[test]
-    fn rowid_only_and_fragments_conflict() {
-        let res = Cli::try_parse_from([
-            "sqlite4n6",
-            "carve",
-            "db.sqlite",
-            "--rowid-only",
-            "--fragments",
-        ]);
-        assert!(res.is_err(), "--rowid-only --fragments must be rejected");
+    fn carve_args(argv: &[&str]) -> CarveArgs {
+        match Cli::try_parse_from(argv)
+            .expect("argv must parse")
+            .command
+        {
+            Commands::Carve(a) => a,
+            Commands::Audit(_) => panic!("expected a carve command"),
+        }
     }
 
-    /// `--fragments` alone parses cleanly (the opt-in path).
+    /// Fragments are ON by default: the zero-flag `carve` surfaces the Tier-2
+    /// partial-row section alongside full rows (one surviving distinctive cell
+    /// can still anchor evidence). The two tiers stay structurally separate in
+    /// the output, so a fragment is never mistaken for a recovered full row.
     #[test]
-    fn fragments_flag_parses() {
-        let res = Cli::try_parse_from(["sqlite4n6", "carve", "db.sqlite", "--fragments"]);
-        assert!(res.is_ok(), "--fragments alone must parse");
+    fn default_carve_includes_fragments() {
+        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite"]);
+        assert!(args.wants_fragments(), "fragments must be on by default");
+    }
+
+    /// `--no-fragments` opts back into the high-precision full-row-only output.
+    #[test]
+    fn no_fragments_opts_out() {
+        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "--no-fragments"]);
+        assert!(
+            !args.wants_fragments(),
+            "--no-fragments must suppress the Tier-2 fragment section"
+        );
+    }
+
+    /// `--rowid-only` is a full-row rowid listing; fragments have no rowid, so it
+    /// coherently implies no fragment section — a usage combination, not an error.
+    #[test]
+    fn rowid_only_suppresses_fragments() {
+        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "--rowid-only"]);
+        assert!(
+            !args.wants_fragments(),
+            "--rowid-only implies the fragment section is omitted"
+        );
     }
 }

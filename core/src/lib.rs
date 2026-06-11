@@ -532,30 +532,11 @@ impl Database {
         if page_type != 0x0d {
             return Vec::new(); // only table-leaf pages have carvable cell residue
         }
-        let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
-        let cell_ptr_array = hdr_off + 8; // leaf header is 8 bytes
-        let usable = self.header.usable_size() as usize;
-
-        // Compute the byte extent [start, end) of every LIVE cell. These ranges
-        // are excluded from carving so no allocated cell is ever re-surfaced.
-        let mut live: Vec<(usize, usize)> = Vec::with_capacity(cell_count);
-        for i in 0..cell_count {
-            let p = cell_ptr_array + i * 2;
-            let cell_off = be_u16(page_bytes, p) as usize;
-            if cell_off == 0 || cell_off >= page_bytes.len() {
-                continue; // cov:unreachable: a valid leaf points cells within page
-            }
-            if let Some(len) = live_cell_len(page_bytes, cell_off, usable) {
-                live.push((cell_off, cell_off.saturating_add(len)));
-            }
-        }
-        live.sort_unstable_by_key(|&(s, _)| s);
-
-        // Carve each maximal free region (complement of the live extents), within
-        // the cell-content area only (below the cell-pointer array).
-        let content_lo = cell_ptr_array + cell_count * 2;
+        // Carve each maximal free region (complement of the live cell extents),
+        // within the cell-content area only — so no allocated cell is ever
+        // re-surfaced (the 0-false-positive guarantee, enforced structurally).
         let mut out = Vec::new();
-        let regions = free_regions(&live, content_lo, page_bytes.len());
+        let regions = self.free_regions_of_leaf(page_bytes, hdr_off);
         for (lo, hi) in regions {
             let Some(region) = page_bytes.get(lo..hi) else {
                 continue; // cov:unreachable: free_regions yields in-bounds spans
@@ -620,11 +601,6 @@ impl Database {
         if page_type != 0x0d {
             return Vec::new(); // only table-leaf pages have freeblock residue
         }
-        let first_freeblock = be_u16(page_bytes, hdr_off + 1) as usize;
-        if first_freeblock == 0 {
-            return Vec::new(); // no freeblock chain on this page
-        }
-
         // Derive the record-header template from the first live cell on the page.
         // Without it we cannot know the serial types of the leading columns that
         // the freeblock header clobbered, so reconstruction is not attempted.
@@ -632,10 +608,28 @@ impl Database {
             return Vec::new();
         };
 
+        // Walk the page's **freeblock chain** (file-format §1.6): `firstFreeblock`
+        // in the page header, then each freeblock's 2-byte `next` pointer. Each
+        // freeblock spans `[fb, fb + size)`. When SQLite frees adjacent cells it
+        // coalesces them into ONE freeblock whose interior still holds the freed
+        // records back-to-back, each prefixed by a stale 4-byte freeblock header
+        // that clobbers its leading bytes — so the span-walk reconstructs *every*
+        // coalesced cell in the freeblock, not just its head.
+        //
+        // Walking only the freeblock chain (the precise, page-recorded boundaries
+        // of freed space) — rather than every free byte range — is the precision
+        // discipline: the chain entries are exactly where freed cells begin, so no
+        // reconstruction is ever anchored in the page's unallocated gap, where a
+        // run of arbitrary bytes could coincidentally satisfy the legal-serial +
+        // fits-in-span checks and manufacture a phantom row.
+        //
+        // Bounded and panic-free: every `next`/`size` is range-checked against the
+        // page before use, visited offsets break a cyclic `next`, and the walk is
+        // capped at [`MAX_FREEBLOCKS_PER_PAGE`].
+        let first_freeblock = be_u16(page_bytes, hdr_off + 1) as usize;
         let mut out = Vec::new();
         let mut fb = first_freeblock;
         let mut walked = 0usize;
-        // Track visited offsets to break a cyclic chain in addition to the count cap.
         let mut visited = std::collections::BTreeSet::new();
         while fb != 0 && walked < MAX_FREEBLOCKS_PER_PAGE {
             walked += 1;
@@ -645,18 +639,87 @@ impl Database {
             // Each freeblock header is 4 bytes: next(2) + size(2).
             let next = be_u16(page_bytes, fb) as usize;
             let size = be_u16(page_bytes, fb + 2) as usize;
-            // A valid freeblock is at least its own 4-byte header and stays on page.
             let Some(fb_end) = fb.checked_add(size) else {
                 break; // cov:unreachable: usize add of two u16-range values
             };
+            // A valid freeblock is at least its own 4-byte header and stays on page.
             if size >= 4 && fb_end <= page_bytes.len() {
-                if let Some(cell) = template.reconstruct(page_bytes, fb, fb_end) {
-                    out.push(cell);
-                }
+                template.reconstruct_span(page_bytes, fb, fb_end, false, &mut out);
             }
             fb = next;
         }
+
+        // (2) The page's **unallocated gap** `[cellPointerArrayEnd, cellContentArea)`.
+        // When cells are deleted and the page is later partially rewritten, SQLite
+        // may clear `firstFreeblock` (the deleted-then-overwritten 0D case), so the
+        // freed cells linger in the gap UNLINKED from any freeblock chain — the
+        // chain walk above cannot reach them. They sit packed back-to-back just
+        // above `cellContentArea`, headed by the most-recently-freed cell, which
+        // still carries an INTACT cell prefix (its 4 bytes were never reused).
+        //
+        // The precision discipline is to anchor on that intact cell — never to
+        // slide blindly through the gap (most of which is zero-fill that decodes as
+        // phantom all-NULL records). `try_carve_cell_at` accepts an offset only when
+        // it forward-parses as a fully self-consistent record with the table's exact
+        // column count, a positive rowid, and real text content; that is the
+        // structural anchor. From the anchor's end the coalesced followers (whose
+        // prefixes WERE clobbered) are reconstructed by the same template span-walk.
+        // The anchor cell itself is left to the in-page free-region carve (it has a
+        // live rowid and is recovered there); this pass contributes only the
+        // clobbered followers the forward carve cannot reach.
+        let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
+        let cptr_end = hdr_off + 8 + cell_count * 2;
+        let cca = be_u16(page_bytes, hdr_off + 5) as usize;
+        if cca > cptr_end && cca <= page_bytes.len() {
+            for anchor_off in cptr_end..cca {
+                let Some(anchor) =
+                    try_carve_cell_at(page_bytes, anchor_off, Some(template.column_count))
+                else {
+                    continue;
+                };
+                // Require real text content on the anchor: a coincidental
+                // all-integer/all-NULL record is not a credible run head.
+                let has_text = anchor.values.iter().any(
+                    |v| matches!(v, Value::Text(t) if !t.is_empty() && !t.contains('\u{FFFD}')),
+                );
+                if !has_text {
+                    continue;
+                }
+                // Span-walk the clobbered followers from the anchor's end to the
+                // cell-content boundary. The anchor itself is NOT pushed here.
+                let tail_start = anchor.offset + anchor.byte_len;
+                template.reconstruct_span(page_bytes, tail_start, cca, true, &mut out);
+                break; // one anchored run per page — the contiguous freed tail
+            }
+        }
         out
+    }
+
+    /// The maximal FREE (unallocated) byte ranges of a table-leaf page — the
+    /// complement of its live cells within the cell-content area. Shared by
+    /// [`Database::carve_free_regions`] and
+    /// [`Database::reconstruct_freeblock_records`] so both scan exactly the same
+    /// ranges and never touch a live cell. Returns empty for a non-leaf page.
+    fn free_regions_of_leaf(&self, page_bytes: &[u8], hdr_off: usize) -> Vec<(usize, usize)> {
+        if page_bytes.get(hdr_off) != Some(&0x0d) {
+            return Vec::new(); // cov:unreachable: callers gate on page_type == 0x0d
+        }
+        let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
+        let cell_ptr_array = hdr_off + 8; // leaf header is 8 bytes
+        let usable = self.header.usable_size() as usize;
+        let mut live: Vec<(usize, usize)> = Vec::with_capacity(cell_count);
+        for i in 0..cell_count {
+            let cell_off = be_u16(page_bytes, cell_ptr_array + i * 2) as usize;
+            if cell_off == 0 || cell_off >= page_bytes.len() {
+                continue; // cov:unreachable: a valid leaf points cells within page
+            }
+            if let Some(len) = live_cell_len(page_bytes, cell_off, usable) {
+                live.push((cell_off, cell_off.saturating_add(len)));
+            }
+        }
+        live.sort_unstable_by_key(|&(s, _)| s);
+        let content_lo = cell_ptr_array + cell_count * 2;
+        free_regions(&live, content_lo, page_bytes.len())
     }
 
     /// Whether `sqlite_master` (the schema table rooted at page 1) lists at least
@@ -1896,13 +1959,99 @@ impl FreeblockTemplate {
         })
     }
 
-    /// Rebuild the record occupying the freeblock `[fb, fb_end)`: read the
-    /// surviving serial tail, prepend the template's leading serials, decode the
-    /// body, and validate the whole record fits within the freeblock. Returns
-    /// `None` (rejecting the candidate) on any out-of-bounds or implausible parse.
-    fn reconstruct(&self, page: &[u8], fb: usize, fb_end: usize) -> Option<CarvedCell> {
+    /// Reconstruct **every** clobbered cell coalesced into the free span
+    /// `[lo, hi)` — a chained freeblock or a page's unallocated gap — and append
+    /// each to `out`.
+    ///
+    /// When SQLite frees adjacent cells it coalesces them into one freeblock whose
+    /// interior still holds the freed cells back-to-back, **each** prefixed by a
+    /// stale 4-byte freeblock header (`next`/`size`) that clobbers that cell's
+    /// payload-length + rowid varints and leading serial(s). A single-shot
+    /// reconstruction at `lo` recovers only the span's first cell; the trailing
+    /// cells are intact records sitting at the previous record's end. This walks
+    /// the template across the span: reconstruct at `lo`, advance to that record's
+    /// end, repeat to `hi`. Every value is derived from the span bounds and the
+    /// page's own schema template — no per-cell or per-database constant.
+    ///
+    /// Each candidate is validated identically to the single-cell case (legal
+    /// serial types, record fits within `[cell_start, hi)`). The walk is
+    /// **structural, not a sliding scan**: SQLite coalesces freed cells exactly
+    /// back-to-back (each freed record's end abuts the next freed cell's clobbered
+    /// 4-byte prefix), so the next cell begins precisely at the previous record's
+    /// end. The walk therefore reconstructs at `lo`, advances to that record's
+    /// end, and repeats — and STOPS the moment a position does not reconstruct
+    /// cleanly. It never slides forward byte-by-byte hunting for the next cell:
+    /// that fallback would synthesize a record from any run of bytes that happens
+    /// to satisfy the legal-serial + fits-in-span checks, manufacturing phantoms
+    /// in non-cell free space. Anchoring every cell at the prior record's exact
+    /// end is what keeps the broader span-walk at single-cell precision. Bounded:
+    /// the walk strictly advances (a record is non-empty) and is capped at
+    /// [`MAX_FREEBLOCKS_PER_PAGE`] reconstructions per span.
+    ///
+    /// Follower precision (the coalesced-freeblock signature): the span's FIRST
+    /// cell at `lo` is reconstructed unconditionally — `lo` is a real boundary (a
+    /// freeblock-chain entry, or the gap anchor's first follower). Every SUBSEQUENT
+    /// follower must carry the structural mark of a freed-and-coalesced cell: its
+    /// clobbered 4-byte prefix is a stale freeblock header whose 2-byte `next`
+    /// field is `0x0000` (a terminal/orphaned freeblock — what SQLite leaves when
+    /// it coalesces freed cells back-to-back). A position whose leading two bytes
+    /// are non-zero is a byte-shifted remnant, not a coalesced cell, so the run
+    /// ends there. This is the check that separates a true coalesced tail (0D-06's
+    /// `00 00 NN NN`-prefixed followers) from a misaligned fragment (0B-02's
+    /// `24 09 …` remnant), keeping the gap pass phantom-free.
+    ///
+    /// `enforce_follower_mark` is `true` for the unallocated-gap pass, where the
+    /// span is bounded only by `cellContentArea` (not by a page-recorded freeblock
+    /// size) and so a byte-shifted remnant could otherwise be mistaken for a
+    /// follower: there EVERY position must carry the `next == 0` mark. It is `false`
+    /// for the freeblock-chain pass, whose span bounds are the page-recorded
+    /// `[fb, fb + size)` — a strong boundary that already pins the coalesced run, so
+    /// the interior followers (whose clobbered bytes are the original record's own
+    /// varints, not necessarily `00 00 …`) are accepted on the fit-in-span check
+    /// alone.
+    fn reconstruct_span(
+        &self,
+        page: &[u8],
+        lo: usize,
+        hi: usize,
+        enforce_follower_mark: bool,
+        out: &mut Vec<CarvedCell>,
+    ) {
+        let mut cell_start = lo;
+        let mut built = 0usize;
+        while cell_start < hi && built < MAX_FREEBLOCKS_PER_PAGE {
+            // Gap pass only: every coalesced follower carries the terminal-freeblock
+            // `next == 0` mark — the signature that separates a real freed-cell run
+            // from a byte-shifted remnant in the unbounded gap.
+            if enforce_follower_mark && be_u16(page, cell_start) != 0 {
+                break; // not a coalesced freeblock follower — the contiguous run ends
+            }
+            let Some((cell, record_end)) = self.reconstruct_one(page, cell_start, hi) else {
+                break; // not a coalesced cell boundary — the contiguous run ends here
+            };
+            out.push(cell);
+            built += 1;
+            // The next coalesced cell begins exactly at this record's end.
+            // record_end is strictly greater than cell_start (a record is
+            // non-empty: surviving_serials_off > 0), so the walk always advances.
+            cell_start = record_end;
+        }
+    }
+
+    /// Rebuild the single record whose clobbered cell begins at `cell_start`,
+    /// bounded by the enclosing span end `span_end`: read the surviving serial
+    /// tail, prepend the template's leading serials, decode the body, and validate
+    /// the whole record fits within `[cell_start, span_end)`. Returns the carved
+    /// cell and the record's end offset (the next coalesced cell's start), or
+    /// `None` on any out-of-bounds or implausible parse.
+    fn reconstruct_one(
+        &self,
+        page: &[u8],
+        cell_start: usize,
+        span_end: usize,
+    ) -> Option<(CarvedCell, usize)> {
         let surviving_count = self.column_count - self.known_lead_serials.len();
-        let tail_start = fb.checked_add(self.surviving_serials_off)?;
+        let tail_start = cell_start.checked_add(self.surviving_serials_off)?;
 
         // Read the surviving serial tail from the freeblock.
         let mut serials = self.known_lead_serials.clone();
@@ -1913,8 +2062,8 @@ impl FreeblockTemplate {
             serial_body_len(s)?;
             serials.push(s);
             pos = pos.checked_add(used)?;
-            if pos > fb_end {
-                return None; // cov:unreachable: corpus serials are 1-byte; the record-end check below dominates
+            if pos > span_end {
+                return None;
             }
         }
 
@@ -1926,9 +2075,9 @@ impl FreeblockTemplate {
         }
         let body_start = pos;
         let record_end = body_start.checked_add(body_len)?;
-        // The reconstructed record MUST fit within the freeblock bounds — the
-        // core precision check that rejects coincidental/garbage reconstructions.
-        if record_end > fb_end {
+        // The reconstructed record MUST fit within the enclosing span — the core
+        // precision check that rejects coincidental/garbage reconstructions.
+        if record_end > span_end {
             return None;
         }
 
@@ -1942,13 +2091,16 @@ impl FreeblockTemplate {
             return None; // cov:unreachable: one value per serial by construction
         }
 
-        Some(CarvedCell {
-            offset: fb,
-            byte_len: fb_end - fb,
-            rowid: 0, // destroyed by freeblock conversion — surfaced as unknown
-            values,
-            confidence: FREEBLOCK_RECONSTRUCT_CONFIDENCE,
-        })
+        Some((
+            CarvedCell {
+                offset: cell_start,
+                byte_len: record_end - cell_start,
+                rowid: 0, // destroyed by freeblock conversion — surfaced as unknown
+                values,
+                confidence: FREEBLOCK_RECONSTRUCT_CONFIDENCE,
+            },
+            record_end,
+        ))
     }
 }
 
@@ -2469,10 +2621,18 @@ mod tests {
         assert!(has("Luca", "Schumacher"), "head cell must be recovered");
         // The two trailing cells deeper inside the same freeblock — only a
         // span-walk reaches these.
-        assert!(has("Kurt", "Schubert"), "second coalesced cell must be recovered");
-        assert!(has("Georg", "Schulz"), "third coalesced cell must be recovered");
+        assert!(
+            has("Kurt", "Schubert"),
+            "second coalesced cell must be recovered"
+        );
+        assert!(
+            has("Georg", "Schulz"),
+            "third coalesced cell must be recovered"
+        );
         // Every reconstruction carries a destroyed rowid and low confidence.
-        assert!(recovered.iter().all(|c| c.rowid == 0 && c.confidence <= 0.5));
+        assert!(recovered
+            .iter()
+            .all(|c| c.rowid == 0 && c.confidence <= 0.5));
     }
 
     /// Helper: a real opened DB to call the page-slice methods against crafted

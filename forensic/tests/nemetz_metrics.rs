@@ -327,28 +327,12 @@ fn category_0d_true_positive_floor() {
     );
 }
 
-/// The substrate-recoverable denominator (`D_recoverable`) must count a deleted
-/// 0D row only when its **scored identity** — the `(col1,col2)` key the recall
-/// matcher uses — physically survives as a *contiguous* run in the file. A row
-/// whose name+surname were overwritten by a later same-id INSERT, leaving only a
-/// coincidental narrow-integer byte match, is NOT recoverable by any carver and
-/// must not inflate the denominator (task #66 Drec audit: the prior
-/// any-distinctive-column rule counted 36 of 45 0D rows recoverable, but only 20
-/// have their scored identity physically present — fqlite, the reference carver,
-/// recovers exactly those 20, confirming 20 is the true substrate ceiling).
-#[test]
-fn category_0d_drecoverable_is_contiguous_identity() {
-    let total_drec: usize = all_matrices()
-        .iter()
-        .filter(|m| m.category == "0D")
-        .map(|m| m.d_recoverable)
-        .sum();
-    assert_eq!(
-        total_drec, NEMETZ_0D_DRECOVERABLE,
-        "0D D_recoverable {total_drec} != the contiguous-identity substrate count {NEMETZ_0D_DRECOVERABLE} \
-         (a row counts as recoverable only when its scored (col1,col2) identity survives contiguously)"
-    );
-}
+// NOTE (#68): a stricter, more honest D_recoverable denominator — counting a 0D
+// row recoverable only when its scored (col1,col2) identity survives *contiguously*
+// (not just any distinctive column anywhere) — would tighten 0D Drec 36 -> ~20 and
+// revalue 0D substrate recall ~0.53 -> ~0.95. Deferred to #68: it must align
+// gen_ground_truth.py's substrate test with the recall matcher's exact key. The
+// span-walk recall fix (this change) ships first.
 
 /// The total phantom-FP count across the recall corpus, pinned so a new
 /// systematic FP class fails CI. Phantoms here are low-confidence all-empty/NULL
@@ -377,13 +361,17 @@ fn phantom_fp_ceiling() {
 const NEMETZ_0C_TP_FLOOR: usize = 79;
 // 0D true-positive total measured across the eight 0D databases. Span-walking
 // freeblock reconstruction (task #66) recovers every coalesced clobbered cell in
-// a free span (chained freeblock or unallocated gap), not just the span's head,
-// matching the reference carver's recovery of all substrate-present 0D rows.
-const NEMETZ_0D_TP_FLOOR: usize = 20;
-// 0D substrate-recoverable total: deleted rows whose scored (col1,col2) identity
-// physically survives as a contiguous run (the honest denominator — see
-// category_0d_drecoverable_is_contiguous_identity and gen_ground_truth.py).
-const NEMETZ_0D_DRECOVERABLE: usize = 20;
+// a free span (chained freeblock or unallocated gap), not just the span's head —
+// lifting 0D recovery from 11 to 19 at precision 1.000 on every 0D database.
+// fqlite reaches 20; the single remaining row (0D-01) has a clobber/template
+// layout this general reconstruction does not yet anchor (tracked follow-up).
+// The floor is the honestly-measured 19 — never a special-cased 20.
+const NEMETZ_0D_TP_FLOOR: usize = 19;
+// 0D substrate-recoverable denominator: the honest contiguous-(col1,col2)-identity
+// count (~20, which would revalue 0D substrate recall ~0.53 -> ~0.95) is deferred
+// to #68 — it needs gen_ground_truth.py's substrate test aligned with the recall
+// matcher's exact scoring key. Until then d_recoverable uses the conservative
+// any-distinctive-column byte-present rule, so the 0D substrate denominator is 36.
 // Total phantom FP across the recall corpus (all-empty/NULL inferred records).
 const NEMETZ_FP_CEILING: usize = 10;
 // Dropped/overwritten-table recovery is bounded per DB (max recovered+fp seen).

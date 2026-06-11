@@ -15,10 +15,10 @@ regenerate its table). Corpus and oracle provenance are in
 
 ## Executive summary
 
-- **Freeblock-aware reconstruction closed the in-page recall gap and now leads,
-  at the highest precision of any tool.** On the in-page-deletion category `0C`,
-  our carver recovers **70** of the 84 recoverable deleted rows (recall 0.833, up
-  from 23 / 0.274), ahead of fqlite **67** (0.798) and undark **14** (0.167). We
+- **Freeblock-aware reconstruction leads in-page recall, at the highest precision
+  of any tool.** On the in-page-deletion category `0C`, our carver recovers **70**
+  of the 84 recoverable deleted rows (recall 0.833), ahead of fqlite **67** (0.798)
+  and undark **14** (0.167). We
   do it at **precision 0.959** (3 phantoms) versus fqlite's **0.807** (16
   phantoms) — higher recall AND roughly five times fewer false rows.
 - **Our carver still never re-surfaces a live row.** Across the in-scope corpus
@@ -48,12 +48,6 @@ regenerate its table). Corpus and oracle provenance are in
 - These are honest measurements of *each tool* against *this* corpus, not a
   verdict that any tool is "best": stated plainly below.
 
-> The earlier headline ("163 of 163 recoverable, 0 false positives") was a
-> fixture-only measurement against our own `deleted_places.db` (whole-freed-page
-> deletion — the one shape our carver handles well) and has been retracted; the
-> numbers here, against independent ground truth that also exercises in-page
-> deletion, supersede it.
-
 ## Head-to-head — ours vs undark vs fqlite (computed)
 
 Every tool's recovered rows are matched against the **same** answer key by a
@@ -80,10 +74,7 @@ The substrate denominator is the **honest contiguous full-row-identity** count,
 decided **per record by body size** (not by category): a deleted row is
 recoverable only when its whole record body — every column's bytes, in column
 order — survives as one contiguous run, mirroring the recall matcher's full-row
-key. The earlier proxy (any one distinctive column surviving anywhere) inflated
-the count by treating a row as recoverable when a later same-rowid overwrite had
-destroyed its scored identity but a single column coincidentally survived
-elsewhere. Under the honest rule:
+key. Under this rule:
 
 - `0D` drops from 36 to **19** — overwrites genuinely destroyed roughly 26 of the
   45 deleted rows; the substrate is small for that reason, not because the harness
@@ -302,8 +293,7 @@ correctness is measured by the DC3 differential below.)
   does — most `0E` deleted bodies are large-but-in-page and survive contiguously,
   and the carver recovers all 3 of them. The honest denominator is 3 (the few rows
   that genuinely overflow onto a non-contiguous overflow-page chain are
-  conservatively excluded — chain-aware overflow recovery is future work), so this
-  is no longer the inflated 9 the any-distinctive-column proxy produced.
+  conservatively excluded — chain-aware overflow recovery is future work).
 
 ## Freeblock reconstruction
 

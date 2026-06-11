@@ -689,11 +689,7 @@ pub fn carve_with_fragments(db: &Database) -> CarveTiers {
     // Layer 3: live-row suppression. A fragment whose surviving set matches the
     // corresponding columns of a live row is a stale partial copy of a live row.
     let live = db.live_rows();
-    fragments.retain(|frag| {
-        !live
-            .values()
-            .any(|lv| fragment_matches_columns(frag, lv))
-    });
+    fragments.retain(|frag| !live.values().any(|lv| fragment_matches_columns(frag, lv)));
 
     // Layer 2: full-row value suppression. A fragment already covered by a
     // recovered full row in this carve is a duplicate — drop it.

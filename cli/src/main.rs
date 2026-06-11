@@ -205,7 +205,8 @@ fn run_carve(args: &CarveArgs) -> Result<(), String> {
             // Tier-1 + Tier-2 in one pass; both sections rendered together.
             let tiers = carve_with_fragments(&db);
             let full = filter_by_confidence(tiers.full, args.min_confidence.into());
-            for line in render_carve_tiered(&full, &tiers.fragments, args.format.into(), args.rowid_only)
+            for line in
+                render_carve_tiered(&full, &tiers.fragments, args.format.into(), args.rowid_only)
             {
                 println!("{line}");
             }
@@ -238,7 +239,13 @@ mod tests {
     /// clap rejects the combination — fail loud, not silently ignore one flag.
     #[test]
     fn rowid_only_and_fragments_conflict() {
-        let res = Cli::try_parse_from(["sqlite4n6", "carve", "db.sqlite", "--rowid-only", "--fragments"]);
+        let res = Cli::try_parse_from([
+            "sqlite4n6",
+            "carve",
+            "db.sqlite",
+            "--rowid-only",
+            "--fragments",
+        ]);
         assert!(res.is_err(), "--rowid-only --fragments must be rejected");
     }
 

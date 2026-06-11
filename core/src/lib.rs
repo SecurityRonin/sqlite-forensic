@@ -2058,7 +2058,8 @@ fn reconstruct_freeblock_inner(page_bytes: &[u8]) -> (Vec<CarvedCell>, Vec<CellF
                 continue;
             }
             let tail_start = anchor.offset + anchor.byte_len;
-            template.reconstruct_span_tiered(page_bytes, tail_start, cca, true, &mut cells, &mut frags);
+            template
+                .reconstruct_span_tiered(page_bytes, tail_start, cca, true, &mut cells, &mut frags);
             break; // one anchored run per page — the contiguous freed tail
         }
     }
@@ -2300,7 +2301,12 @@ impl FreeblockTemplate {
     /// overruns the span ends the prefix. Returns a [`CellFragment`] **only** when
     /// the salvaged prefix contains at least one distinctive cell (TEXT ≥ 4 bytes
     /// of valid UTF-8, or REAL) — the §3.1 emission gate — otherwise `None`.
-    fn salvage_fragment(&self, page: &[u8], cell_start: usize, span_end: usize) -> Option<CellFragment> {
+    fn salvage_fragment(
+        &self,
+        page: &[u8],
+        cell_start: usize,
+        span_end: usize,
+    ) -> Option<CellFragment> {
         let surviving_count = self.column_count - self.known_lead_serials.len();
         let tail_start = cell_start.checked_add(self.surviving_serials_off)?;
 
@@ -3117,7 +3123,10 @@ mod tests {
         freed[11..15].copy_from_slice(b"Erow");
         let page = synth_frag_page(96, 64, 15, &freed);
         let cells = db.reconstruct_freeblock_records(&page);
-        assert!(cells.iter().any(|c| c.offset == 64), "full record recovered");
+        assert!(
+            cells.iter().any(|c| c.offset == 64),
+            "full record recovered"
+        );
         assert!(
             db.reconstruct_freeblock_fragments(&page).is_empty(),
             "no fragment when the full record is recoverable"

@@ -570,6 +570,24 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
                 overflow: Some(OverflowProvenance { first_page, chain }),
             });
         }
+        // (2d) Freeblock-clobbered spilled cells (task #73, Codex ruling #5;
+        // UNPROVEN-BY-CORPUS — synthetic validation only). A spilled cell whose
+        // prefix was also freeblock-clobbered: P re-derived from the surviving
+        // serial array, chain resolved through freelist leaves, rowid destroyed.
+        for (cell, chain) in db.carve_overflow_template_records(page_bytes) {
+            let first_page = chain.first().copied().unwrap_or(0);
+            out.push(CarvedRecord {
+                page,
+                offset: cell.offset,
+                rowid: cell.rowid,
+                values: cell.values,
+                confidence: cell.confidence,
+                allocated: false,
+                source: RecoverySource::FreeblockReconstructed,
+                wal: None,
+                overflow: Some(OverflowProvenance { first_page, chain }),
+            });
+        }
     }
 
     // (3) WAL-frame carving (additive — runs ONLY when a `-wal` overlay is in

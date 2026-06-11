@@ -84,7 +84,7 @@ This is one workspace (`sqlite-forensic`): two library crates following the flee
 
 | Crate | Role | Entry points |
 |---|---|---|
-| [`sqlite-core`](core) | The raw, read-only, panic-free file-format reader: header parse, b-tree walk, freelist + overflow chains, and a read-only WAL overlay. No findings. | `Database::open`, `Database::open_with_wal`, `freelist_pages`, `read_table`, `carve_free_regions`, `live_rowids` |
+| [`sqlite-core`](core) | The raw, read-only, panic-free file-format reader: header parse, b-tree walk, freelist + overflow chains, and a read-only WAL overlay that maps onto the canonical `forensicnomicon::history` temporal cohort (each commit a salt-qualified `[H]` state). No findings. | `Database::open`, `Database::open_with_wal`, `freelist_pages`, `read_table`, `carve_free_regions`, `live_rowids`, `wal_timeline`, `WalTimeline::to_temporal_cohort` |
 | [`sqlite-forensic`](forensic) | The anomaly auditor + deleted-record carver: grades observations into `forensicnomicon::report::Finding`s and recovers deleted rows. Depends on `sqlite-core`. | `audit`, `audit_findings`, `carve_all_deleted_records`, `carve_deleted_records` |
 
 `sqlite-forensic` accepts an in-memory `Database` (built from `&[u8]`) — it is medium-agnostic and has no dependency on any image format or container layer. Findings flow into the shared `forensicnomicon::report` model, so a SQLite database's anomalies aggregate uniformly with the partition / container / filesystem layers in a triage report.

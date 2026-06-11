@@ -53,6 +53,7 @@ pub struct Element {
 pub struct DeletedRow {
     cells: Vec<String>,
     substrate_recoverable: bool,
+    fragment_recoverable: bool,
 }
 
 impl DeletedRow {
@@ -63,6 +64,13 @@ impl DeletedRow {
     #[must_use]
     pub fn substrate_recoverable(&self) -> bool {
         self.substrate_recoverable
+    }
+    /// Whether the row is Tier-2 fragment-recoverable: its full identity is
+    /// destroyed (`!substrate_recoverable`) but at least one distinctive cell
+    /// (TEXT >= 4 UTF-8 bytes, or REAL) survives contiguously in the .db bytes.
+    #[must_use]
+    pub fn fragment_recoverable(&self) -> bool {
+        self.fragment_recoverable
     }
 }
 
@@ -143,6 +151,8 @@ fn parse_manifest(raw: &str) -> Manifest {
                         .map(|c| c.as_str().to_string())
                         .collect(),
                     substrate_recoverable: dr.get("substrate_recoverable").as_bool(),
+                    // RED stub: parsed from the manifest in the GREEN commit.
+                    fragment_recoverable: false,
                 });
             }
             let alive = elj

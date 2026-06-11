@@ -458,6 +458,16 @@ const NEMETZ_0D_DRECOVERABLE: usize = 19;
 const NEMETZ_0E_DRECOVERABLE: usize = 3;
 // Total phantom FP across the recall corpus (all-empty/NULL inferred records).
 const NEMETZ_FP_CEILING: usize = 10;
+// 0D fragment-recoverable denominator (Tier-2): deleted rows whose full identity
+// is destroyed (NOT substrate-recoverable) yet a distinctive cell — TEXT >= 4
+// UTF-8 bytes, or REAL — still survives contiguously somewhere in the .db bytes.
+// INTEGER-only "survivors" are excluded (coincidence-prone), so this is the
+// honest ~5, not the integer-pattern-inflated legacy any-column upper bound.
+const NEMETZ_0D_FRAGMENT_RECOVERABLE: usize = 5;
+// 0E fragment-recoverable denominator under the same distinctive-cell rule.
+const NEMETZ_0E_FRAGMENT_RECOVERABLE: usize = 4;
+// 0C is fully reconstructable, so no row is fragment-recoverable.
+const NEMETZ_0C_FRAGMENT_RECOVERABLE: usize = 0;
 // Dropped/overwritten-table recovery is bounded per DB (max recovered+fp seen).
 const DROPPED_TABLE_CARVE_CEILING: usize = 24;
 // Category-11 tampered DBs (manipulated page/cell pointers): the carver
@@ -501,4 +511,43 @@ fn antiforensic_category_11_is_panic_free() {
         }
     }
     assert!(ran > 0, "no category-11 DB opened");
+}
+
+// --- Tier-2 fragment metrics (task #72) -------------------------------------
+
+/// The fragment-recoverable denominator per category, parsed from the manifest's
+/// `fragment_recoverable` flag, equals the pinned honest totals — and the two
+/// buckets are DISJOINT (`fragment_recoverable ⇒ !substrate_recoverable`).
+#[test]
+fn fragment_substrate_denominators_match_manifest() {
+    let mut by_cat: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (nid, category) in manifest().databases() {
+        for el in manifest().db(&nid).elements() {
+            for row in el.deleted() {
+                if row.fragment_recoverable() {
+                    *by_cat.entry(category.clone()).or_default() += 1;
+                    // Disjoint buckets: a fragment row is never substrate-recoverable.
+                    assert!(
+                        !row.substrate_recoverable(),
+                        "{nid}: row is both substrate- and fragment-recoverable"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        by_cat.get("0D").copied().unwrap_or(0),
+        NEMETZ_0D_FRAGMENT_RECOVERABLE,
+        "0D fragment-recoverable total"
+    );
+    assert_eq!(
+        by_cat.get("0E").copied().unwrap_or(0),
+        NEMETZ_0E_FRAGMENT_RECOVERABLE,
+        "0E fragment-recoverable total"
+    );
+    assert_eq!(
+        by_cat.get("0C").copied().unwrap_or(0),
+        NEMETZ_0C_FRAGMENT_RECOVERABLE,
+        "0C fragment-recoverable total"
+    );
 }

@@ -9,7 +9,8 @@
 
 use sqlite_core::{Database, Value, WalTimeline};
 use sqlite_forensic::{
-    carve_all_deleted_records, carve_at_commit, Anomaly, CarvedRecord, RecoverySource,
+    carve_all_deleted_records, carve_at_commit, Anomaly, CarvedFragment, CarvedRecord,
+    RecoverySource,
 };
 
 /// Output rendering format, shared by `carve` and `audit`.
@@ -328,6 +329,174 @@ fn render_carve_jsonl(records: &[CarvedRecord]) -> Vec<String> {
             )
         })
         .collect()
+}
+
+// ---- Tier-2 fragment rendering (opt-in `--fragments`) ----------------------
+
+/// The fixed leading cells of a fragment row: page, offset, confidence, source.
+/// Fragments carry NO rowid (it was clobbered), so there is no rowid cell.
+fn fragment_lead_cells(frag: &CarvedFragment) -> [String; 4] {
+    [
+        frag.page.to_string(),
+        frag.offset.to_string(),
+        format!("{:.2}", frag.confidence),
+        recovery_source_token(frag.source).to_string(),
+    ]
+}
+
+/// Render a fragment's surviving cells as a human-readable summary, e.g.
+/// `col1='Anja' col2='Frank' (+1 column destroyed)`.
+fn fragment_surviving_cell(frag: &CarvedFragment) -> String {
+    let mut parts: Vec<String> = frag
+        .surviving
+        .iter()
+        .map(|(idx, v)| format!("col{idx}='{}'", value_to_cell(v)))
+        .collect();
+    if frag.missing > 0 {
+        let noun = if frag.missing == 1 { "column" } else { "columns" };
+        parts.push(format!("(+{} {noun} destroyed)", frag.missing));
+    }
+    parts.join(" ")
+}
+
+/// Render the Tier-2 fragment section in the chosen format.
+///
+/// A fragment is **not** a recovered row: it has no rowid and an incomplete
+/// column set, and the full-row 0-false-positive guarantee does NOT extend to it.
+/// The section is therefore clearly labelled (table) / discriminated by a `kind`
+/// column (CSV) / a `"kind":"fragment"` key (JSONL), so a fragment can never be
+/// mistaken for a full row. Empty input yields no lines.
+#[must_use]
+pub fn render_fragments(frags: &[CarvedFragment], format: OutputFormat) -> Vec<String> {
+    // RED stub: real rendering wired in the GREEN commit.
+    let _ = (frags, format);
+    return Vec::new();
+    #[allow(unreachable_code)]
+    if frags.is_empty() {
+        return Vec::new();
+    }
+    #[allow(unreachable_code)]
+    match format {
+        OutputFormat::Table => render_fragments_table(frags),
+        OutputFormat::Csv => render_fragments_csv(frags),
+        OutputFormat::Jsonl => render_fragments_jsonl(frags),
+    }
+}
+
+fn render_fragments_table(frags: &[CarvedFragment]) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        "# fragments — partial rows, lower confidence (opt-in; not part of the \
+         full-row zero-false-positive output)"
+            .to_string(),
+        format!(
+            "{:>6}  {:>8}  {:>5}  {:<24}  surviving",
+            "page", "offset", "conf", "source"
+        ),
+    ];
+    for frag in frags {
+        let lead = fragment_lead_cells(frag);
+        lines.push(format!(
+            "{:>6}  {:>8}  {:>5}  {:<24}  {}",
+            lead[0],
+            lead[1],
+            lead[2],
+            lead[3],
+            fragment_surviving_cell(frag)
+        ));
+    }
+    lines
+}
+
+fn render_fragments_csv(frags: &[CarvedFragment]) -> Vec<String> {
+    let mut lines = vec!["kind,page,offset,confidence,source,missing,surviving".to_string()];
+    for frag in frags {
+        let lead = fragment_lead_cells(frag);
+        lines.push(format!(
+            "fragment,{},{},{},{},{},{}",
+            csv_escape(&lead[0]),
+            csv_escape(&lead[1]),
+            csv_escape(&lead[2]),
+            csv_escape(&lead[3]),
+            frag.missing,
+            csv_escape(&fragment_surviving_cell(frag))
+        ));
+    }
+    lines
+}
+
+fn render_fragments_jsonl(frags: &[CarvedFragment]) -> Vec<String> {
+    frags
+        .iter()
+        .map(|frag| {
+            let surviving: Vec<String> = frag
+                .surviving
+                .iter()
+                .map(|(idx, v)| {
+                    format!(
+                        "{{\"column\":{idx},\"value\":\"{}\"}}",
+                        json_escape(&value_to_cell(v))
+                    )
+                })
+                .collect();
+            format!(
+                "{{\"kind\":\"fragment\",\"page\":{},\"offset\":{},\"confidence\":{:.4},\"source\":\"{}\",\"missing\":{},\"surviving\":[{}]}}",
+                frag.page,
+                frag.offset,
+                frag.confidence,
+                recovery_source_token(frag.source),
+                frag.missing,
+                surviving.join(",")
+            )
+        })
+        .collect()
+}
+
+/// Render full rows + the Tier-2 fragment section for the opt-in `--fragments`
+/// path. The full-row output is byte-identical to [`render_carve`] EXCEPT in CSV,
+/// where both sections gain a leading `kind` column (`row` / `fragment`) — the
+/// flag is the explicit opt-in to that schema change, so no zero-config CSV
+/// consumer breaks. `rowid_only` collapses to bare rowids of the FULL rows only
+/// (fragments have no rowid); callers gate `--rowid-only --fragments` as a
+/// conflict, so this branch renders full rowids and no fragment section.
+#[must_use]
+pub fn render_carve_tiered(
+    full: &[CarvedRecord],
+    fragments: &[CarvedFragment],
+    format: OutputFormat,
+    rowid_only: bool,
+) -> Vec<String> {
+    if rowid_only {
+        return full.iter().map(|r| rowid_cell(r.rowid)).collect();
+    }
+    match format {
+        OutputFormat::Csv => {
+            // Both sections carry a leading `kind` column under `--fragments`.
+            let mut lines =
+                vec!["kind,page,offset,rowid,recovery_source,confidence,values".to_string()];
+            for rec in full {
+                let lead = carve_lead_cells(rec);
+                let values: Vec<String> = rec.values.iter().map(value_to_cell).collect();
+                lines.push(format!(
+                    "row,{},{},{},{},{},{}",
+                    csv_escape(&lead[0]),
+                    csv_escape(&lead[1]),
+                    csv_escape(&lead[2]),
+                    csv_escape(&lead[3]),
+                    csv_escape(&lead[4]),
+                    csv_escape(&values.join(" | "))
+                ));
+            }
+            lines.extend(render_fragments(fragments, format));
+            lines
+        }
+        // Table / JSONL: full-row output unchanged, fragment section appended.
+        _ => {
+            let mut lines = render_carve(full, format, false);
+            lines.extend(render_fragments(fragments, format));
+            lines
+        }
+    }
 }
 
 // ---- carve rendering with the snapshot/LSN column --------------------------
@@ -872,5 +1041,94 @@ mod tests {
         assert!(lines[0].contains("severity"));
         assert!(lines[0].contains("code"));
         assert_eq!(lines.len(), 2);
+    }
+
+    // ---- Tier-2 fragment rendering (task #72) ------------------------------
+
+    fn frag() -> CarvedFragment {
+        CarvedFragment {
+            page: 2,
+            offset: 3965,
+            surviving: vec![
+                (0, Value::Integer(20004)),
+                (1, Value::Text("Anja".into())),
+                (2, Value::Text("Frank".into())),
+            ],
+            missing: 2,
+            confidence: 0.2,
+            source: RecoverySource::FreeblockReconstructed,
+            wal: None,
+        }
+    }
+
+    #[test]
+    fn fragments_table_has_labelled_section_and_row() {
+        let lines = render_fragments(&[frag()], OutputFormat::Table);
+        assert!(
+            lines.iter().any(|l| l.contains("# fragments")),
+            "labelled fragment section header"
+        );
+        assert!(lines.iter().any(|l| l.contains("surviving")));
+        assert!(
+            lines.iter().any(|l| l.contains("col1='Anja'")),
+            "surviving cells rendered"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("destroyed")),
+            "missing-column count shown"
+        );
+    }
+
+    #[test]
+    fn fragments_csv_carries_kind_column() {
+        let lines = render_fragments(&[frag()], OutputFormat::Csv);
+        assert_eq!(lines[0], "kind,page,offset,confidence,source,missing,surviving");
+        assert!(lines[1].starts_with("fragment,2,3965,0.20,"));
+    }
+
+    #[test]
+    fn fragments_jsonl_marks_kind_fragment() {
+        let lines = render_fragments(&[frag()], OutputFormat::Jsonl);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"kind\":\"fragment\""));
+        assert!(lines[0].contains("\"column\":1,\"value\":\"Anja\""));
+        assert!(lines[0].contains("\"missing\":2"));
+    }
+
+    #[test]
+    fn fragments_empty_input_renders_nothing() {
+        assert!(render_fragments(&[], OutputFormat::Table).is_empty());
+        assert!(render_fragments(&[], OutputFormat::Csv).is_empty());
+        assert!(render_fragments(&[], OutputFormat::Jsonl).is_empty());
+    }
+
+    #[test]
+    fn tiered_default_full_rows_unchanged_jsonl() {
+        // Without fragments, the JSONL full-row output is byte-identical to
+        // render_carve (no `kind` key added to full rows — published contract).
+        let records = vec![rec(7, 0.9, RecoverySource::FreelistPage, vec![Value::Integer(7)])];
+        let plain = render_carve(&records, OutputFormat::Jsonl, false);
+        let tiered = render_carve_tiered(&records, &[], OutputFormat::Jsonl, false);
+        assert_eq!(plain, tiered, "no fragments → full-row JSONL unchanged");
+        assert!(!tiered[0].contains("\"kind\""));
+    }
+
+    #[test]
+    fn tiered_csv_adds_kind_column_to_both_sections() {
+        let records = vec![rec(7, 0.9, RecoverySource::FreelistPage, vec![Value::Integer(7)])];
+        let lines = render_carve_tiered(&records, &[frag()], OutputFormat::Csv, false);
+        assert_eq!(
+            lines[0],
+            "kind,page,offset,rowid,recovery_source,confidence,values"
+        );
+        assert!(lines.iter().any(|l| l.starts_with("row,")));
+        assert!(lines.iter().any(|l| l.starts_with("fragment,")));
+    }
+
+    #[test]
+    fn tiered_rowid_only_emits_full_rowids_no_fragments() {
+        let records = vec![rec(7, 0.9, RecoverySource::FreelistPage, vec![])];
+        let lines = render_carve_tiered(&records, &[frag()], OutputFormat::Table, true);
+        assert_eq!(lines, vec!["7".to_string()]);
     }
 }

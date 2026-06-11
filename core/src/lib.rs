@@ -62,6 +62,15 @@ pub enum Error {
     MalformedOverflow,
 }
 
+/// A freed overflow-page chain could not be followed to a complete, trustworthy
+/// payload (task #73): a chain page that is not a freelist leaf (live / trunk /
+/// unreachable), a cycle, a premature terminator with bytes still owed, an
+/// out-of-range page, or a declared payload exceeding the freelist's capacity.
+/// Carries no detail by design — any break is a uniform "this chain is not
+/// recoverable as a Tier-1 row", and the candidate degrades to a Tier-2 fragment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainBreak;
+
 /// A single decoded column value from a table row. Mirrors `SQLite`'s storage
 /// classes.
 #[derive(Debug, Clone, PartialEq)]
@@ -410,7 +419,32 @@ impl Database {
     /// out-of-range page, or a leaf-pointer count larger than a trunk page can
     /// hold aborts with [`Error::MalformedFreelist`] rather than looping.
     pub fn freelist_pages(&self) -> Result<Vec<u32>, Error> {
-        let mut free = Vec::new();
+        let (leaves, trunks) = self.freelist_pages_split()?;
+        // Preserve the historical order: each trunk's leaves, then the trunk.
+        // The split sets are ordered, which is sufficient for every caller (they
+        // treat the result as a set), and keeps a single source of truth.
+        let mut free: Vec<u32> = leaves.into_iter().collect();
+        free.extend(trunks);
+        Ok(free)
+    }
+
+    /// Walk the freelist and return its **leaf** and **trunk** page numbers
+    /// separately (task #73). The distinction is load-bearing for chain-aware
+    /// overflow recovery: a freed page that became a freelist *leaf* keeps its
+    /// former content byte-for-byte, while a *trunk* page has its head
+    /// (next-trunk pointer + leaf count + leaf-number array) written over the
+    /// former content (file-format §"The Freelist"). Only leaves are
+    /// content-preserving, so [`Database::read_freed_overflow_chain`] accepts a
+    /// chain page only when it is a leaf.
+    ///
+    /// Bounded identically to [`Database::freelist_pages`]: a cyclic trunk chain,
+    /// an out-of-range page, or an over-large leaf count aborts with
+    /// [`Error::MalformedFreelist`] rather than looping.
+    pub fn freelist_pages_split(
+        &self,
+    ) -> Result<(std::collections::BTreeSet<u32>, std::collections::BTreeSet<u32>), Error> {
+        let mut leaves = std::collections::BTreeSet::new();
+        let mut trunks = std::collections::BTreeSet::new();
         let mut trunk = be_u32(&self.bytes, SQLITE_FREELIST_TRUNK_OFFSET);
         let total_pages = self.file_page_count();
         // Each trunk page holds at most (page_size/4 - 2) leaf pointers.
@@ -437,13 +471,72 @@ impl Database {
                 if leaf == 0 || leaf > total_pages {
                     return Err(Error::MalformedFreelist);
                 }
-                free.push(leaf);
+                leaves.insert(leaf);
             }
-            // The trunk page itself is also a free page.
-            free.push(trunk);
+            trunks.insert(trunk);
             trunk = next;
         }
-        Ok(free)
+        Ok((leaves, trunks))
+    }
+
+    /// Follow a **freed** overflow-page chain starting at `first`, reading raw
+    /// main-file pages only (carving wants on-disk residue, not the WAL view),
+    /// and assemble up to `remaining` content bytes (task #73). The carve-side
+    /// dual of [`Database::read_overflow_chain`], with one extra discipline that
+    /// makes it the 0-FP-relevant guard: **every chain page must be a freelist
+    /// leaf** (`freed_leaves`). A page that is not a leaf is live, a trunk, or
+    /// unreachable — following its pointer would risk reading reused or clobbered
+    /// content, so it is a [`ChainBreak`] (Codex ruling #2: the leaf requirement,
+    /// not the UTF-8 gate, is what rejects a destroyed chain).
+    ///
+    /// Returns the assembled content and the ordered list of chain pages on
+    /// success. Robustness (Paranoid Gatekeeper, design §4.2): the anti-bomb cap
+    /// rejects upfront any `remaining` above what the freelist leaves can deliver
+    /// (`(usable - 4) × freed_leaves.len()`), so an attacker-declared huge
+    /// payload dies before any allocation; cycles are caught by a visited set;
+    /// a premature `next == 0` with bytes still wanted, an out-of-range page, or
+    /// page 0 mid-chain all break. Never panics — every read is bounds-checked.
+    pub fn read_freed_overflow_chain(
+        &self,
+        first: u32,
+        remaining: usize,
+        usable: usize,
+        freed_leaves: &std::collections::BTreeSet<u32>,
+    ) -> Result<(Vec<u8>, Vec<u32>), ChainBreak> {
+        let per_page = usable.checked_sub(4).filter(|&p| p > 0).ok_or(ChainBreak)?;
+        // Anti-bomb cap: the chain can deliver at most this many bytes. Reject an
+        // absurd declared payload before allocating (design §4.2).
+        let max_deliverable = per_page.checked_mul(freed_leaves.len()).ok_or(ChainBreak)?;
+        if remaining > max_deliverable {
+            return Err(ChainBreak);
+        }
+        let total_pages = self.file_page_count();
+        let mut content = Vec::with_capacity(remaining);
+        let mut chain = Vec::new();
+        let mut visited = std::collections::BTreeSet::new();
+        let mut page = first;
+        let mut left = remaining;
+        while left > 0 {
+            if page == 0 || page > total_pages {
+                return Err(ChainBreak);
+            }
+            // The load-bearing guard: a chain page must be a freelist LEAF.
+            if !freed_leaves.contains(&page) {
+                return Err(ChainBreak);
+            }
+            if !visited.insert(page) {
+                return Err(ChainBreak); // cycle
+            }
+            let slice = self.raw_page(page).ok_or(ChainBreak)?;
+            let next = be_u32(slice, 0);
+            let take = left.min(per_page);
+            let chunk = slice.get(4..4 + take).ok_or(ChainBreak)?;
+            content.extend_from_slice(chunk);
+            chain.push(page);
+            left -= take;
+            page = next;
+        }
+        Ok((content, chain))
     }
 
     /// Raw bytes of the 1-based `page` from the **main file only**, ignoring any

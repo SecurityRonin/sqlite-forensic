@@ -151,8 +151,7 @@ fn parse_manifest(raw: &str) -> Manifest {
                         .map(|c| c.as_str().to_string())
                         .collect(),
                     substrate_recoverable: dr.get("substrate_recoverable").as_bool(),
-                    // RED stub: parsed from the manifest in the GREEN commit.
-                    fragment_recoverable: false,
+                    fragment_recoverable: dr.get("fragment_recoverable").as_bool(),
                 });
             }
             let alive = elj

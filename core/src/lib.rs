@@ -1799,6 +1799,9 @@ impl WalTimeline {
         use forensicnomicon::history::identity::IdentityDiscipline;
         use forensicnomicon::history::profiles;
 
+        // One canonical profile drives every state's clock + safety — read from
+        // forensicnomicon, never re-asserted here, so the fleet cannot drift.
+        let profile = profiles::SourceTemporalProfile::sqlite_wal();
         let mut commit_seq_in_segment: std::collections::HashMap<WalSegmentId, u32> =
             std::collections::HashMap::new();
 
@@ -1830,8 +1833,8 @@ impl WalTimeline {
                         commit_seq,
                     }),
                     wall_time: None,
-                    clock: profiles::sqlite_wal_clock(),
-                    safety: profiles::SQLITE_WAL_SAFETY,
+                    clock: profile.clock.clone(),
+                    safety: profile.safety.clone(),
                     handle: id,
                 }
             })

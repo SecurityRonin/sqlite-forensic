@@ -855,6 +855,66 @@ impl Database {
         Some((cell, chain))
     }
 
+    /// Reconstruct **freeblock-clobbered spilled** cells (task #73, design §2.2 /
+    /// Codex ruling #5). When a freed cell whose payload spilled is also
+    /// freeblock-clobbered, its declared `P` is destroyed but **re-derivable** from
+    /// the surviving structure: `P = header_len + Σ serial_body_len` over the full
+    /// (template + surviving) serial array. When that `P` exceeds `usable - 35` the
+    /// record is spilled by construction, so we read the 4-byte first-overflow
+    /// pointer that follows the local payload and resolve the chain through
+    /// freelist leaves, exactly as the intact-prefix path does — but with
+    /// `rowid = 0` (the prefix's rowid varint was clobbered, never invented).
+    ///
+    /// UNPROVEN-BY-CORPUS (Codex ruling #5): no real Nemetz `0E` cell is *both*
+    /// freeblock-clobbered *and* spilled — every measured spilled cell kept an
+    /// intact prefix in the unallocated gap. This path is therefore validated
+    /// against a **synthetic** fixture only; it is the general solution the
+    /// no-special-case rule requires (it applies the same spill formula to the
+    /// clobbered class), but its real-data behavior is not yet observed.
+    ///
+    /// Returns `(cell, chain)` per fully-resolved record. Bounded and panic-free.
+    #[must_use]
+    pub fn carve_overflow_template_records(&self, page_bytes: &[u8]) -> Vec<(CarvedCell, Vec<u32>)> {
+        let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
+            SQLITE_HEADER_SIZE
+        } else {
+            0
+        };
+        if page_bytes.get(hdr_off) != Some(&0x0d) {
+            return Vec::new();
+        }
+        let Some(template) = freeblock_template(page_bytes, hdr_off) else {
+            return Vec::new();
+        };
+        let Ok((freed_leaves, _trunks)) = self.freelist_pages_split() else {
+            return Vec::new();
+        };
+        let usable = self.header.usable_size() as usize;
+
+        let mut out = Vec::new();
+        // Walk the freeblock chain; at each freeblock head, try a clobbered-spill
+        // reconstruction (the chain pass reaches the clobbered prefix the
+        // intact-prefix recognizer cannot read).
+        let first_freeblock = be_u16(page_bytes, hdr_off + 1) as usize;
+        let mut fb = first_freeblock;
+        let mut walked = 0usize;
+        let mut visited = std::collections::BTreeSet::new();
+        while fb != 0 && walked < MAX_FREEBLOCKS_PER_PAGE {
+            walked += 1;
+            if !visited.insert(fb) {
+                break; // cyclic next pointer
+            }
+            let next = be_u16(page_bytes, fb) as usize;
+            if let Some((cell, chain)) =
+                template.reconstruct_spilled(self, page_bytes, fb, usable, &freed_leaves)
+            {
+                out.push((cell, chain));
+            }
+            fb = next;
+        }
+        out
+    }
+
     /// Tier-2 salvage for **spilled** cells whose overflow chain is broken (task
     /// #73, Codex ruling #4): when [`Database::carve_overflow_records`] rejects a
     /// recognized spilled cell because its chain failed (a trunk-clobbered or
@@ -2634,6 +2694,131 @@ impl FreeblockTemplate {
             record_end,
         ))
     }
+
+    /// Reconstruct a freeblock-clobbered **spilled** cell at `cell_start` (task
+    /// #73, design §2.2). A spilled cell always carries a multi-byte
+    /// `payload_len` varint, so the 4-byte freeblock clobber destroys the
+    /// `payload_len` + `rowid` varints and the record's `header_len` varint —
+    /// **but not the serial-type array**, which survives intact immediately after
+    /// the clobber. We therefore read the full serial array directly from
+    /// `cell_start + CLOBBER` (using the template only for the column count),
+    /// re-derive `header_len` and `P = header_len + Σ serial_body_len`, and — when
+    /// `P > usable - 35` — resolve the spill: `local_payload_len(P, usable)` bytes
+    /// of payload sit locally (the destroyed header counted within them), the
+    /// 4-byte first-overflow pointer follows, and the chain is resolved through
+    /// freelist leaves. Returns `(cell, chain)` with `rowid = 0`, or `None`.
+    ///
+    /// UNPROVEN-BY-CORPUS (Codex ruling #5): synthetic-fixture validation only.
+    /// No real Nemetz cell is both freeblock-clobbered and spilled.
+    fn reconstruct_spilled(
+        &self,
+        db: &Database,
+        page: &[u8],
+        cell_start: usize,
+        usable: usize,
+        freed_leaves: &std::collections::BTreeSet<u32>,
+    ) -> Option<(CarvedCell, Vec<u32>)> {
+        // The freeblock header clobbers exactly 4 bytes. For a spilled cell those
+        // 4 bytes are payload_len(>=2) + rowid(>=1) + header_len(>=1) varints, so
+        // the serial array begins right after the clobber.
+        const CLOBBER: usize = 4;
+        let serials_start = cell_start.checked_add(CLOBBER)?;
+        let mut serials = Vec::with_capacity(self.column_count);
+        let mut pos = serials_start;
+        for _ in 0..self.column_count {
+            let (s, used) = read_varint(page, pos).ok()?;
+            serial_body_len(s)?;
+            serials.push(s);
+            pos = pos.checked_add(used)?;
+        }
+
+        // Re-derive the record header bytes that were destroyed: header_len is a
+        // varint counting itself plus the serial array.
+        let mut serial_bytes_len = 0usize;
+        for &s in &serials {
+            serial_bytes_len += varint_len(s);
+        }
+        let mut header_len = serial_bytes_len + 1;
+        while varint_len(header_len as i64) + serial_bytes_len != header_len {
+            header_len += 1;
+        }
+        // The clobber removed `header_len`'s own varint plus the prefix; verify the
+        // surviving serial array aligns with the reconstructed header (the bytes
+        // from serials_start to `pos` are the serial array, length serial_bytes_len).
+        if pos.checked_sub(serials_start)? != serial_bytes_len {
+            return None; // cov:unreachable: read_varint widths sum to serial_bytes_len
+        }
+        let mut body_len = 0usize;
+        for &s in &serials {
+            body_len = body_len.checked_add(serial_body_len(s)?)?;
+        }
+        let payload_len = header_len.checked_add(body_len)?;
+        // Only the spilled class — an in-page payload is the existing template path.
+        if payload_len <= usable.checked_sub(35)? {
+            return None;
+        }
+        let local_len = local_payload_len(payload_len, usable);
+
+        // The body starts right after the surviving serial array. The local payload
+        // spans `local_len` bytes of (header ++ body); the destroyed header is
+        // `header_len` of those, so `local_len - header_len` body bytes are present
+        // locally before the 4-byte first-overflow pointer.
+        let body_start = pos;
+        let local_body = local_len.checked_sub(header_len)?;
+        let local_body_end = body_start.checked_add(local_body)?;
+        let ptr_off = local_body_end;
+        let ptr_slice = page.get(ptr_off..ptr_off + 4)?;
+        let first_overflow =
+            u32::from_be_bytes([ptr_slice[0], ptr_slice[1], ptr_slice[2], ptr_slice[3]]);
+        let local_body_bytes = page.get(body_start..local_body_end)?;
+
+        let remaining = payload_len - local_len;
+        let (chain_content, chain) = db
+            .read_freed_overflow_chain(first_overflow, remaining, usable, freed_leaves)
+            .ok()?;
+
+        // Assemble the full payload: reconstructed header ++ local body ++ chain.
+        let mut header = enc_varint_into(header_len);
+        for &s in &serials {
+            header.extend(enc_varint_into(usize::try_from(s).ok()?));
+        }
+        if header.len() != header_len {
+            return None; // cov:unreachable: header_len was solved to this width
+        }
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(&header);
+        payload.extend_from_slice(local_body_bytes);
+        payload.extend_from_slice(&chain_content);
+        if payload.len() != payload_len {
+            return None; // cov:unreachable: local_body + chain == body_len by construction
+        }
+
+        let values = decode_record(&payload, self.column_count, 0).ok()?;
+        if values.len() != self.column_count {
+            return None; // cov:unreachable: one value per serial
+        }
+        let any_replacement = values.iter().any(|v| match v {
+            Value::Text(t) => t.contains('\u{FFFD}'),
+            _ => false,
+        });
+        if any_replacement {
+            return None;
+        }
+        if !values.iter().any(is_distinctive) {
+            return None;
+        }
+
+        Some((
+            CarvedCell {
+                offset: cell_start,
+                byte_len: ptr_off + 4 - cell_start,
+                rowid: 0,
+                values,
+                confidence: FREEBLOCK_RECONSTRUCT_CONFIDENCE * OVERFLOW_CHAIN_CONFIDENCE_FACTOR,
+            },
+            chain,
+        ))
+    }
 }
 
 /// Decode a record body given an explicit serial-type array (the freeblock
@@ -3006,6 +3191,40 @@ fn be_u16(buf: &[u8], off: usize) -> u16 {
         b.copy_from_slice(s);
     }
     u16::from_be_bytes(b)
+}
+
+/// Byte width of the minimal `SQLite` varint encoding of a non-negative `value`
+/// (task #73, used to re-derive a clobbered record's `header_len`). Mirrors the
+/// 7-bit big-endian grouping of [`enc_varint_into`]; a value needing more than 8
+/// groups uses the 9-byte form. Negative inputs (illegal serial types) are
+/// treated as a single byte and rejected upstream by `serial_body_len`.
+fn varint_len(value: i64) -> usize {
+    if value < 0 {
+        return 1; // cov:unreachable: callers pass only non-negative serials/lengths
+    }
+    enc_varint_into(value as usize).len()
+}
+
+/// Minimal `SQLite` varint encoding of a non-negative `value` (task #73). 7-bit
+/// big-endian groups, high bit set on every group but the last (file-format §2).
+fn enc_varint_into(value: usize) -> Vec<u8> {
+    if value == 0 {
+        return vec![0];
+    }
+    let mut groups = Vec::new();
+    let mut n = value as u64;
+    while n > 0 {
+        groups.push((n & 0x7f) as u8);
+        n >>= 7;
+    }
+    groups.reverse();
+    let last = groups.len() - 1;
+    for (i, g) in groups.iter_mut().enumerate() {
+        if i != last {
+            *g |= 0x80;
+        }
+    }
+    groups
 }
 
 /// Bounds-checked big-endian u32; out-of-range yields 0 (never panics).
@@ -3917,9 +4136,8 @@ mod tests {
         // Page-2 leaf header (type 0x0d), 1 live cell, freeblock at 0x100, content
         // area covering both the live cell and the clobbered spilled cell.
         b[base2] = 0x0d;
-        // first freeblock pointer (offset 1) -> 0
-        b[base2 + 1] = 0;
-        b[base2 + 2] = 0;
+        // first freeblock pointer (offset 1) -> the clobbered spilled cell at 1000.
+        b[base2 + 1..base2 + 3].copy_from_slice(&1000u16.to_be_bytes());
         // cell count (offset 3) = 1
         b[base2 + 3..base2 + 5].copy_from_slice(&1u16.to_be_bytes());
         // cell content area start (offset 5) — low so both regions are "content".

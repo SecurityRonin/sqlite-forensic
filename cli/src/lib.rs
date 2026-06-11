@@ -1101,6 +1101,17 @@ mod tests {
     }
 
     #[test]
+    fn fragment_single_missing_column_is_singular() {
+        let mut f = frag();
+        f.missing = 1;
+        let lines = render_fragments(&[f], OutputFormat::Table);
+        assert!(
+            lines.iter().any(|l| l.contains("(+1 column destroyed)")),
+            "singular noun for a single missing column"
+        );
+    }
+
+    #[test]
     fn tiered_default_full_rows_unchanged_jsonl() {
         // Without fragments, the JSONL full-row output is byte-identical to
         // render_carve (no `kind` key added to full rows — published contract).

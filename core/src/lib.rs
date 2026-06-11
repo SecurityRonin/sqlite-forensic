@@ -3844,4 +3844,139 @@ mod tests {
             .read_freed_overflow_chain(3, absurd, usable, &leaves)
             .is_err());
     }
+
+    // ---- task #73 step 5: freeblock-clobbered spilled cell (SYNTHETIC ONLY) ----
+    // Codex ruling #5: there is NO corpus instance for a freeblock-clobbered
+    // *spilled* cell — this path is validated against a synthetic fixture only
+    // and is marked unproven-by-corpus in the production code + docs.
+
+    /// Build a synthetic 4096-byte-page DB with an allocated table-leaf page 2
+    /// holding (a) a LIVE template cell of the `(id INTEGER 1-byte, name TEXT,
+    /// code TEXT)` schema and (b) a freeblock-clobbered SPILLED cell whose 4-byte
+    /// prefix is overwritten by a stale freeblock header, with its overflow chain
+    /// on a freed leaf page. Returns the bytes. `break_chain` routes the chain
+    /// pointer at the freelist trunk instead of a leaf to exercise the rejection.
+    fn synth_clobbered_spill_db(break_chain: bool) -> Vec<u8> {
+        let ps = 4096usize;
+        let usable = ps;
+        // Pages: 1 header, 2 allocated leaf, 3 trunk, 4 leaf (chain), 5 leaf spare.
+        let mut b = synth_db(ps, 6, 3, 2);
+        write_trunk(&mut b, ps, 3, 0, &[4, 5]);
+
+        // Record geometry: id=7 (1-byte), name="Zoe", code 4200×'C'.
+        let name = b"Zoe";
+        let code_len = 4200usize;
+        let serials: [i64; 3] = [1, 13 + 2 * name.len() as i64, 13 + 2 * code_len as i64];
+        let mut serial_bytes = Vec::new();
+        for &s in &serials {
+            serial_bytes.extend(enc_varint(s as u64));
+        }
+        let mut header_len = serial_bytes.len() + 1;
+        while enc_varint(header_len as u64).len() + serial_bytes.len() != header_len {
+            header_len += 1;
+        }
+        let mut header = enc_varint(header_len as u64);
+        header.extend(&serial_bytes);
+        let mut full_payload = header.clone();
+        full_payload.push(7u8); // id body
+        full_payload.extend(name);
+        full_payload.extend(std::iter::repeat_n(b'C', code_len));
+        let payload_len = full_payload.len();
+        let local = local_payload_len(payload_len, usable);
+        let remaining = payload_len - local;
+
+        // --- LIVE template cell at offset 200 on page 2 (a small non-spilling row
+        //     of the SAME schema so freeblock_template derives the column layout).
+        let base2 = ps; // page 2 starts at byte 4096
+        let tmpl_name = b"Al";
+        let tmpl_code = b"xy";
+        let tser: [i64; 3] = [
+            1,
+            13 + 2 * tmpl_name.len() as i64,
+            13 + 2 * tmpl_code.len() as i64,
+        ];
+        let mut tsb = Vec::new();
+        for &s in &tser {
+            tsb.extend(enc_varint(s as u64));
+        }
+        let mut thl = tsb.len() + 1;
+        while enc_varint(thl as u64).len() + tsb.len() != thl {
+            thl += 1;
+        }
+        let mut tpayload = enc_varint(thl as u64);
+        tpayload.extend(&tsb);
+        tpayload.push(1u8);
+        tpayload.extend(tmpl_name);
+        tpayload.extend(tmpl_code);
+        let live_off = 200usize;
+        let mut live_cell = enc_varint(tpayload.len() as u64);
+        live_cell.extend(enc_varint(1u64)); // rowid 1
+        live_cell.extend(&tpayload);
+        b[base2 + live_off..base2 + live_off + live_cell.len()].copy_from_slice(&live_cell);
+
+        // Page-2 leaf header (type 0x0d), 1 live cell, freeblock at 0x100, content
+        // area covering both the live cell and the clobbered spilled cell.
+        b[base2] = 0x0d;
+        // first freeblock pointer (offset 1) -> 0
+        b[base2 + 1] = 0;
+        b[base2 + 2] = 0;
+        // cell count (offset 3) = 1
+        b[base2 + 3..base2 + 5].copy_from_slice(&1u16.to_be_bytes());
+        // cell content area start (offset 5) — low so both regions are "content".
+        b[base2 + 5..base2 + 7].copy_from_slice(&100u16.to_be_bytes());
+        // cell pointer array (1 entry) at offset 8 -> live cell offset.
+        b[base2 + 8..base2 + 10].copy_from_slice(&(live_off as u16).to_be_bytes());
+
+        // --- Clobbered SPILLED cell at offset 1000 on page 2. Lay down the FULL
+        //     prefix (payload_len varint, rowid varint, header, local payload,
+        //     overflow ptr), then OVERWRITE the first 4 bytes with a stale
+        //     freeblock header (next=0x0000, size) to simulate freeblock clobber.
+        let spill_off = 1000usize;
+        let mut spill_cell = enc_varint(payload_len as u64);
+        spill_cell.extend(enc_varint(1u64)); // rowid (will be clobbered)
+        let prefix_len = spill_cell.len();
+        spill_cell.extend(&full_payload[..local]);
+        let chain_first = if break_chain { 3u32 } else { 4u32 };
+        spill_cell.extend(chain_first.to_be_bytes());
+        b[base2 + spill_off..base2 + spill_off + spill_cell.len()].copy_from_slice(&spill_cell);
+        // Clobber the first 4 bytes with a freeblock header: next=0, size=4.
+        b[base2 + spill_off] = 0;
+        b[base2 + spill_off + 1] = 0;
+        b[base2 + spill_off + 2..base2 + spill_off + 4].copy_from_slice(&4u16.to_be_bytes());
+
+        // --- The overflow chain content on freed leaf page 4 (next=0).
+        write_overflow(&mut b, ps, 4, 0, &full_payload[local..local + remaining]);
+
+        let _ = prefix_len;
+        b
+    }
+
+    #[test]
+    fn clobbered_spilled_cell_reconstructs_with_unknown_rowid() {
+        let db = Database::open(synth_clobbered_spill_db(false)).unwrap();
+        let page2 = db.raw_page(2).unwrap();
+        let recovered = db.carve_overflow_template_records(page2);
+        let (cell, chain) = recovered
+            .iter()
+            .find(|(c, _)| {
+                matches!(c.values.get(1), Some(Value::Text(t)) if t == "Zoe")
+            })
+            .expect("synthetic clobbered spilled cell must reconstruct");
+        // rowid destroyed by the freeblock clobber -> surfaced as 0.
+        assert_eq!(cell.rowid, 0);
+        // code fully reassembled across the chain.
+        assert!(matches!(cell.values.get(2), Some(Value::Text(t)) if t.len() == 4200));
+        assert_eq!(chain, &vec![4u32]);
+    }
+
+    #[test]
+    fn clobbered_spilled_broken_chain_yields_no_full_row() {
+        // Chain pointer routed at the freelist TRUNK (page 3) -> rejected.
+        let db = Database::open(synth_clobbered_spill_db(true)).unwrap();
+        let page2 = db.raw_page(2).unwrap();
+        let recovered = db.carve_overflow_template_records(page2);
+        assert!(recovered
+            .iter()
+            .all(|(c, _)| !matches!(c.values.get(1), Some(Value::Text(t)) if t == "Zoe")));
+    }
 }

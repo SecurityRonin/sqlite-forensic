@@ -128,6 +128,34 @@ pub struct CellFragment {
     pub confidence: f32,
 }
 
+/// A freed table-leaf cell whose declared payload **spills onto an overflow-page
+/// chain** (task #73). Recognized by [`try_carve_spilled_cell_at`] from the
+/// cell's intact local prefix; the chain itself is resolved separately
+/// ([`Database::read_freed_overflow_chain`]) because that needs whole-database
+/// access. A `SpilledCell` is deliberately NOT a [`CarvedCell`]: until its chain
+/// is walked and validated it cannot masquerade as a recovered row (secure by
+/// design — the type system keeps an unresolved spill out of the full-row output).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpilledCell {
+    /// Byte offset of the cell within the scanned slice.
+    pub offset: usize,
+    /// On-page footprint of the cell prefix: `n1 + n2 + local_len + 4`.
+    pub byte_len: usize,
+    /// Declared total payload length `P` (header + full body).
+    pub payload_len: usize,
+    /// Decoded rowid varint (intact-prefix anchors); `0` when the prefix was
+    /// clobbered and the rowid is unrecoverable (template path).
+    pub rowid: i64,
+    /// Full serial-type array, decoded from the local record header.
+    pub serials: Vec<i64>,
+    /// Local payload bytes kept on the leaf page (`local_payload_len(P, usable)`).
+    pub local_len: usize,
+    /// Offset, within the scanned slice, at which the local payload begins.
+    pub local_payload_off: usize,
+    /// First overflow-page number (big-endian u32 at `local_payload_off + local_len`).
+    pub first_overflow: u32,
+}
+
 /// Parsed 100-byte `SQLite` file header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -2418,6 +2446,86 @@ fn try_carve_cell_at(
     })
 }
 
+/// Recognize a freed **spilled** table-leaf cell at `off` whose payload exceeds
+/// the in-page threshold (`usable - 35`) and therefore continues on an
+/// overflow-page chain (task #73). The sibling of [`try_carve_cell_at`] for the
+/// overflow class: the two partition the candidate space by the spec spill
+/// threshold, so a cell is recognized by exactly one of them.
+///
+/// `expected_columns` is `Some(n)` to require exactly `n` columns, or `None` to
+/// infer the count (≥ [`MIN_INFERRED_COLUMNS`]). Returns a [`SpilledCell`]
+/// (recognition only — the chain is resolved later) when the local prefix is
+/// self-consistent: header fits in the local payload, the serial array consumes
+/// the header cleanly, `header_len + Σ serial_body_len == P` (length closure
+/// over the *declared* P), and the local payload plus its 4-byte overflow
+/// pointer are in-bounds. Never panics — every access is bounds-checked.
+fn try_carve_spilled_cell_at(
+    buf: &[u8],
+    off: usize,
+    usable: usize,
+    expected_columns: Option<usize>,
+) -> Option<SpilledCell> {
+    let (payload_len, n1) = read_varint(buf, off).ok()?;
+    let payload_len = usize::try_from(payload_len).ok()?;
+    // Only the overflow class — in-page payloads belong to `try_carve_cell_at`.
+    if payload_len <= usable.checked_sub(35)? {
+        return None;
+    }
+    let (rowid, n2) = read_varint(buf, off + n1).ok()?;
+    if rowid <= 0 {
+        return None;
+    }
+    let payload_start = off + n1 + n2;
+    let local_len = local_payload_len(payload_len, usable);
+    // The local payload prefix plus the 4-byte first-overflow pointer must be in
+    // bounds of the scanned slice.
+    let prefix = buf.get(payload_start..payload_start + local_len + 4)?;
+
+    // The record header must fit entirely within the local prefix — otherwise the
+    // serial array is not addressable locally and we abstain rather than guess.
+    let (header_len, hn) = read_varint(prefix, 0).ok()?;
+    let header_len = usize::try_from(header_len).ok()?;
+    if header_len > local_len || header_len < hn {
+        return None;
+    }
+    let mut serials = Vec::new();
+    let mut hpos = hn;
+    while hpos < header_len {
+        let (s, used) = read_varint(prefix, hpos).ok()?;
+        serials.push(s);
+        hpos += used;
+    }
+    if hpos != header_len {
+        return None;
+    }
+    match expected_columns {
+        Some(n) if serials.len() != n => return None,
+        None if serials.len() < MIN_INFERRED_COLUMNS => return None,
+        _ => {}
+    }
+
+    // Length closure over the DECLARED payload: header + body must equal P.
+    let mut body_len = 0usize;
+    for &s in &serials {
+        body_len += serial_body_len(s)?;
+    }
+    if header_len + body_len != payload_len {
+        return None;
+    }
+
+    let first_overflow = be_u32(prefix, local_len);
+    Some(SpilledCell {
+        offset: off,
+        byte_len: n1 + n2 + local_len + 4,
+        payload_len,
+        rowid,
+        serials,
+        local_len,
+        local_payload_off: payload_start,
+        first_overflow,
+    })
+}
+
 /// Parse + validate the 100-byte file header.
 fn parse_header(bytes: &[u8]) -> Result<Header, Error> {
     let head = bytes.get(..SQLITE_HEADER_SIZE).ok_or(Error::TooShort)?;
@@ -3157,7 +3265,7 @@ mod tests {
     fn spilled_recognizer_reads_intact_prefix() {
         let usable = 4096usize;
         let (cell, p, local, serials) =
-            synth_spilled_prefix(20012, 42, "Ella", 4000, usable, 13);
+            synth_spilled_prefix(20012, 42, "Ella", 4200, usable, 13);
         assert!(p > usable - 35, "this record must spill");
         // Place the cell inside a larger scanned slice at a nonzero offset.
         let off = 50usize;
@@ -3190,7 +3298,7 @@ mod tests {
     fn spilled_recognizer_abstains_on_truncated_pointer() {
         let usable = 4096usize;
         let (cell, _p, _local, _s) =
-            synth_spilled_prefix(20012, 42, "Ella", 4000, usable, 13);
+            synth_spilled_prefix(20012, 42, "Ella", 4200, usable, 13);
         // Drop the final 2 bytes so the 4-byte overflow pointer is out of bounds.
         let truncated = &cell[..cell.len() - 2];
         assert!(try_carve_spilled_cell_at(truncated, 0, usable, Some(3)).is_none());
@@ -3200,7 +3308,7 @@ mod tests {
     fn spilled_recognizer_abstains_on_column_mismatch() {
         let usable = 4096usize;
         let (cell, _p, _local, _s) =
-            synth_spilled_prefix(20012, 42, "Ella", 4000, usable, 13);
+            synth_spilled_prefix(20012, 42, "Ella", 4200, usable, 13);
         // Expect 5 columns but the record has 3.
         assert!(try_carve_spilled_cell_at(&cell, 0, usable, Some(5)).is_none());
         // Inferred (None) still recognizes it.

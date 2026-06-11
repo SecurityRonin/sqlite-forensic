@@ -358,6 +358,53 @@ pub struct CarvedRecord {
     pub wal: Option<WalProvenance>,
 }
 
+/// A **Tier-2 partial recovery**: a freed cell whose full row could not be
+/// reconstructed but at least one *distinctive* cell (TEXT ≥ 4 bytes of valid
+/// UTF-8, or REAL) survived at a structural anchor.
+///
+/// Deliberately NOT a [`CarvedRecord`]: it has no rowid (clobbered) and an
+/// incomplete column set, and it does **not** share the full-row
+/// 0-false-positive guarantee — it is a lead-generation surface with an expected
+/// non-zero false-positive rate. The type system keeps it out of the full-row
+/// output so a fragment can never be silently rendered as a recovered row
+/// (secure by design). Returned only by [`carve_with_fragments`] in the opt-in
+/// [`CarveTiers::fragments`] bucket. A fragment is "consistent with a partial
+/// deleted row" — the examiner draws the conclusion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarvedFragment {
+    /// 1-based page the fragment was salvaged from.
+    pub page: u32,
+    /// Byte offset of the failed cell's anchor within that page.
+    pub offset: usize,
+    /// `(column_index, value)` for each column that decoded cleanly, ascending by
+    /// index — meaningful against the table's column order.
+    pub surviving: Vec<(usize, Value)>,
+    /// Number of the row's columns that did NOT decode.
+    pub missing: usize,
+    /// Always the flat Tier-2 fragment confidence (0.2) for now — strictly below
+    /// every full-row class.
+    pub confidence: f32,
+    /// Which class of free space the fragment was salvaged from
+    /// ([`RecoverySource::FreeblockReconstructed`] for chain-pass fragments,
+    /// [`RecoverySource::InPageFreeBlock`] for gap-pass fragments).
+    pub source: RecoverySource,
+    /// WAL log-sequence provenance. `None` in v1 (no WAL fragment pass yet).
+    pub wal: Option<WalProvenance>,
+}
+
+/// The two strictly-separated recovery tiers returned by [`carve_with_fragments`].
+///
+/// `full` is **byte-identical** to [`carve_all_deleted_records`] and keeps its
+/// structural 0-false-positive guarantee — the zero-config, high-precision
+/// output. `fragments` is the opt-in Tier-2 lead surface (see [`CarvedFragment`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarveTiers {
+    /// Tier-1 full rows — identical to [`carve_all_deleted_records`].
+    pub full: Vec<CarvedRecord>,
+    /// Tier-2 partial recoveries (opt-in; expected non-zero false-positive rate).
+    pub fragments: Vec<CarvedFragment>,
+}
+
 /// Recover deleted records by carving the database's free (unallocated) pages.
 ///
 /// Each free page from [`Database::freelist_pages`] is scanned with
@@ -592,6 +639,122 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
     });
 
     dedup_keep_best(out)
+}
+
+/// Two-tier deleted-record recovery: Tier-1 full rows **plus** Tier-2 partial
+/// fragments, in one pass.
+///
+/// [`CarveTiers::full`] is byte-identical to [`carve_all_deleted_records`] (the
+/// high-precision, structurally-0-false-positive output). [`CarveTiers::fragments`]
+/// is the opt-in lead surface: at every freeblock/gap anchor where full
+/// reconstruction failed but ≥ 1 distinctive cell (TEXT ≥ 4 bytes of valid UTF-8,
+/// or REAL) survived, the maximal decodable column prefix is salvaged as a
+/// [`CarvedFragment`]. Three suppression layers keep the fragment bucket honest:
+///
+/// 1. **By construction** — a fragment is emitted only where full reconstruction
+///    failed, so an anchor yields a full cell or a fragment, never both.
+/// 2. **Full-row value suppression** — a fragment whose every surviving
+///    `(column, value)` matches the corresponding column of a Tier-1 record in
+///    `full` is dropped (the row was already recovered another way).
+/// 3. **Live-row suppression** — a fragment whose every surviving `(column, value)`
+///    matches the corresponding columns of a currently-live row is dropped (never
+///    re-surface a live row, the fragment analog of the rebalance-copy drop).
+///
+/// Read-only and panic-free, identically to [`carve_all_deleted_records`].
+#[must_use]
+pub fn carve_with_fragments(db: &Database) -> CarveTiers {
+    let full = carve_all_deleted_records(db);
+
+    // RED stub: Tier-2 salvage wired in the GREEN commit.
+    if full.is_empty() || !full.is_empty() {
+        return CarveTiers {
+            full,
+            fragments: Vec::new(),
+        };
+    }
+
+    // Salvage Tier-2 fragments from every on-disk table-leaf page. The core
+    // walker emits a fragment only where full reconstruction failed (layer 1).
+    #[allow(unreachable_code)]
+    let mut fragments: Vec<CarvedFragment> = Vec::new();
+    let page_count = db.page_count();
+    for page in 1..=page_count {
+        let Some(page_bytes) = db.raw_page(page) else {
+            continue; // cov:unreachable: 1..=page_count is in range
+        };
+        for frag in db.reconstruct_freeblock_fragments(page_bytes) {
+            fragments.push(CarvedFragment {
+                page,
+                offset: frag.offset,
+                surviving: frag.surviving,
+                missing: frag.missing,
+                confidence: frag.confidence,
+                source: RecoverySource::FreeblockReconstructed,
+                wal: None,
+            });
+        }
+    }
+
+    // Layer 3: live-row suppression. A fragment whose surviving set matches the
+    // corresponding columns of a live row is a stale partial copy of a live row.
+    let live = db.live_rows();
+    fragments.retain(|frag| {
+        !live
+            .values()
+            .any(|lv| fragment_matches_columns(frag, lv))
+    });
+
+    // Layer 2: full-row value suppression. A fragment already covered by a
+    // recovered full row in this carve is a duplicate — drop it.
+    fragments.retain(|frag| {
+        !full
+            .iter()
+            .any(|rec| fragment_matches_columns(frag, &rec.values))
+    });
+
+    // Fragment dedup: one fragment per (page, offset) anchor by construction,
+    // then collapse value-level duplicates keeping the copy with more surviving
+    // columns (mirrors dedup_keep_best for the full tier).
+    fragments = dedup_fragments(fragments);
+
+    CarveTiers { full, fragments }
+}
+
+/// Whether a fragment's every surviving `(column_index, value)` pair equals the
+/// corresponding column of `row` — the projection test shared by the full-row
+/// (layer 2) and live-row (layer 3) suppression passes. Equality of the **whole**
+/// surviving set is required: a fragment that coincides with a row on only some
+/// cells is kept (it may be genuine residue), mirroring the full-row rule's
+/// whole-values comparison.
+fn fragment_matches_columns(frag: &CarvedFragment, row: &[Value]) -> bool {
+    !frag.surviving.is_empty()
+        && frag
+            .surviving
+            .iter()
+            .all(|(idx, v)| row.get(*idx) == Some(v))
+}
+
+/// De-duplicate fragments: first by `(page, offset)` anchor (one fragment per
+/// anchor by construction), then collapse value-level duplicates keeping the copy
+/// with the most surviving columns. Mirrors [`dedup_keep_best`] for the full tier.
+fn dedup_fragments(mut frags: Vec<CarvedFragment>) -> Vec<CarvedFragment> {
+    use std::collections::HashSet;
+    // More surviving columns first, so the kept copy of each identity is richest.
+    frags.sort_by(|a, b| b.surviving.len().cmp(&a.surviving.len()));
+    let mut seen_anchor: HashSet<(u32, usize)> = HashSet::new();
+    let mut seen_values: HashSet<String> = HashSet::new();
+    let mut kept = Vec::new();
+    for frag in frags {
+        if !seen_anchor.insert((frag.page, frag.offset)) {
+            continue;
+        }
+        let vkey = format!("{:?}", frag.surviving);
+        if !seen_values.insert(vkey) {
+            continue;
+        }
+        kept.push(frag);
+    }
+    kept
 }
 
 /// Carve the deleted residue of **one materialized commit snapshot** of the

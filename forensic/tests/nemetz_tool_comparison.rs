@@ -576,3 +576,85 @@ fn ours_never_rereads_a_live_row() {
         "our carver re-surfaced {live} live row(s) as deleted across the in-scope corpus"
     );
 }
+
+// --- live sqlite_master re-read measurement (per tool) -----------------------
+//
+// A *live `sqlite_master` re-read* is a carving tool emitting the database's
+// CURRENT schema-table row (the `(type, name, tbl_name, rootpage, sql)` definition
+// record that still lives on page 1) as if it were a recovered DELETED record.
+// It is a pure precision artifact: the schema row was never deleted, so surfacing
+// it as "recovered" mis-reports a live object as evidence. This is distinct from
+// the user-row `live_reread` the confusion matrix already tracks (carved ∈ alive)
+// — the schema row is not a user-table row and never enters the `alive` set.
+//
+// The detector is GENERAL, derived from the schema itself, not from any per-DB
+// constant: each tool's recovered records are projected to the schema identity
+// `(type, name, tbl_name)` and counted iff that identity equals a row returned by
+// `Database::live_schema_rows()` (the currently-live page-1 schema). A genuinely
+// deleted PRIOR schema version (e.g. a dropped table's old `CREATE TABLE`) has a
+// different identity and is therefore NOT counted — only the LIVE row is.
+
+/// Per-tool live `sqlite_master` re-read totals across the in-scope (0C/0D/0E)
+/// corpus, the precision artifact #67 measures: our carver re-reads the live
+/// schema row **0** times (the #64 live-schema filter), undark **0** times (it
+/// never reconstructs `sqlite_master`), and fqlite **28** times (it emits the
+/// live schema-table row as a recovered record on every database — one per
+/// single-table DB, two per two-table DB). Pinned as exact measurements; the
+/// undark/fqlite legs skip when their gate env var is unset (CI stays green
+/// without the tools), while the `ours == 0` guarantee is always asserted.
+#[test]
+fn live_sqlite_master_rereads_per_tool() {
+    let undark = undark_bin();
+    let fqlite = fqlite_tap();
+
+    let mut ours_total = 0usize;
+    let mut undark_total = 0usize;
+    let mut fqlite_total = 0usize;
+
+    for (nid, cat) in in_scope() {
+        let path = db_path(&nid, &cat);
+        let db = Database::open(std::fs::read(&path).unwrap()).unwrap();
+        let live = live_schema_identities(&db);
+        assert!(
+            !live.is_empty(),
+            "{nid}: a live (non-dropped) table DB must carry a live sqlite_master row to guard against"
+        );
+        ours_total += ours_schema_rereads(&db);
+        if let Some(bin) = &undark {
+            undark_total += undark_schema_rereads(bin, &path, &live);
+        }
+        if let Some(tap) = &fqlite {
+            fqlite_total += fqlite_schema_rereads(tap, &path, &live);
+        }
+    }
+
+    // Our carver: the structural guarantee — never re-read the live schema row.
+    assert_eq!(
+        ours_total, 0,
+        "our carver re-read the live sqlite_master row {ours_total} time(s) across 0C/0D/0E"
+    );
+
+    if undark.is_some() {
+        assert_eq!(
+            undark_total, 0,
+            "undark live sqlite_master re-reads {undark_total} (expected 0 — undark does not reconstruct the schema row)"
+        );
+    } else {
+        eprintln!("SKIP undark schema-reread leg: set UNDARK_BIN");
+    }
+
+    if fqlite.is_some() {
+        assert_eq!(
+            fqlite_total, NEMETZ_FQLITE_SCHEMA_REREADS,
+            "fqlite live sqlite_master re-reads {fqlite_total} (expected {NEMETZ_FQLITE_SCHEMA_REREADS})"
+        );
+    } else {
+        eprintln!("SKIP fqlite schema-reread leg: set FQLITE_TAP");
+    }
+}
+
+/// fqlite's measured live `sqlite_master` re-read total across the in-scope
+/// (0C/0D/0E) corpus: it emits the live schema-table row as a recovered record on
+/// every database (one per single-table DB, two per two-table DB), 28 in total.
+/// Pinned so a change in fqlite's schema-row behavior surfaces as a test update.
+const NEMETZ_FQLITE_SCHEMA_REREADS: usize = 28;

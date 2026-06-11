@@ -30,12 +30,18 @@ regenerate its table). Corpus and oracle provenance are in
   whose full identity still survives** — substrate recall 1.000, precision 1.000 —
   against an honest contiguous full-row denominator of 19 (the other ~26 of 45
   deleted rows were destroyed by later overwrites; **end-to-end** recall is 0.422).
-- **Overflow (`0E`) is a weakness, not a win.** The contiguous substrate is tiny —
-  only 3 of 12 deleted rows survive in-page and contiguously (the rest genuinely
-  spill to an overflow-page chain and are conservatively excluded; chain-aware
-  overflow recovery is future work). On that 3-row substrate ours recovers 3/3 to
-  fqlite's 1/3, but **end-to-end `0E` recall is only 0.250** — overflow records are
-  mostly not recovered. On `0C` ours now leads on recall as well as precision.
+- **Overflow (`0E`) is now partially recovered, still a limited capability.**
+  Chain-aware overflow recovery reassembles a deleted row whose payload spilled
+  onto a freed overflow-page chain **when every chain page survives as a freelist
+  leaf** (content-preserving). Of the 12 deleted `0E` rows, 3 survive in-page and
+  contiguously and 1 spilled chain (`0E-01` `Ella`, chain page 13 a freelist leaf)
+  reassembles byte-perfect — substrate `Drec = 4`, ours recovers all 4 (substrate
+  recall 1.000, precision 1.000). The other spilled chain (`0E-01` `Matteo`, chain
+  page 5 reallocated as the freelist trunk) was destroyed: it is correctly NOT
+  recovered as a full row and surfaces only as a Tier-2 fragment (`id`, `name` from
+  its intact local prefix). **End-to-end `0E` recall is 0.333** — most deleted `0E`
+  bodies were genuinely overwritten, which no carver can undo. On `0C` ours leads on
+  recall as well as precision.
 - **The mechanism**: when SQLite frees an in-page cell it overwrites the cell's
   first four bytes (payload-length + rowid varints, the record `header_len`, and
   the leading serial type) with the freeblock header. `reconstruct_freeblock_records`
@@ -84,12 +90,14 @@ key. Under this rule:
 - `0D` drops from 36 to **19** — overwrites genuinely destroyed roughly 26 of the
   45 deleted rows; the substrate is small for that reason, not because the harness
   is lenient.
-- `0E` drops from 9 to **3**. Most `0E` deleted bodies are large-but-in-page and
-  survive as a single contiguous run (tested honestly); the few records whose
-  payload exceeds the in-page limit (`usable − 35`) spill to a non-contiguous
-  overflow-page chain (SQLite file format, "Cell payload overflow pages") that a
-  flat-file contiguity test cannot model, so they are conservatively counted as
-  not-recoverable — chain-aware overflow recoverability is future work.
+- `0E` substrate is **4**. Most `0E` deleted bodies are large-but-in-page and
+  survive as a single contiguous run (tested honestly). The records whose payload
+  exceeds the in-page limit (`usable − 35`) spill to an overflow-page chain (SQLite
+  file format, "Cell payload overflow pages"); chain-aware recovery now counts such
+  a row as recoverable when its chain is **followable through freelist leaves** to a
+  byte-exact reassembly. One of the two `0E` spilled chains qualifies (`Ella`, chain
+  page 13 a leaf); the other (`Matteo`, chain page 5 the freelist trunk) was
+  overwritten and stays excluded.
 - `0C` (no overwrites) stays fully recoverable (101/101 on the single-tool
   matrix).
 
@@ -101,9 +109,9 @@ key. Under this rule:
 | 0D | **ours** | 45 | 19 | 19 | 0 | 0 | **0** | **1.000** | 0.422 | **1.000** |
 | 0D | undark | 45 | 19 | 1 | 10 | 18 | 56 | 0.053 | 0.022 | 0.091 |
 | 0D | fqlite | 45 | 19 | **20** | 0 | 0 | **0** | **1.000** | **0.444** | **1.000** |
-| 0E | **ours** | 12 | 3 | **3** | 0 | 0 | **0** | **1.000** | **0.250** | **1.000** |
-| 0E | undark | 12 | 3 | 3 | 6 | 0 | 27 | 1.000 | 0.250 | 0.333 |
-| 0E | fqlite | 12 | 3 | 2 | 2 | 2 | **0** | 0.333 | 0.167 | 0.500 |
+| 0E | **ours** | 12 | 4 | **4** | 0 | 0 | **0** | **1.000** | **0.333** | **1.000** |
+| 0E | undark | 12 | 4 | 3 | 6 | 1 | 27 | 0.750 | 0.250 | 0.333 |
+| 0E | fqlite | 12 | 4 | 2 | 2 | 2 | **0** | 0.500 | 0.167 | 0.500 |
 
 (Totals exclude 0C-06/0C-07; `0C` therefore sums 8 databases, 84 deleted rows.
 Regenerate with `cargo test -p sqlite-forensic --test nemetz_tool_comparison --
@@ -121,9 +129,10 @@ from that CSV — chart and table are the same dataset by construction. By **F1*
 (balanced), sqlite-forensic leads `0C` (0.892 vs fqlite 0.802); under **F0.5**
 (precision-weighted — the forensic β, since a phantom row costs an examiner more
 than a missed low-confidence one) the `0C` lead widens (0.931 vs 0.805). The `0E`
-F-scores (ours 1.000 vs undark 0.500/0.385, fqlite 0.400/0.455) are computed on the
-tiny 3-row contiguous substrate only — with end-to-end `0E` recall at 0.250, that is
-a substrate-level edge, not an overflow-recovery win. On `0D`, ours and fqlite both
+F-scores are computed on the 4-row substrate (3 in-page contiguous + 1 followable
+chain); ours recovers all 4 at precision 1.000, but with end-to-end `0E` recall at
+0.333 that remains a limited capability — most deleted overflow bodies were
+overwritten. On `0D`, ours and fqlite both
 score **1.000** on substrate
 recall, precision, and therefore both F-scores — each recovers every row whose full
 identity survives. To refresh: rerun the test with `UNDARK_BIN`/`FQLITE_TAP` set to
@@ -148,23 +157,23 @@ committed CSV/PNG were produced by that oracle run; `FQLITE_TAP` =
   projects **20** TPs under the cross-tool `(col1,col2)` projection against the
   denominator of 19 substrate-recoverable rows; that extra projected row is not
   part of the recoverable substrate.)
-- **Overflow (`0E`): substrate-only partial, not a lead.** End-to-end `0E` recall
-  is only **0.250** — most deleted overflow rows are not recovered. Against the
-  honest denominator (3 of the 12 deleted overflow rows survive in-page and
-  contiguously) our carver recovers all 3 with no false positive. undark also
-  recovers 3/3 on the substrate but re-reads **27** live rows (precision 0.333);
-  fqlite recovers 2 deleted overflow rows end-to-end (the table's `TP = 2`) but only
-  1 falls within the 3-row recoverable substrate, so its substrate recall is
-  1/3 = 0.333 (precision 0.500). (Freeblock reconstruction adds nothing on `0E` —
-  these records spill to overflow, so the residue is not a simple in-page freeblock.)
+- **Overflow (`0E`): partial chain recovery, a limited capability.** End-to-end
+  `0E` recall is **0.333** — most deleted overflow rows were overwritten and cannot
+  be recovered by any carver. Against the honest denominator (3 in-page contiguous
+  rows + 1 chain that survives through freelist leaves) our carver recovers all 4
+  with no false positive, including the one reassembled overflow chain (`Ella`);
+  the destroyed chain (`Matteo`, page-5 trunk) is correctly excluded and degrades
+  to a Tier-2 fragment. undark recovers 3/4 on the substrate but re-reads **27**
+  live rows (precision 0.333); fqlite recovers 2 deleted overflow rows end-to-end,
+  2 within the 4-row substrate (substrate recall 0.500, precision 0.500).
 
 The consistent picture (per the committed oracle run): **our carver leads fqlite
 on in-page recall (`0C`, 0.833 vs 0.798) while keeping the highest precision of all
 three tools on every category and never re-reading a live row; it matches fqlite on
 overwritten records (`0D`) — both recover every row whose full identity survives, at
-precision 1.000. On the tiny `0E` overflow substrate (3 rows) ours recovers 3/3 to
-fqlite's 1/3, but end-to-end `0E` recall (0.250) makes overflow a weakness, not a
-claim; undark trails on precision throughout and over-reports live rows as
+precision 1.000. On the `0E` overflow substrate (4 rows) ours recovers 4/4 to
+fqlite's 2/4, but end-to-end `0E` recall (0.333) keeps overflow a limited
+capability, not a headline claim; undark trails on precision throughout and over-reports live rows as
 deleted.**
 
 ### Live `sqlite_master` re-reads — a precision artifact, measured per tool
@@ -217,9 +226,10 @@ Recall is reported with two denominators:
 - **substrate-limited recall** = TP / `|D_recoverable|` — of the deleted rows
   whose scored identity *physically survives* in the file (a corpus property
   computed independently of our carver: the full record body surviving
-  contiguously, decided per record by body size — records that genuinely overflow
-  onto a non-contiguous overflow-page chain are conservatively excluded), how many
-  did we recover? The carver-capability number.
+  contiguously, decided per record by body size; a record that genuinely overflows
+  onto an overflow-page chain counts when its chain is followable through freelist
+  leaves to a byte-exact reassembly), how many did we recover? The carver-capability
+  number.
 - **end-to-end recall** = TP / `|D_deleted|` — of *all* rows the workload deleted
   (some destroyed by later overwrites), how many did we recover? The
   examiner-usefulness number.
@@ -258,9 +268,9 @@ reals at 5 dp) rather than the `(col1,col2)` projection, and it **includes
 Categories: `0C` deleted records (in-page free block); `0D` deleted then
 overwritten; `0E` deleted overflow records. `Ddel` = rows deleted; `Drec` = of
 those, the recoverable substrate — rows whose full scored identity survives
-contiguously, decided per record by body size (records that genuinely overflow
-onto a non-contiguous chain are conservatively excluded); `live` = live-re-reads
-(must be 0).
+contiguously (or, for an overflow row, whose chain is followable through freelist
+leaves to a byte-exact reassembly), decided per record by body size; `live` =
+live-re-reads (must be 0).
 
 | DB | Ddel | Drec | TP | FP | FN | live | recall (substrate) | recall (e2e) | precision | F2 |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -283,7 +293,7 @@ onto a non-contiguous chain are conservatively excluded); `live` = live-re-reads
 | 0D-06 | 10 | 5 | 5 | 0 | 0 | 0 | 1.000 | 0.500 | 1.000 | 1.000 |
 | 0D-07 | 5  | 5 | 5 | 0 | 0 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |
 | 0D-08 | 5  | 5 | 5 | 0 | 0 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |
-| 0E-01 | 7  | 3 | 3 | 0 | 0 | 0 | 1.000 | 0.429 | 1.000 | 1.000 |
+| 0E-01 | 7  | 4 | 4 | 0 | 0 | 0 | 1.000 | 0.571 | 1.000 | 1.000 |
 | 0E-02 | 5  | 0 | 0 | 0 | 0 | 0 | 1.000 | 0.000 | 1.000 | 1.000 |
 
 (Dropped/overwritten-*table* categories `0A`/`0B` carry no row-level deleted set
@@ -308,12 +318,14 @@ correctness is measured by the DC3 differential below.)
   still survives. The carver recovers all of them. End-to-end recall (TP / Ddel)
   stays lower because later `INSERT`s genuinely destroyed ~26 of the 45 deleted
   rows' identities.
-- **0E substrate recall 1.000** (3 TP / 3 Drec): the freeblock template does not
-  apply here (these records spill to overflow), but the per-record substrate rule
-  does — most `0E` deleted bodies are large-but-in-page and survive contiguously,
-  and the carver recovers all 3 of them. The honest denominator is 3 (the few rows
-  that genuinely overflow onto a non-contiguous overflow-page chain are
-  conservatively excluded — chain-aware overflow recovery is future work).
+- **0E substrate recall 1.000** (4 TP / 4 Drec): most `0E` deleted bodies are
+  large-but-in-page and survive contiguously, and the carver recovers all of them.
+  The honest denominator is 4 — 3 in-page contiguous rows plus 1 overflow chain
+  (`Ella`) that is followable through freelist leaves to a byte-exact reassembly.
+  The other overflow chain (`Matteo`, page-5 trunk) was overwritten and is excluded
+  (it degrades to a Tier-2 fragment). Overflow Tier-1 is a graded recovery, not part
+  of the structural 0-false-positive guarantee: a freelist leaf can be stale, so the
+  chain-reassembled row is graded below the in-page full-row tier.
 
 ## Freeblock reconstruction
 
@@ -373,10 +385,11 @@ Of the 5 fragment-recoverable 0D rows, the on-disk freeblock/gap extractor reach
 clobbered). The other 4 survive only *inside live-cell extents the carver must
 never scan* (re-surfacing them would break the never-touch-a-live-row guarantee)
 or at offsets no freeblock/gap anchor walks — so fragment recall < 1.0 is expected
-and honest, not a defect. `0E` adds 4 fragment-recoverable rows (long TEXT split
-across overflow pages), none yet reached by the flat-contiguity extractor
-(chain-aware overflow fragments are future work). `0C` is fully reconstructable,
-so it yields no fragments.
+and honest, not a defect. `0E` has 3 fragment-recoverable rows (long TEXT split
+across overflow pages); the broken-chain overflow fragment salvage reaches one of
+them — `Matteo` (chain page 5 the freelist trunk), whose intact local prefix yields
+`id` and `name` after the chain is rejected from Tier-1. `0C` is fully
+reconstructable, so it yields no fragments.
 
 Because a lone surviving cell *can* be a coincidental byte run that satisfies the
 serial + UTF-8 checks, the fragment surface carries an **expected non-zero
@@ -407,16 +420,18 @@ reported here.
   *this* independent corpus (per the committed oracle run): our carver leads fqlite
   on in-page recall (`0C`) at the highest precision of the three and never re-reads
   a live row; it matches fqlite on overwritten records (`0D`), where both recover
-  every row whose full identity survives; on the tiny `0E` overflow substrate ours
-  recovers 3/3 to fqlite's 1/3, though end-to-end `0E` recall (0.250) marks overflow
-  a weakness; undark trails on precision and over-reports live
+  every row whose full identity survives; on the `0E` overflow substrate ours
+  recovers 4/4 to fqlite's 2/4, though end-to-end `0E` recall (0.333) keeps overflow
+  a limited capability; undark trails on precision and over-reports live
   rows as deleted on the overwritten and overflow tables.
 - They do **not** claim our carver is "best" overall. On `0D` end-to-end, fqlite's
   cross-tool `(col1,col2)` projection counts **20** TPs to our 19 (against a
   denominator of 19 substrate-recoverable rows); on `0C` we lead fqlite by raw
-  recall; on `0E` end-to-end recovery is weak for both (ours 0.250, fqlite 0.167) —
-  not a meaningful lead. We hold a structural 0-false-positive guarantee and the
-  lowest phantom rate of the three throughout.
+  recall; on `0E` end-to-end recovery is limited for both (ours 0.333, fqlite 0.167)
+  — not a meaningful lead. We hold a structural 0-false-positive guarantee on the
+  in-page tier and the lowest phantom rate of the three throughout; overflow Tier-1
+  is a separate graded path (a freelist leaf can be stale), not part of that
+  structural guarantee.
 - A low per-category end-to-end recall is a true statement about a capability
   boundary, not a harness artifact — the two-denominator split separates "the bytes
   did not survive" (substrate) from "the bytes survived and we missed them"

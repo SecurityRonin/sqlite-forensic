@@ -454,7 +454,13 @@ impl Database {
     /// [`Error::MalformedFreelist`] rather than looping.
     pub fn freelist_pages_split(
         &self,
-    ) -> Result<(std::collections::BTreeSet<u32>, std::collections::BTreeSet<u32>), Error> {
+    ) -> Result<
+        (
+            std::collections::BTreeSet<u32>,
+            std::collections::BTreeSet<u32>,
+        ),
+        Error,
+    > {
         let mut leaves = std::collections::BTreeSet::new();
         let mut trunks = std::collections::BTreeSet::new();
         let mut trunk = be_u32(&self.bytes, SQLITE_FREELIST_TRUNK_OFFSET);
@@ -810,7 +816,8 @@ impl Database {
         freed_leaves: &std::collections::BTreeSet<u32>,
     ) -> Option<(CarvedCell, Vec<u32>)> {
         let remaining = sc.payload_len.checked_sub(sc.local_len)?;
-        let local_payload = region.get(sc.local_payload_off..sc.local_payload_off + sc.local_len)?;
+        let local_payload =
+            region.get(sc.local_payload_off..sc.local_payload_off + sc.local_len)?;
         let (chain_content, chain) = self
             .read_freed_overflow_chain(sc.first_overflow, remaining, usable, freed_leaves)
             .ok()?;
@@ -874,7 +881,10 @@ impl Database {
     ///
     /// Returns `(cell, chain)` per fully-resolved record. Bounded and panic-free.
     #[must_use]
-    pub fn carve_overflow_template_records(&self, page_bytes: &[u8]) -> Vec<(CarvedCell, Vec<u32>)> {
+    pub fn carve_overflow_template_records(
+        &self,
+        page_bytes: &[u8],
+    ) -> Vec<(CarvedCell, Vec<u32>)> {
         let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
             SQLITE_HEADER_SIZE
         } else {
@@ -3827,8 +3837,7 @@ mod tests {
     #[test]
     fn spilled_recognizer_reads_intact_prefix() {
         let usable = 4096usize;
-        let (cell, p, local, serials) =
-            synth_spilled_prefix(20012, 42, "Ella", 4200, usable, 13);
+        let (cell, p, local, serials) = synth_spilled_prefix(20012, 42, "Ella", 4200, usable, 13);
         assert!(p > usable - 35, "this record must spill");
         // Place the cell inside a larger scanned slice at a nonzero offset.
         let off = 50usize;
@@ -3848,11 +3857,8 @@ mod tests {
     fn spilled_recognizer_abstains_for_in_page_payload() {
         let usable = 4096usize;
         // A small (in-page) payload: the existing carve path owns it.
-        let (cell, p, _local, _s) = {
-            // header (3 serials) + body for a tiny code -> P <= usable-35.
-            let r = synth_spilled_prefix(7, 1, "Bob", 10, usable, 9);
-            r
-        };
+        // header (3 serials) + body for a tiny code -> P <= usable-35.
+        let (cell, p, _local, _s) = synth_spilled_prefix(7, 1, "Bob", 10, usable, 9);
         assert!(p <= usable - 35, "this record must NOT spill");
         assert!(try_carve_spilled_cell_at(&cell, 0, usable, Some(3)).is_none());
     }
@@ -3860,8 +3866,7 @@ mod tests {
     #[test]
     fn spilled_recognizer_abstains_on_truncated_pointer() {
         let usable = 4096usize;
-        let (cell, _p, _local, _s) =
-            synth_spilled_prefix(20012, 42, "Ella", 4200, usable, 13);
+        let (cell, _p, _local, _s) = synth_spilled_prefix(20012, 42, "Ella", 4200, usable, 13);
         // Drop the final 2 bytes so the 4-byte overflow pointer is out of bounds.
         let truncated = &cell[..cell.len() - 2];
         assert!(try_carve_spilled_cell_at(truncated, 0, usable, Some(3)).is_none());
@@ -3870,8 +3875,7 @@ mod tests {
     #[test]
     fn spilled_recognizer_abstains_on_column_mismatch() {
         let usable = 4096usize;
-        let (cell, _p, _local, _s) =
-            synth_spilled_prefix(20012, 42, "Ella", 4200, usable, 13);
+        let (cell, _p, _local, _s) = synth_spilled_prefix(20012, 42, "Ella", 4200, usable, 13);
         // Expect 5 columns but the record has 3.
         assert!(try_carve_spilled_cell_at(&cell, 0, usable, Some(5)).is_none());
         // Inferred (None) still recognizes it.
@@ -3881,8 +3885,7 @@ mod tests {
     #[test]
     fn spilled_recognizer_abstains_on_nonpositive_rowid() {
         let usable = 4096usize;
-        let (cell, _p, _local, _s) =
-            synth_spilled_prefix(0, 42, "Ella", 4000, usable, 13);
+        let (cell, _p, _local, _s) = synth_spilled_prefix(0, 42, "Ella", 4000, usable, 13);
         assert!(try_carve_spilled_cell_at(&cell, 0, usable, Some(3)).is_none());
     }
 
@@ -3940,7 +3943,8 @@ mod tests {
         assert_eq!(leaves, [3u32, 4, 5].into_iter().collect());
         assert_eq!(trunks, [2u32].into_iter().collect());
         // The legacy combined accessor still returns leaves ++ trunk.
-        let all: std::collections::BTreeSet<u32> = db.freelist_pages().unwrap().into_iter().collect();
+        let all: std::collections::BTreeSet<u32> =
+            db.freelist_pages().unwrap().into_iter().collect();
         assert_eq!(all, [2u32, 3, 4, 5].into_iter().collect());
     }
 
@@ -4176,9 +4180,7 @@ mod tests {
         let recovered = db.carve_overflow_template_records(page2);
         let (cell, chain) = recovered
             .iter()
-            .find(|(c, _)| {
-                matches!(c.values.get(1), Some(Value::Text(t)) if t == "Zoe")
-            })
+            .find(|(c, _)| matches!(c.values.get(1), Some(Value::Text(t)) if t == "Zoe"))
             .expect("synthetic clobbered spilled cell must reconstruct");
         // rowid destroyed by the freeblock clobber -> surfaced as 0.
         assert_eq!(cell.rowid, 0);
@@ -4196,5 +4198,187 @@ mod tests {
         assert!(recovered
             .iter()
             .all(|(c, _)| !matches!(c.values.get(1), Some(Value::Text(t)) if t == "Zoe")));
+    }
+
+    #[test]
+    fn enc_varint_into_round_trips_zero_and_multibyte() {
+        // Zero -> single 0 byte (the NULL-serial / empty-header path).
+        assert_eq!(enc_varint_into(0), vec![0]);
+        assert_eq!(varint_len(0), 1);
+        // Multi-byte: 8413 -> 2-byte varint; round-trips via read_varint.
+        let v = enc_varint_into(8413);
+        assert_eq!(varint_len(8413), v.len());
+        assert_eq!(read_varint(&v, 0).unwrap(), (8413, v.len()));
+        // Negative input (illegal serial) treated as 1 byte (defensive).
+        assert_eq!(varint_len(-1), 1);
+    }
+
+    /// Build a 4096-byte-page DB with an allocated table-leaf page 2 holding an
+    /// **intact-prefix** spilled cell in its unallocated gap, with the overflow
+    /// chain on a freed leaf page (page 4). Mirrors the real 0E geometry so
+    /// `carve_overflow_records` (and its fragment dual) can be unit-covered without
+    /// the corpus. `break_chain` routes the pointer at the freelist trunk.
+    fn synth_gap_spill_db(break_chain: bool, code_len: usize, name: &str) -> Vec<u8> {
+        let ps = 4096usize;
+        let usable = ps;
+        let mut b = synth_db(ps, 6, 3, 2);
+        write_trunk(&mut b, ps, 3, 0, &[4, 5]);
+        let base2 = ps;
+
+        // Record: (id INTEGER 1-byte, name TEXT, code TEXT) spilled.
+        let serials: [i64; 3] = [1, 13 + 2 * name.len() as i64, 13 + 2 * code_len as i64];
+        let mut serial_bytes = Vec::new();
+        for &s in &serials {
+            serial_bytes.extend(enc_varint(s as u64));
+        }
+        let mut header_len = serial_bytes.len() + 1;
+        while enc_varint(header_len as u64).len() + serial_bytes.len() != header_len {
+            header_len += 1;
+        }
+        let mut payload = enc_varint(header_len as u64);
+        payload.extend(&serial_bytes);
+        payload.push(9u8); // id body
+        payload.extend(name.as_bytes());
+        payload.extend(std::iter::repeat_n(b'C', code_len));
+        let payload_len = payload.len();
+        let local = local_payload_len(payload_len, usable);
+        let remaining = payload_len - local;
+
+        // Spilled cell at gap offset 1500 on page 2 (intact prefix).
+        let spill_off = 1500usize;
+        let mut cell = enc_varint(payload_len as u64);
+        cell.extend(enc_varint(5u64)); // rowid 5
+        cell.extend(&payload[..local]);
+        let first = if break_chain { 3u32 } else { 4u32 };
+        cell.extend(first.to_be_bytes());
+        b[base2 + spill_off..base2 + spill_off + cell.len()].copy_from_slice(&cell);
+
+        // Page-2 leaf header: 0 live cells, content area at 100 so the gap [8,100..]
+        // is scanned. No live cells keeps free_regions = the whole content area.
+        b[base2] = 0x0d;
+        b[base2 + 1] = 0; // first freeblock = 0
+        b[base2 + 2] = 0;
+        b[base2 + 3..base2 + 5].copy_from_slice(&0u16.to_be_bytes()); // 0 cells
+        b[base2 + 5..base2 + 7].copy_from_slice(&8u16.to_be_bytes()); // cca low
+
+        // Chain content on freed leaf page 4.
+        write_overflow(&mut b, ps, 4, 0, &payload[local..local + remaining]);
+        b
+    }
+
+    #[test]
+    fn carve_overflow_records_resolves_gap_spill() {
+        let db = Database::open(synth_gap_spill_db(false, 4200, "Nora")).unwrap();
+        let page2 = db.raw_page(2).unwrap();
+        let recovered = db.carve_overflow_records(page2);
+        let (cell, chain) = recovered
+            .iter()
+            .find(|(c, _)| matches!(c.values.get(1), Some(Value::Text(t)) if t == "Nora"))
+            .expect("gap-resident spilled cell must resolve to a full row");
+        assert_eq!(cell.rowid, 5);
+        assert!(matches!(cell.values.get(2), Some(Value::Text(t)) if t.len() == 4200));
+        assert_eq!(chain, &vec![4u32]);
+        // Graded below the in-page full-row tier (0.9 * factor).
+        assert!(cell.confidence < 0.72);
+        // Non-leaf page yields nothing; empty slice yields nothing.
+        assert!(db.carve_overflow_records(&[0x05u8; 4096]).is_empty());
+        assert!(db.carve_overflow_records(&[]).is_empty());
+    }
+
+    #[test]
+    fn carve_overflow_records_rejects_trunk_chain() {
+        let db = Database::open(synth_gap_spill_db(true, 4200, "Nora")).unwrap();
+        let page2 = db.raw_page(2).unwrap();
+        // Chain routed at the trunk -> no full row.
+        assert!(db
+            .carve_overflow_records(page2)
+            .iter()
+            .all(|(c, _)| !matches!(c.values.get(1), Some(Value::Text(t)) if t == "Nora")));
+    }
+
+    #[test]
+    fn stale_leaf_chain_with_invalid_utf8_is_rejected() {
+        // NEGATIVE test (the stale-leaf residual): a chain page that IS a freelist
+        // leaf and assembles to the exact declared length, but whose content is
+        // unrelated bytes (invalid UTF-8 in the TEXT column). The freelist-leaf
+        // requirement passes; the strict-UTF-8 extra-signal gate rejects it from
+        // Tier-1. This documents the design's limit (Codex ruling #2): the leaf
+        // requirement cannot prove the bytes are the record — only the UTF-8 gate
+        // catches the cases the lossy decoder would otherwise mask.
+        let ps = 4096usize;
+        let usable = ps;
+        let mut b = synth_db(ps, 6, 3, 2);
+        write_trunk(&mut b, ps, 3, 0, &[4, 5]);
+        let base2 = ps;
+        let name = "Stale";
+        let code_len = 4200usize;
+        let serials: [i64; 3] = [1, 13 + 2 * name.len() as i64, 13 + 2 * code_len as i64];
+        let mut serial_bytes = Vec::new();
+        for &s in &serials {
+            serial_bytes.extend(enc_varint(s as u64));
+        }
+        let mut header_len = serial_bytes.len() + 1;
+        while enc_varint(header_len as u64).len() + serial_bytes.len() != header_len {
+            header_len += 1;
+        }
+        let mut payload = enc_varint(header_len as u64);
+        payload.extend(&serial_bytes);
+        payload.push(9u8);
+        payload.extend(name.as_bytes());
+        payload.extend(std::iter::repeat_n(b'C', code_len));
+        let payload_len = payload.len();
+        let local = local_payload_len(payload_len, usable);
+        let remaining = payload_len - local;
+
+        let spill_off = 1500usize;
+        let mut cell = enc_varint(payload_len as u64);
+        cell.extend(enc_varint(5u64));
+        cell.extend(&payload[..local]);
+        cell.extend(4u32.to_be_bytes());
+        b[base2 + spill_off..base2 + spill_off + cell.len()].copy_from_slice(&cell);
+        b[base2] = 0x0d;
+        b[base2 + 3..base2 + 5].copy_from_slice(&0u16.to_be_bytes());
+        b[base2 + 5..base2 + 7].copy_from_slice(&8u16.to_be_bytes());
+
+        // Stale leaf content: invalid UTF-8 (0xff bytes) where the TEXT body lands.
+        let stale = vec![0xffu8; remaining];
+        write_overflow(&mut b, ps, 4, 0, &stale);
+
+        let db = Database::open(b).unwrap();
+        let page2 = db.raw_page(2).unwrap();
+        // Decodes mechanically (the leaf assembles exactly), but the strict-UTF-8
+        // gate rejects it -> NOT a Tier-1 full row.
+        assert!(db.carve_overflow_records(page2).is_empty());
+    }
+
+    #[test]
+    fn carve_overflow_fragments_salvages_broken_gap_spill() {
+        // Broken chain (trunk) -> the local prefix (id + name) salvages as a fragment.
+        let db = Database::open(synth_gap_spill_db(true, 4200, "Nora")).unwrap();
+        let page2 = db.raw_page(2).unwrap();
+        let frags = db.carve_overflow_fragments(page2);
+        let f = frags
+            .iter()
+            .find(|f| {
+                f.surviving
+                    .iter()
+                    .any(|(_, v)| matches!(v, Value::Text(t) if t == "Nora"))
+            })
+            .expect("broken-chain gap spill must salvage a fragment");
+        // id (col 0) survives locally too.
+        assert!(f
+            .surviving
+            .iter()
+            .any(|(i, v)| *i == 0 && matches!(v, Value::Integer(9))));
+        // An intact chain produces NO fragment (it is a full row instead).
+        let ok = Database::open(synth_gap_spill_db(false, 4200, "Nora")).unwrap();
+        let ok_page = ok.raw_page(2).unwrap();
+        assert!(ok.carve_overflow_fragments(ok_page).iter().all(|f| !f
+            .surviving
+            .iter()
+            .any(|(_, v)| matches!(v, Value::Text(t) if t == "Nora"))));
+        // Non-leaf / empty inputs yield nothing.
+        assert!(db.carve_overflow_fragments(&[0x05u8; 4096]).is_empty());
+        assert!(db.carve_overflow_fragments(&[]).is_empty());
     }
 }

@@ -26,15 +26,16 @@ regenerate its table). Corpus and oracle provenance are in
   through the change. fqlite also holds 0; undark does **not** — on `0D` it
   re-reads **56** live rows as deleted (precision 0.091) and on `0E` **27**
   (precision 0.333).
-- **On overflow (`0E`) we lead on substrate recall (1.000 vs fqlite 0.667) at
-  precision 1.000.** On `0D` (deleted then overwritten) ours and fqlite both
-  recover **every** row whose full identity still survives — substrate recall
-  1.000, precision 1.000 — against an honest contiguous full-row denominator of 19
-  (the other ~26 of 45 deleted rows were destroyed by later overwrites). The `0E`
-  denominator is likewise honest (3 of 12: most overflow bodies that survive do so
-  in-page and contiguously; the few that genuinely spill to an overflow-page chain
-  are conservatively excluded). On `0C` ours now leads on recall as well as
-  precision.
+- **On `0D` (deleted then overwritten), ours and fqlite both recover every row
+  whose full identity still survives** — substrate recall 1.000, precision 1.000 —
+  against an honest contiguous full-row denominator of 19 (the other ~26 of 45
+  deleted rows were destroyed by later overwrites; **end-to-end** recall is 0.422).
+- **Overflow (`0E`) is a weakness, not a win.** The contiguous substrate is tiny —
+  only 3 of 12 deleted rows survive in-page and contiguously (the rest genuinely
+  spill to an overflow-page chain and are conservatively excluded; chain-aware
+  overflow recovery is future work). On that 3-row substrate ours recovers 3/3 to
+  fqlite's 1/3, but **end-to-end `0E` recall is only 0.250** — overflow records are
+  mostly not recovered. On `0C` ours now leads on recall as well as precision.
 - **The mechanism**: when SQLite frees an in-page cell it overwrites the cell's
   first four bytes (payload-length + rowid varints, the record `header_len`, and
   the leading serial type) with the freeblock header. `reconstruct_freeblock_records`
@@ -151,18 +152,20 @@ committed CSV/PNG were produced by that oracle run; `FQLITE_TAP` =
   part of the recoverable substrate.)
 - **Overflow (`0E`): ours leads — substrate recall 1.000 at precision 1.000.**
   Against the honest denominator (3 of the 12 deleted overflow rows survive
-  in-page and contiguously), our carver recovers all 3 with no false positive.
-  undark ties on substrate recall (3/3) but re-reads **27** live rows (precision
-  0.333); fqlite recovers 2 of 3 (recall 0.667) and emits phantoms (precision
-  0.500). (Freeblock reconstruction adds nothing on `0E` — these records spill to
-  overflow, so the residue is not a simple in-page freeblock.)
+  in-page and contiguously; **end-to-end `0E` recall is therefore only 0.250**),
+  our carver recovers all 3 with no false positive. undark also recovers 3/3 on the
+  substrate but re-reads **27** live rows (precision 0.333); fqlite recovers 1 of
+  the 3 (substrate recall 0.333) and emits phantoms (precision 0.500). (Freeblock
+  reconstruction adds nothing on `0E` — these records spill to overflow, so the
+  residue is not a simple in-page freeblock.)
 
 The consistent picture (per the committed oracle run): **our carver leads fqlite
 on in-page recall (`0C`, 0.833 vs 0.798) while keeping the highest precision of all
-three tools on every category and never re-reading a live row; it leads on overflow
-(`0E`, substrate recall 1.000 vs fqlite 0.667) and matches fqlite on overwritten
-records (`0D`) — both recover every row whose full identity survives, at precision
-1.000; undark trails on precision throughout and over-reports live rows as
+three tools on every category and never re-reading a live row; it matches fqlite on
+overwritten records (`0D`) — both recover every row whose full identity survives, at
+precision 1.000. On the tiny `0E` overflow substrate (3 rows) ours recovers 3/3 to
+fqlite's 1/3, but end-to-end `0E` recall (0.250) makes overflow a weakness, not a
+claim; undark trails on precision throughout and over-reports live rows as
 deleted.**
 
 ### Live `sqlite_master` re-reads — a precision artifact, measured per tool
@@ -336,9 +339,10 @@ GPL tool's source.
 - They claim an **honest, reproducible measurement** of all three tools against
   *this* independent corpus (per the committed oracle run): our carver leads fqlite
   on in-page recall (`0C`) at the highest precision of the three and never re-reads
-  a live row; it leads on overflow (`0E`, substrate recall 1.000 vs fqlite 0.667)
-  and matches fqlite on overwritten records (`0D`), where both recover every row
-  whose full identity survives; undark trails on precision and over-reports live
+  a live row; it matches fqlite on overwritten records (`0D`), where both recover
+  every row whose full identity survives; on the tiny `0E` overflow substrate ours
+  recovers 3/3 to fqlite's 1/3, though end-to-end `0E` recall (0.250) marks overflow
+  a weakness; undark trails on precision and over-reports live
   rows as deleted on the overwritten and overflow tables.
 - They do **not** claim our carver is "best" overall. On `0D` end-to-end, fqlite's
   cross-tool `(col1,col2)` projection counts **20** TPs to our 19 (against a

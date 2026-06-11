@@ -277,7 +277,17 @@ of `docs/recovery-comparison.md`.
 - Ground-truth manifest `tests/data/nemetz/nemetz_ground_truth.json` is generated
   from the `.xml` answer keys by the committed
   `tests/data/nemetz/gen_ground_truth.py`; the harness reads the manifest, never
-  the `.xml` at test time.
+  the `.xml` at test time. The generator's `substrate_recoverable` rule now decides
+  the **overflow** class via `chain_followable` (task #73): a deleted overflow row
+  counts as recoverable iff its freed overflow chain is followable through freelist
+  leaves to a byte-exact reassembly of the expected payload (pure-bytes, independent
+  of our carver). Regenerate with `python3 tests/data/nemetz/gen_ground_truth.py`.
+- **In-code synthetic fixtures (no committed files)** for chain-aware overflow
+  recovery (task #73): `synth_db` / `synth_spilled_prefix` / `synth_clobbered_spill_db`
+  in `core/src/lib.rs` (test module) build minimal multi-page images (intact-prefix
+  spilled cells, freed leaf/trunk chains, and the freeblock-clobbered-spill case that
+  has NO corpus instance — `SYNTHETIC`, unproven-by-corpus). They produce no
+  `tests/data/` artifacts; the builders are the generator of record.
 
 ## §J `tests/data/wal_carve.db` + `…-wal`  (WAL-frame deleted-residue carving)
 

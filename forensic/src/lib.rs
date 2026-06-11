@@ -332,6 +332,18 @@ pub struct WalProvenance {
     pub salt2: u32,
 }
 
+/// Provenance for a record reassembled across an **overflow-page chain** (task
+/// #73): the pages whose bytes were concatenated to recover the row. An examiner
+/// citing the row as evidence can name exactly where its bytes came from. Present
+/// only on chain-reassembled rows; `None` for every contiguous recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverflowProvenance {
+    /// First overflow page of the chain (the page the local-prefix pointer named).
+    pub first_page: u32,
+    /// Ordered overflow pages whose content was assembled into the payload.
+    pub chain: Vec<u32>,
+}
+
 /// A deleted record recovered from unallocated space — the headline capability
 /// rusqlite cannot provide. Carries the decoded row plus provenance so the
 /// examiner can weigh it as a "consistent with a deleted row" observation.
@@ -356,6 +368,9 @@ pub struct CarvedRecord {
     /// [`RecoverySource::WalFrame`] records (the frame the residue was carved
     /// from); `None` for every on-disk class.
     pub wal: Option<WalProvenance>,
+    /// Overflow-chain provenance, present **only** for rows reassembled across a
+    /// freed overflow-page chain (task #73); `None` for every contiguous recovery.
+    pub overflow: Option<OverflowProvenance>,
 }
 
 /// A **Tier-2 partial recovery**: a freed cell whose full row could not be
@@ -436,6 +451,7 @@ pub fn carve_deleted_records(db: &Database, column_count: usize) -> Vec<CarvedRe
                 allocated: false,
                 source: RecoverySource::FreelistPage,
                 wal: None,
+                overflow: None,
             });
         }
     }
@@ -491,6 +507,7 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
                     allocated: false,
                     source,
                     wal: None,
+                    overflow: None,
                 });
             }
         }
@@ -512,6 +529,7 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
                 allocated: false,
                 source: RecoverySource::InPageFreeBlock,
                 wal: None,
+                overflow: None,
             });
         }
         // (2b) Freeblock reconstruction: the freed cells whose first four bytes
@@ -529,6 +547,45 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
                 allocated: false,
                 source: RecoverySource::FreeblockReconstructed,
                 wal: None,
+                overflow: None,
+            });
+        }
+        // (2c) Chain-aware overflow recovery (task #73): a freed cell whose
+        // payload spilled onto an overflow-page chain, reassembled when every
+        // chain page survives as a freelist leaf. Graded below the in-page
+        // full-row tier (NOT part of the structural 0-FP guarantee — Codex
+        // ruling #1); a broken chain (e.g. a trunk-clobbered page) is rejected
+        // here and degrades to a Tier-2 fragment elsewhere.
+        for (cell, chain) in db.carve_overflow_records(page_bytes) {
+            let first_page = chain.first().copied().unwrap_or(0);
+            out.push(CarvedRecord {
+                page,
+                offset: cell.offset,
+                rowid: cell.rowid,
+                values: cell.values,
+                confidence: cell.confidence,
+                allocated: false,
+                source: RecoverySource::InPageFreeBlock,
+                wal: None,
+                overflow: Some(OverflowProvenance { first_page, chain }),
+            });
+        }
+        // (2d) Freeblock-clobbered spilled cells (task #73, Codex ruling #5;
+        // UNPROVEN-BY-CORPUS — synthetic validation only). A spilled cell whose
+        // prefix was also freeblock-clobbered: P re-derived from the surviving
+        // serial array, chain resolved through freelist leaves, rowid destroyed.
+        for (cell, chain) in db.carve_overflow_template_records(page_bytes) {
+            let first_page = chain.first().copied().unwrap_or(0);
+            out.push(CarvedRecord {
+                page,
+                offset: cell.offset,
+                rowid: cell.rowid,
+                values: cell.values,
+                confidence: cell.confidence,
+                allocated: false,
+                source: RecoverySource::FreeblockReconstructed,
+                wal: None,
+                overflow: Some(OverflowProvenance { first_page, chain }),
             });
         }
     }
@@ -576,6 +633,7 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
                 allocated: false,
                 source: RecoverySource::WalFrame,
                 wal: Some(prov),
+                overflow: None,
             });
         }
     }
@@ -681,6 +739,22 @@ pub fn carve_with_fragments(db: &Database) -> CarveTiers {
                 missing: frag.missing,
                 confidence: frag.confidence,
                 source: RecoverySource::FreeblockReconstructed,
+                wal: None,
+            });
+        }
+        // Broken-chain overflow fragments (task #73, Codex ruling #4): a spilled
+        // cell whose overflow chain was destroyed (e.g. a trunk-clobbered chain
+        // page) still has an intact local prefix; salvage its locally-decodable
+        // columns. The chain-resident columns are lost (untrusted), so this is a
+        // Tier-2 lead, never a full row.
+        for frag in db.carve_overflow_fragments(page_bytes) {
+            fragments.push(CarvedFragment {
+                page,
+                offset: frag.offset,
+                surviving: frag.surviving,
+                missing: frag.missing,
+                confidence: frag.confidence,
+                source: RecoverySource::InPageFreeBlock,
                 wal: None,
             });
         }
@@ -794,6 +868,7 @@ pub fn carve_at_commit(db: &Database, timeline: &WalTimeline, id: CommitId) -> V
                 allocated: false,
                 source: RecoverySource::CommitSnapshot,
                 wal: Some(prov),
+                overflow: None,
             });
         }
     }

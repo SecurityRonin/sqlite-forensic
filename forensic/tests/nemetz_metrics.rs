@@ -551,3 +551,176 @@ fn fragment_substrate_denominators_match_manifest() {
         "0C fragment-recoverable total"
     );
 }
+
+// 0D fragment-TP floor measured by the harness: of the 5 fragment-recoverable 0D
+// rows, the on-disk freeblock-fragment extractor reaches the genuine "Anja"
+// partial row on 0D-01 (id 20004). The other 4 survive only inside live-cell
+// extents the carver must never scan, or at offsets no freeblock/gap anchor
+// walks — so fragment recall < 1.0 is expected and honest (see
+// docs/recovery-comparison.md). Raising it by an overflow-chain or template-free
+// salvage is future work; this floor pins the current honest yield.
+const NEMETZ_0D_FRAGMENT_TP_FLOOR: usize = 2;
+// 0E fragment-TP floor: 0E fragment substrate is long TEXT split across overflow
+// pages, unreachable by flat contiguity in v1 — measured yield is 0.
+const NEMETZ_0E_FRAGMENT_TP_FLOOR: usize = 0;
+// Fragment false-positive ceiling across the whole recall corpus: a fragment
+// whose distinctive cells match NO deleted row and NO live row is a
+// fragment-phantom. The Tier-2 mechanism PERMITS a non-zero rate (a lone
+// surviving cell can be a coincidental byte run) — that is why fragments are
+// opt-in — but on this corpus the measured count is 0.
+const NEMETZ_FRAGMENT_FP_CEILING: usize = 0;
+
+/// One database's fragment confusion counts.
+struct FragMatrix {
+    tp: usize,
+    phantom_fp: usize,
+    live_reread: usize,
+}
+
+/// Whether a fragment's surviving distinctive cells equal the corresponding
+/// columns of some normalized answer-key row (the per-cell key mirrors
+/// `carved_key`: integers decimal, reals 5dp, text verbatim).
+fn fragment_matches_any(rows: &BTreeSet<String>, frag: &sqlite_forensic::CarvedFragment) -> bool {
+    rows.iter().any(|d| {
+        let dcells: Vec<&str> = d.split('\u{1f}').collect();
+        frag.surviving.iter().all(|(i, v)| {
+            let s = match v {
+                Value::Integer(n) => n.to_string(),
+                Value::Real(r) => format!("{r:.5}"),
+                Value::Text(t) => t.clone(),
+                Value::Null => String::new(),
+                Value::Blob(_) => "\u{0}<blob>".to_string(),
+            };
+            dcells.get(*i).copied() == Some(s.as_str())
+        })
+    })
+}
+
+fn frag_matrix_for(nid: &str, db: &Database) -> FragMatrix {
+    let mut deleted: BTreeSet<String> = BTreeSet::new();
+    let mut alive: BTreeSet<String> = BTreeSet::new();
+    for el in manifest().db(nid).elements() {
+        for row in el.deleted() {
+            deleted.insert(normalize_row(row.cells()));
+        }
+        for row in el.alive() {
+            alive.insert(normalize_row(row));
+        }
+    }
+    let tiers = sqlite_forensic::carve_with_fragments(db);
+    let mut m = FragMatrix {
+        tp: 0,
+        phantom_fp: 0,
+        live_reread: 0,
+    };
+    for frag in &tiers.fragments {
+        if fragment_matches_any(&deleted, frag) {
+            m.tp += 1;
+        } else if fragment_matches_any(&alive, frag) {
+            m.live_reread += 1;
+        } else {
+            m.phantom_fp += 1;
+        }
+    }
+    m
+}
+
+fn frag_matrices() -> Vec<(String, String, FragMatrix)> {
+    let mut out = Vec::new();
+    for (nid, category) in manifest().databases() {
+        let path = format!(
+            "{}/../tests/data/nemetz/{category}/{nid}.db",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        if !Path::new(&path).exists() {
+            continue;
+        }
+        let db = Database::open(std::fs::read(&path).unwrap()).unwrap();
+        out.push((nid.clone(), category, frag_matrix_for(&nid, &db)));
+    }
+    out
+}
+
+/// Fragment YIELD (Tier-2 true positives) meets the measured per-category floor.
+#[test]
+fn fragment_yield_meets_floor() {
+    let mats = frag_matrices();
+    let tp_0d: usize = mats
+        .iter()
+        .filter(|(_, c, _)| c == "0D")
+        .map(|(_, _, m)| m.tp)
+        .sum();
+    let tp_0e: usize = mats
+        .iter()
+        .filter(|(_, c, _)| c == "0E")
+        .map(|(_, _, m)| m.tp)
+        .sum();
+    assert!(
+        tp_0d >= NEMETZ_0D_FRAGMENT_TP_FLOOR,
+        "0D fragment-TP {tp_0d} < floor {NEMETZ_0D_FRAGMENT_TP_FLOOR}"
+    );
+    assert!(
+        tp_0e >= NEMETZ_0E_FRAGMENT_TP_FLOOR,
+        "0E fragment-TP {tp_0e} < floor {NEMETZ_0E_FRAGMENT_TP_FLOOR}"
+    );
+}
+
+/// Fragment FALSE-POSITIVE rate stays within the measured ceiling — separately
+/// measured and reported (it is expected non-zero in general; on this corpus 0).
+#[test]
+fn fragment_fp_within_ceiling() {
+    let total_fp: usize = frag_matrices()
+        .iter()
+        .map(|(_, _, m)| m.phantom_fp + m.live_reread)
+        .sum();
+    assert!(
+        total_fp <= NEMETZ_FRAGMENT_FP_CEILING,
+        "fragment FP {total_fp} > ceiling {NEMETZ_FRAGMENT_FP_CEILING}"
+    );
+}
+
+/// Tier separation: `carve_all_deleted_records(db) == carve_with_fragments(db).full`
+/// on EVERY corpus DB — the load-bearing Tier-1 regression gate.
+#[test]
+fn full_tier_equals_carve_all_on_every_corpus_db() {
+    for (nid, category) in manifest().databases() {
+        let path = format!(
+            "{}/../tests/data/nemetz/{category}/{nid}.db",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        if !Path::new(&path).exists() {
+            continue;
+        }
+        let db = Database::open(std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            carve_all_deleted_records(&db),
+            sqlite_forensic::carve_with_fragments(&db).full,
+            "{nid}: full tier diverged from carve_all_deleted_records"
+        );
+    }
+}
+
+/// No fragment's surviving set equals the column-projection of any `full` record
+/// (suppression layer 2 works) on every corpus DB.
+#[test]
+fn no_fragment_shadows_a_full_record_on_corpus() {
+    for (nid, category) in manifest().databases() {
+        let path = format!(
+            "{}/../tests/data/nemetz/{category}/{nid}.db",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        if !Path::new(&path).exists() {
+            continue;
+        }
+        let db = Database::open(std::fs::read(&path).unwrap()).unwrap();
+        let tiers = sqlite_forensic::carve_with_fragments(&db);
+        for frag in &tiers.fragments {
+            let shadow = tiers.full.iter().any(|rec| {
+                frag.surviving
+                    .iter()
+                    .all(|(i, v)| rec.values.get(*i) == Some(v))
+            });
+            assert!(!shadow, "{nid}: fragment shadows a full record");
+        }
+    }
+}

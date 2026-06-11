@@ -855,6 +855,67 @@ impl Database {
         Some((cell, chain))
     }
 
+    /// Tier-2 salvage for **spilled** cells whose overflow chain is broken (task
+    /// #73, Codex ruling #4): when [`Database::carve_overflow_records`] rejects a
+    /// recognized spilled cell because its chain failed (a trunk-clobbered or
+    /// reused chain page), the cell's intact LOCAL prefix still holds the columns
+    /// whose bodies fit entirely on the leaf page. Those are salvaged as a
+    /// [`CellFragment`] — the same Tier-2 surface freeblock reconstruction uses.
+    ///
+    /// Only columns whose body lies wholly within the local payload are kept; the
+    /// chain-resident columns are lost (untrusted by definition — the chain that
+    /// would supply them is the thing that failed). A fragment is emitted only
+    /// when the salvaged prefix carries ≥ 1 distinctive cell (TEXT ≥ 4 bytes of
+    /// valid UTF-8, or REAL — the §3.1 gate), so a lone integer prefix never
+    /// anchors one. Bounded and panic-free.
+    #[must_use]
+    pub fn carve_overflow_fragments(&self, page_bytes: &[u8]) -> Vec<CellFragment> {
+        let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
+            SQLITE_HEADER_SIZE
+        } else {
+            0
+        };
+        let Some(&page_type) = page_bytes.get(hdr_off) else {
+            return Vec::new();
+        };
+        if page_type != 0x0d {
+            return Vec::new();
+        }
+        let Ok((freed_leaves, _trunks)) = self.freelist_pages_split() else {
+            return Vec::new();
+        };
+        let usable = self.header.usable_size() as usize;
+
+        let mut out = Vec::new();
+        let regions = self.free_regions_of_leaf(page_bytes, hdr_off);
+        for (lo, hi) in regions {
+            let Some(region) = page_bytes.get(lo..hi) else {
+                continue; // cov:unreachable: free_regions yields in-bounds spans
+            };
+            let mut off = 0usize;
+            while off < region.len() {
+                let Some(sc) = try_carve_spilled_cell_at(region, off, usable, None) else {
+                    off += 1;
+                    continue;
+                };
+                // Only broken chains degrade to a fragment — an intact chain is a
+                // Tier-1 row (handled by carve_overflow_records), never both.
+                let remaining = sc.payload_len.saturating_sub(sc.local_len);
+                let chain_ok = self
+                    .read_freed_overflow_chain(sc.first_overflow, remaining, usable, &freed_leaves)
+                    .is_ok();
+                if !chain_ok {
+                    if let Some(mut frag) = salvage_local_prefix(region, &sc) {
+                        frag.offset += lo;
+                        out.push(frag);
+                    }
+                }
+                off += sc.byte_len.max(1);
+            }
+        }
+        out
+    }
+
     /// Reconstruct deleted records from the **freeblock chain** of an allocated
     /// table-leaf page (type `0x0d`) — the records a forward parse cannot recover
     /// because their first four bytes were destroyed by freeblock conversion.
@@ -2756,6 +2817,56 @@ fn try_carve_spilled_cell_at(
         local_len,
         local_payload_off: payload_start,
         first_overflow,
+    })
+}
+
+/// Salvage the columns of a recognized [`SpilledCell`] whose bodies lie wholly
+/// within the local payload (task #73, Codex ruling #4): the chain-resident
+/// columns are dropped (the chain that would supply them failed), and the
+/// surviving local columns become a [`CellFragment`]. Returns `None` unless the
+/// salvaged prefix carries ≥ 1 distinctive cell (the §3.1 emission gate). The
+/// returned fragment's `offset` is region-local; the caller translates it.
+fn salvage_local_prefix(region: &[u8], sc: &SpilledCell) -> Option<CellFragment> {
+    // The body begins right after the local header; decode each column while its
+    // body ends within the local payload bytes (`local_payload_off + local_len`).
+    let local_end = sc.local_payload_off.checked_add(sc.local_len)?;
+    // Recompute the record header length to find where the body starts.
+    let (header_len, _hn) = read_varint(region, sc.local_payload_off).ok()?;
+    let header_len = usize::try_from(header_len).ok()?;
+    let mut bpos = sc.local_payload_off.checked_add(header_len)?;
+
+    let mut surviving: Vec<(usize, Value)> = Vec::new();
+    for (idx, &serial) in sc.serials.iter().enumerate() {
+        let Some(blen) = serial_body_len(serial) else {
+            break; // cov:unreachable: recognizer accepted only legal serials
+        };
+        let Some(body_end) = bpos.checked_add(blen) else {
+            break; // cov:unreachable: usize add of an in-page body length
+        };
+        if body_end > local_end {
+            break; // this column's body spills into the chain — local prefix ends
+        }
+        let Some(body) = region.get(bpos..body_end) else {
+            break; // cov:unreachable: body_end <= local_end <= region.len()
+        };
+        // Column 0 of a rowid-alias table reads as the rowid when serial 0; here a
+        // spilled cell's id column is a stored integer, so decode it directly.
+        let Ok((val, _)) = decode_value(body, 0, serial) else {
+            break; // cov:unreachable: legal serials decode in-bounds
+        };
+        surviving.push((idx, val));
+        bpos = body_end;
+    }
+
+    if !surviving.iter().any(|(_, v)| is_distinctive(v)) {
+        return None;
+    }
+    Some(CellFragment {
+        offset: sc.offset,
+        byte_len: bpos.saturating_sub(sc.local_payload_off),
+        missing: sc.serials.len() - surviving.len(),
+        surviving,
+        confidence: FRAGMENT_CONFIDENCE,
     })
 }
 

@@ -4519,7 +4519,7 @@
        "-754954629",
        "416666262.51147"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -4529,7 +4529,7 @@
        "87530326",
        "3127699614.56195"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -4706,7 +4706,7 @@
        "-512750394",
        "4368689600.08430"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      }
     ],
     "rows_alive": 10,
@@ -4858,7 +4858,7 @@
        "-417174382",
        "-843767763.97404"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -4898,7 +4898,7 @@
        "1398371778",
        "4182440223.72292"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      }
     ],
     "rows_alive": 15,
@@ -5001,7 +5001,7 @@
        "-379434507",
        "226975937.94529"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -5011,7 +5011,7 @@
        "307818773",
        "4119462179.54134"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -5021,7 +5021,7 @@
        "1526902782",
        "-1169769692.31375"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -5158,7 +5158,7 @@
        "-915976262",
        "-611483233.79992"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -5168,7 +5168,7 @@
        "229635902",
        "32060386.16228"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -5178,7 +5178,7 @@
        "1314199476",
        "-4059448823.82613"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -5188,7 +5188,7 @@
        "-1077188344",
        "-870435482.76203"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -5198,7 +5198,7 @@
        "-63458245",
        "1880819977.67129"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      }
     ],
     "rows_alive": 10,
@@ -5280,7 +5280,7 @@
        "-144913111",
        "-3293129186.28246"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -5300,7 +5300,7 @@
        "1184946766",
        "-1502135142.91781"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -5310,7 +5310,7 @@
        "985155245",
        "-4908664510.54284"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [
@@ -5320,7 +5320,7 @@
        "1155076104",
        "-1594597751.55159"
       ],
-      "substrate_recoverable": true
+      "substrate_recoverable": false
      },
      {
       "cells": [

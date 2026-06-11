@@ -505,31 +505,32 @@ fn f_beta_family_matches_known_values() {
     assert!((f0_5(1.0, 1.0) - 1.0).abs() < 1e-12);
 }
 
-/// fqlite's freeblock-aware reconstruction leads on the clean in-page-deletion
-/// category (0C): it recovers substantially more deleted rows than our
-/// forward-parse carver, which the freeblock-prefix clobber holds back (task #56).
-/// This pins that head-to-head relationship: fqlite's 0C true-positive total
-/// clears a floor far above ours, and exceeds our carver's 0C total.
+/// After span-walking freeblock reconstruction (task #66), OUR carver leads on the
+/// clean in-page-deletion category (0C): it recovers more deleted rows than fqlite
+/// while keeping the higher precision and re-reading no live row. This pins the
+/// current head-to-head relationship — our 0C true-positive total clears a floor
+/// and exceeds fqlite's — which superseded the earlier state (when the
+/// freeblock-prefix clobber held our forward parser back and fqlite led).
 #[test]
-fn fqlite_leads_on_0c_inpage_recall() {
+fn ours_leads_on_0c_inpage_recall() {
     let Some(tap) = fqlite_tap() else {
-        eprintln!("SKIP fqlite_leads_on_0c_inpage_recall: set FQLITE_TAP");
+        eprintln!("SKIP ours_leads_on_0c_inpage_recall: set FQLITE_TAP");
         return;
     };
     let (ours, _u, f) = category_totals("0C", None, Some(tap.as_path()));
     let f = f.expect("fqlite requested");
-    // Measured: fqlite 67 TP on 0C (excl. 06/07) vs ours 23. Pinned as a floor and
+    // Measured: ours 70 TP on 0C (excl. 06/07) vs fqlite 67. Pinned as a floor and
     // a strict-lead relationship, robust to small tap variation.
     assert!(
-        f.matrix.tp >= 60,
-        "fqlite 0C true positives {} fell below the measured floor 60",
-        f.matrix.tp
+        ours.matrix.tp >= 68,
+        "our 0C true positives {} fell below the measured floor 68",
+        ours.matrix.tp
     );
     assert!(
-        f.matrix.tp > ours.matrix.tp,
-        "fqlite ({}) must lead ours ({}) on 0C in-page recall",
-        f.matrix.tp,
-        ours.matrix.tp
+        ours.matrix.tp > f.matrix.tp,
+        "ours ({}) must lead fqlite ({}) on 0C in-page recall",
+        ours.matrix.tp,
+        f.matrix.tp
     );
 }
 

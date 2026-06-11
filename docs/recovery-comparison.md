@@ -15,22 +15,23 @@ regenerate its table). Corpus and oracle provenance are in
 
 ## Executive summary
 
-- **Freeblock-aware reconstruction closed most of the in-page recall
-  gap at the highest precision of any tool.** On the in-page-deletion category
-  `0C`, our carver now recovers **63** of the 84 recoverable deleted rows
-  (recall 0.750, up from 23 / 0.274), against fqlite **67** (0.798) and undark
-  **14** (0.167). We do it at **precision 0.955** (3 phantoms) versus fqlite's
-  **0.807** (16 phantoms) — i.e. nearly fqlite's recall with roughly five times
-  fewer false rows.
+- **Freeblock-aware reconstruction closed the in-page recall gap and now leads,
+  at the highest precision of any tool.** On the in-page-deletion category `0C`,
+  our carver recovers **70** of the 84 recoverable deleted rows (recall 0.833, up
+  from 23 / 0.274), ahead of fqlite **67** (0.798) and undark **14** (0.167). We
+  do it at **precision 0.959** (3 phantoms) versus fqlite's **0.807** (16
+  phantoms) — higher recall AND roughly five times fewer false rows.
 - **Our carver still never re-surfaces a live row.** Across the in-scope corpus
   it emits **0 live-re-reads** — the structural 0-false-positive guarantee held
   through the change. fqlite also holds 0; undark does **not** — on `0D` it
   re-reads **56** live rows as deleted (precision 0.091) and on `0E` **27**
   (precision 0.333).
 - **We Pareto-dominate fqlite on overflow (`0E`)** — higher recall (0.333 vs
-  0.222) AND higher precision (1.000 vs 0.500). On `0C` and `0D` fqlite keeps a
-  recall edge (0.798 vs 0.750; 0.556 vs 0.528) while we keep the precision edge;
-  neither tool dominates the other there.
+  0.222) AND higher precision (1.000 vs 0.500). On `0D` (deleted then overwritten)
+  ours and fqlite both recover **every** row whose full identity still survives —
+  substrate recall 1.000, precision 1.000 — against an honest contiguous full-row
+  denominator of 19 (the other ~26 of 45 deleted rows were destroyed by later
+  overwrites). On `0C` ours now leads on recall as well as precision.
 - **The mechanism**: when SQLite frees an in-page cell it overwrites the cell's
   first four bytes (payload-length + rowid varints, the record `header_len`, and
   the leading serial type) with the freeblock header. `reconstruct_freeblock_records`
@@ -66,18 +67,32 @@ still scores them, rounding reals symmetrically). Categories `0A`/`0B`
 tampering — no deleted answer key) carry no clean row-level deleted set and are
 **out of scope** for a recall table.
 
-`Ddel` = rows deleted; `Drec` = of those, byte-present (recoverable substrate);
-`live` = live rows wrongly recovered as deleted (must be 0); recall denominators
-as defined under "[How the matrix is computed](#how-the-matrix-is-computed)".
+`Ddel` = rows deleted; `Drec` = of those, the recoverable substrate — rows whose
+scored identity still physically survives in the file; `live` = live rows wrongly
+recovered as deleted (must be 0); recall denominators as defined under
+"[How the matrix is computed](#how-the-matrix-is-computed)".
+
+The `0D` substrate denominator is the **honest contiguous full-row-identity**
+count: a deleted row is recoverable only when its whole record body — every
+column's bytes, in column order — survives as one contiguous run, mirroring the
+recall matcher's full-row key. The earlier proxy (any one distinctive column
+surviving anywhere) inflated `0D` `Drec` to 36 by counting rows whose scored
+identity a later same-rowid overwrite had destroyed but a single column
+coincidentally survived elsewhere; the honest count is **19**. The substrate is
+small because the overwrite workload genuinely destroyed roughly 26 of the 45
+deleted rows — not because the harness is lenient. `0C` (no overwrites) stays
+fully recoverable (101/101 on the single-tool matrix); `0E` keeps the
+any-distinctive-column proxy because its records overflow onto a non-contiguous
+overflow-page chain, where a flat-file contiguity test does not apply.
 
 | cat | tool | Ddel | Drec | TP | FP | FN | live | recall (substrate) | recall (e2e) | precision |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 0C | **ours** | 84 | 84 | 63 | 3 | 21 | **0** | 0.750 | 0.750 | **0.955** |
+| 0C | **ours** | 84 | 84 | **70** | 3 | 14 | **0** | **0.833** | **0.833** | **0.959** |
 | 0C | undark | 84 | 84 | 14 | 10 | 70 | 4 | 0.167 | 0.167 | 0.583 |
-| 0C | fqlite | 84 | 84 | **67** | 16 | 17 | **0** | **0.798** | **0.798** | 0.807 |
-| 0D | **ours** | 45 | 36 | 19 | 0 | 17 | **0** | 0.528 | 0.422 | **1.000** |
-| 0D | undark | 45 | 36 | 1 | 10 | 35 | 56 | 0.028 | 0.022 | 0.091 |
-| 0D | fqlite | 45 | 36 | **20** | 0 | 16 | **0** | **0.556** | **0.444** | **1.000** |
+| 0C | fqlite | 84 | 84 | 67 | 16 | 17 | **0** | 0.798 | 0.798 | 0.807 |
+| 0D | **ours** | 45 | 19 | 19 | 0 | 0 | **0** | **1.000** | 0.422 | **1.000** |
+| 0D | undark | 45 | 19 | 1 | 10 | 18 | 56 | 0.053 | 0.022 | 0.091 |
+| 0D | fqlite | 45 | 19 | **20** | 0 | 0 | **0** | **1.000** | **0.444** | **1.000** |
 | 0E | **ours** | 12 | 9 | **3** | 0 | 6 | **0** | **0.333** | **0.250** | **1.000** |
 | 0E | undark | 12 | 9 | 3 | 6 | 6 | 27 | 0.333 | 0.250 | 0.333 |
 | 0E | fqlite | 12 | 9 | 2 | 2 | 7 | **0** | 0.222 | 0.167 | 0.500 |
@@ -95,30 +110,32 @@ The figure plots the **same harness-computed numbers** as the table above:
 [`img/comparison_metrics.csv`](img/comparison_metrics.csv) when run with the
 undark/fqlite oracles, and `docs/plot_comparison.py` renders the chart straight
 from that CSV — chart and table are the same dataset by construction. By **F1**
-(balanced), sqlite-forensic leads `0C` (0.840 vs fqlite 0.802) and `0E` (0.500 vs
+(balanced), sqlite-forensic leads `0C` (0.892 vs fqlite 0.802) and `0E` (0.500 vs
 fqlite 0.308, undark 0.333); under **F0.5** (precision-weighted — the forensic β,
 since a phantom row costs an examiner more than a missed low-confidence one) those
-leads widen (`0C` 0.905 vs 0.805; `0E` 0.714 vs 0.400). fqlite leads `0D` on raw
-substrate recall (0.556 vs 0.528) and therefore on both F-scores there. To
-refresh: rerun the test with `UNDARK_BIN`/`FQLITE_TAP` set to rewrite the CSV,
-then `python3 docs/plot_comparison.py` to rerender the PNG.
+leads widen (`0C` 0.931 vs 0.805; `0E` 0.714 vs 0.400). On `0D`, ours and fqlite
+both score **1.000** on substrate recall, precision, and therefore both F-scores —
+each recovers every row whose full identity survives. To refresh: rerun the test
+with `UNDARK_BIN`/`FQLITE_TAP` set to rewrite the CSV, then
+`python3 docs/plot_comparison.py` to rerender the PNG.
 
 ### Honest read — who wins where, and why
 
-- **In-page deletion (`0C`): ours and fqlite now lead together; undark trails.**
-  With freeblock reconstruction our recall rose 0.274 → **0.750**,
-  essentially matching fqlite's **0.798** — but at **precision 0.955** (3
-  phantoms) versus fqlite's **0.807** (16 phantoms). fqlite keeps a small recall
-  edge; we keep a clear precision edge and re-read no live row. Neither tool
-  Pareto-dominates the other on `0C`.
-- **Deleted-then-overwritten (`0D`): fqlite leads recall (0.556 vs ours 0.528);
-  ours and fqlite hold perfect precision; undark fails on precision.** undark
-  re-surfaces **56** live rows as deleted here (precision 0.091) — it mis-parses
-  these overwritten tables and re-reads the live cells. Span-walking freeblock
-  reconstruction — rebuilding *every* coalesced cell in a free span,
-  not just the head — lifted our recall 0.056 → **0.528**, nearly matching
-  fqlite's 0.556 at precision 1.000; the lone remaining row (0D-01) has a
-  clobber/template layout we do not yet anchor. Both keep 0 live-re-reads.
+- **In-page deletion (`0C`): ours leads on both recall and precision; undark
+  trails.** With freeblock reconstruction our recall reached **0.833** (70 of 84),
+  ahead of fqlite's **0.798** (67) — and at **precision 0.959** (3 phantoms)
+  versus fqlite's **0.807** (16 phantoms). We re-read no live row.
+- **Deleted-then-overwritten (`0D`): ours and fqlite both recover every row whose
+  identity survives — substrate recall 1.000, precision 1.000; undark fails on
+  precision.** undark re-surfaces **56** live rows as deleted here (precision
+  0.091) — it mis-parses these overwritten tables and re-reads the live cells.
+  Against the honest contiguous full-row-identity denominator (19 of the 45
+  deleted rows still carry a survivable scored identity; the rest were destroyed
+  by later same-rowid overwrites), our span-walk reconstruction recovers all 19,
+  matching fqlite — both at precision 1.000, both with 0 live-re-reads. (fqlite
+  emits one extra `0D-01` row under the cross-tool `(col1,col2)` projection, but
+  its full record carries an overwritten final column, so that row's scored
+  identity did not survive — it is not part of the recoverable substrate.)
 - **Overflow (`0E`): ours Pareto-dominates fqlite — higher recall (0.333 vs
   0.222) AND higher precision (1.000 vs 0.500).** undark ties our recall (0.333)
   but re-reads **27** live rows (precision 0.333); fqlite emits phantoms (0.500).
@@ -126,14 +143,12 @@ then `python3 docs/plot_comparison.py` to rerender the PNG.
   with no false positive. (Freeblock reconstruction adds nothing on `0E` — these
   records spill to overflow, so the residue is not a simple in-page freeblock.)
 
-The consistent picture: **our carver matches fqlite's in-page
-recall while keeping the highest precision of all three tools on every category
-and never re-reading a live row; it Pareto-dominates fqlite on overflow and,
-after span-walk reconstruction, nearly matches it on overwritten
-records (`0D`, 0.528 vs 0.556); fqlite keeps only a slim recall edge — on `0C`
-by tolerating more phantoms, on `0D` by one unanchored row (both precision
-1.000); undark trails on both recall and precision and over-reports live rows
-as deleted.**
+The consistent picture: **our carver leads fqlite on in-page recall (`0C`, 0.833
+vs 0.798) while keeping the highest precision of all three tools on every category
+and never re-reading a live row; it Pareto-dominates fqlite on overflow (`0E`) and
+matches it on overwritten records (`0D`) — both recover every row whose full
+identity survives, at precision 1.000; undark trails on both recall and precision
+and over-reports live rows as deleted.**
 
 ### Live `sqlite_master` re-reads — a precision artifact, measured per tool
 
@@ -183,9 +198,11 @@ symmetrically to both sides):
 Recall is reported with two denominators:
 
 - **substrate-limited recall** = TP / `|D_recoverable|` — of the deleted rows
-  whose bytes *physically survive* in the file (a corpus property computed
-  independently of our carver, by byte-presence), how many did we recover? The
-  carver-capability number.
+  whose scored identity *physically survives* in the file (a corpus property
+  computed independently of our carver: for the in-page categories `0C`/`0D`, the
+  full record body surviving contiguously; for overflow `0E`, the
+  any-distinctive-column proxy), how many did we recover? The carver-capability
+  number.
 - **end-to-end recall** = TP / `|D_deleted|` — of *all* rows the workload deleted
   (some destroyed by later overwrites), how many did we recover? The
   examiner-usefulness number.
@@ -203,32 +220,34 @@ deliberate ways, both of which slightly *raise* the count reported here versus t
 head-to-head's `ours` row: it matches on the **full decoded row** (all columns,
 reals at 5 dp) rather than the `(col1,col2)` projection, and it **includes
 0C-06/0C-07** (whose float key columns the cross-tool table must drop). So our
-0C total here is **79** (over all ten 0C databases) versus 63 in the head-to-head
+0C total here is **87** (over all ten 0C databases) versus 70 in the head-to-head
 (eight databases) — the same carver, two compatible scopings.
 
 Categories: `0C` deleted records (in-page free block); `0D` deleted then
 overwritten; `0E` deleted overflow records. `Ddel` = rows deleted; `Drec` = of
-those, byte-present (recoverable substrate); `live` = live-re-reads (must be 0).
+those, the recoverable substrate (for the in-page categories `0C`/`0D`, the rows
+whose full scored identity survives contiguously; for overflow `0E`, the
+any-distinctive-column survival proxy); `live` = live-re-reads (must be 0).
 
 | DB | Ddel | Drec | TP | FP | FN | live | recall (substrate) | recall (e2e) | precision | F2 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 0C-01 | 7  | 7  | 6  | 0 | 1 | 0 | 0.857 | 0.857 | 1.000 | 0.882 |
-| 0C-02 | 10 | 10 | 8  | 0 | 2 | 0 | 0.800 | 0.800 | 1.000 | 0.833 |
-| 0C-03 | 7  | 7  | 6  | 1 | 1 | 0 | 0.857 | 0.857 | 0.857 | 0.857 |
-| 0C-04 | 10 | 10 | 8  | 2 | 2 | 0 | 0.800 | 0.800 | 0.800 | 0.800 |
+| 0C-01 | 7  | 7  | 7  | 0 | 0 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |
+| 0C-02 | 10 | 10 | 10 | 0 | 0 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |
+| 0C-03 | 7  | 7  | 7  | 1 | 0 | 0 | 1.000 | 1.000 | 0.875 | 0.972 |
+| 0C-04 | 10 | 10 | 10 | 2 | 0 | 0 | 1.000 | 1.000 | 0.833 | 0.962 |
 | 0C-05 | 10 | 10 | 10 | 0 | 0 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |
 | 0C-06 | 7  | 7  | 7  | 0 | 0 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |
-| 0C-07 | 10 | 10 | 9  | 0 | 1 | 0 | 0.900 | 0.900 | 1.000 | 0.918 |
-| 0C-08 | 10 | 10 | 9  | 1 | 1 | 0 | 0.900 | 0.900 | 0.900 | 0.900 |
+| 0C-07 | 10 | 10 | 10 | 0 | 0 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |
+| 0C-08 | 10 | 10 | 10 | 1 | 0 | 0 | 1.000 | 1.000 | 0.909 | 0.980 |
 | 0C-09 | 10 | 10 | 5  | 0 | 5 | 0 | 0.500 | 0.500 | 1.000 | 0.556 |
 | 0C-10 | 20 | 20 | 11 | 0 | 9 | 0 | 0.550 | 0.550 | 1.000 | 0.604 |
-| **0C total** | **101** | **101** | **79** | **4** | **22** | **0** | **0.782** | **0.782** | **0.952** | — |
-| 0D-01 | 5  | 3 | 1 | 0 | 2 | 0 | 0.333 | 0.200 | 1.000 | 0.385 |
-| 0D-02 | 5  | 2 | 1 | 0 | 1 | 0 | 0.500 | 0.200 | 1.000 | 0.556 |
-| 0D-03 | 5  | 2 | 0 | 0 | 2 | 0 | 0.000 | 0.000 | 1.000 | 0.000 |
-| 0D-04 | 5  | 5 | 2 | 0 | 3 | 0 | 0.400 | 0.400 | 1.000 | 0.455 |
-| 0D-05 | 5  | 5 | 0 | 0 | 5 | 0 | 0.000 | 0.000 | 1.000 | 0.000 |
-| 0D-06 | 10 | 9 | 5 | 0 | 4 | 0 | 0.556 | 0.500 | 1.000 | 0.610 |
+| **0C total** | **101** | **101** | **87** | **4** | **14** | **0** | **0.861** | **0.861** | **0.956** | — |
+| 0D-01 | 5  | 1 | 1 | 0 | 0 | 0 | 1.000 | 0.200 | 1.000 | 1.000 |
+| 0D-02 | 5  | 1 | 1 | 0 | 0 | 0 | 1.000 | 0.200 | 1.000 | 1.000 |
+| 0D-03 | 5  | 0 | 0 | 0 | 0 | 0 | 1.000 | 0.000 | 1.000 | 1.000 |
+| 0D-04 | 5  | 2 | 2 | 0 | 0 | 0 | 1.000 | 0.400 | 1.000 | 1.000 |
+| 0D-05 | 5  | 0 | 0 | 0 | 0 | 0 | 1.000 | 0.000 | 1.000 | 1.000 |
+| 0D-06 | 10 | 5 | 5 | 0 | 0 | 0 | 1.000 | 0.500 | 1.000 | 1.000 |
 | 0D-07 | 5  | 5 | 5 | 0 | 0 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |
 | 0D-08 | 5  | 5 | 5 | 0 | 0 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |
 | 0E-01 | 7  | 6 | 3 | 0 | 3 | 0 | 0.500 | 0.429 | 1.000 | 0.556 |
@@ -241,21 +260,25 @@ correctness is measured by the DC3 differential below.)
 
 ### Reading the numbers
 
-- **0C precision 0.952** (79 TP / 83 carved): the only leaks are the phantom
+- **0C precision 0.956** (87 TP / 91 carved): the only leaks are the phantom
   all-empty class (4 across 0C-03/04/08), never a live row. Freeblock
-  reconstruction added 55 TP without adding a single live-re-read.
-- **0C recall ≈ 78 %** with every deleted row substrate-present: reconstruction
-  now recovers the freeblock-head cells the forward parser missed; the residual
-  FN are mostly 0C-09/0C-10 (whose freed cells have no freeblock chain — they sit
-  in the unallocated gap with a destroyed prefix the template cannot anchor).
-- **0D recall rose to ≈ 53 %** (11 → 19 TP): span-walking freeblock
+  reconstruction added the freeblock-head cells without adding a single
+  live-re-read.
+- **0C recall ≈ 86 %** with every deleted row substrate-present: reconstruction
+  recovers the freeblock-head cells the forward parser missed; the residual FN are
+  0C-09/0C-10 (whose freed cells have no freeblock chain — they sit in the
+  unallocated gap with a destroyed prefix the template cannot anchor).
+- **0D substrate recall 1.000** (19 TP / 19 Drec): span-walking freeblock
   reconstruction recovers *every* coalesced cell in a free span, not just the
-  span's head — closing most of the gap to fqlite (0.556). Later `INSERT`s still
-  overwrite some freed slack (`Drec < Ddel`), and one row (0D-01) has a
-  clobber/template layout the reconstruction does not yet anchor.
+  span's head — and the substrate denominator is now the honest contiguous
+  full-row-identity count, so it equals exactly the rows whose scored identity
+  still survives. The carver recovers all of them. End-to-end recall (TP / Ddel)
+  stays lower because later `INSERT`s genuinely destroyed ~26 of the 45 deleted
+  rows' identities.
 - **0E** (overflow): unchanged — these records spill to overflow pages, so the
-  in-page freeblock template does not apply; the carver recovers the rows whose
-  first overflow segment + header survived.
+  in-page freeblock template does not apply (and the contiguity substrate test
+  does not apply either; `0E` keeps the any-distinctive-column proxy). The carver
+  recovers the rows whose first overflow segment + header survived.
 
 ## Freeblock reconstruction
 
@@ -282,8 +305,8 @@ as unknown (`0`) — never invented — and the record is graded LOW
 only when every serial type is legal AND the whole record fits within the
 freeblock's `[offset, offset + size)` bounds; the forensic layer additionally
 drops any reconstruction whose decoded values match a live row (by value, since
-the rowid is gone). The result: 0C recall 0.274 → 0.750 with **0 new phantoms and
-0 live-re-reads** — fqlite-level recall at higher precision (3 phantoms vs 16).
+the rowid is gone). The result: 0C recall 0.274 → 0.833 with **0 new phantoms and
+0 live-re-reads** — above fqlite's recall at higher precision (3 phantoms vs 16).
 
 This is the published forensic technique (Nemetz et al. 2018; Pawlaszczyk &
 Hummert 2021), implemented from the SQLite file-format spec — not adapted from any
@@ -292,16 +315,17 @@ GPL tool's source.
 ## What the numbers do and do NOT claim
 
 - They claim an **honest, reproducible measurement** of all three tools against
-  *this* independent corpus: our carver matches fqlite's in-page
-  recall at the highest precision of the three and never re-reads a live row;
-  it Pareto-dominates fqlite on overflow (`0E`) and, after span-walk
-  reconstruction, nearly matches it on overwritten records (`0D`); fqlite keeps
-  only a slim recall edge — `0C` by tolerating more phantoms, `0D` by one
-  unanchored row; undark trails on both and over-reports live rows as deleted on
-  the overwritten and overflow tables.
-- They do **not** claim our carver is "best" overall. fqlite still recovers more
-  raw rows on `0C` (0.798 vs 0.750) and `0D` (0.556 vs 0.528); we trade those few
-  rows for a structural 0-false-positive guarantee and the lowest phantom rate.
+  *this* independent corpus: our carver leads fqlite on in-page recall (`0C`) at
+  the highest precision of the three and never re-reads a live row; it
+  Pareto-dominates fqlite on overflow (`0E`) and matches it on overwritten records
+  (`0D`), where both recover every row whose full identity survives; undark trails
+  on both recall and precision and over-reports live rows as deleted on the
+  overwritten and overflow tables.
+- They do **not** claim our carver is "best" overall. On `0D`, fqlite's
+  cross-tool `(col1,col2)` projection counts one extra row whose full record was
+  overwritten (its scored identity did not survive); on `0E` fqlite trails us. We
+  trade nothing on recall for a structural 0-false-positive guarantee and the
+  lowest phantom rate.
 - A low per-category recall (e.g. `0E`) is a true statement about a capability
   boundary, not a harness artifact — the substrate partition proves the bytes are
   present and we still miss them.

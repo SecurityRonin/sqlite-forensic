@@ -64,10 +64,18 @@ python3 tests/data/nemetz/gen_ground_truth.py
 
 For each table it records the schema column order, the deleted rows (recall
 ground truth), the alive rows (used to tell a live-re-read from a phantom FP),
-and per deleted row `substrate_recoverable` — whether a distinctive column's
-bytes still physically survive in the `.db` (computed independently of our
+and per deleted row `substrate_recoverable` — whether the row's **full scored
+identity** still physically survives in the `.db` (computed independently of our
 carver, partitioning `D_recoverable` from `D_destroyed` for the two-denominator
-recall). The harness reads this manifest, never the `.xml` at test time.
+recall). For the in-page record-deletion categories (`0C`, `0D`) this is the
+honest **contiguous full-row-identity** test: the whole record body (every
+column's SQLite serial encoding, in column order) must survive as one contiguous
+byte run, mirroring the recall matcher's full-row key — so a row whose scored
+identity a later same-rowid overwrite destroyed (only a coincidental single column
+surviving) is correctly excluded. The overflow category (`0E`) keeps the legacy
+any-distinctive-column proxy because its records spill onto a non-contiguous
+overflow-page chain, where a flat-file contiguity test does not apply. The harness
+reads this manifest, never the `.xml` at test time.
 
 ## MD5 manifest (vendored databases)
 

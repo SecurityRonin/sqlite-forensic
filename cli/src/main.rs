@@ -102,12 +102,23 @@ struct CarveArgs {
     #[arg(long, conflicts_with = "wal")]
     no_wal: bool,
 
-    /// Also emit Tier-2 partial fragments — lower-confidence partial rows
-    /// salvaged where a full row could not be reconstructed but a distinctive
-    /// cell survived. Off by default (the high-precision full-row output is the
-    /// zero-config path). Fragments are sourced from the on-disk image only.
-    #[arg(long, conflicts_with = "rowid_only")]
-    fragments: bool,
+    /// Suppress the Tier-2 partial-fragment section, leaving only high-precision
+    /// full rows. Fragments — lower-confidence partial rows salvaged where a full
+    /// row could not be reconstructed but a distinctive cell survived — are shown
+    /// **by default**, kept structurally separate from the full-row tier so they
+    /// can never be mistaken for a recovered row. `--rowid-only` also omits them
+    /// (a fragment has no rowid). Fragments are sourced from the on-disk image only.
+    #[arg(long)]
+    no_fragments: bool,
+}
+
+impl CarveArgs {
+    /// Whether to render the Tier-2 fragment section. On by default; suppressed
+    /// by `--no-fragments`, and by `--rowid-only` (fragments carry no rowid, so a
+    /// rowid listing coherently excludes them rather than erroring).
+    fn wants_fragments(&self) -> bool {
+        !self.no_fragments && !self.rowid_only
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -190,8 +201,8 @@ fn run_carve(args: &CarveArgs) -> Result<(), String> {
             println!("{line}");
         }
         // v1 fragments are sourced from the on-disk image only (no WAL fragment
-        // pass yet); print the opt-in section under the WAL-applied view's `db`.
-        if args.fragments {
+        // pass yet); print the default section under the WAL-applied view's `db`.
+        if args.wants_fragments() {
             let fragments = carve_with_fragments(&db).fragments;
             for line in render_fragments(&fragments, args.format.into()) {
                 println!("{line}");
@@ -201,7 +212,7 @@ fn run_carve(args: &CarveArgs) -> Result<(), String> {
         // On-disk-only view: single view, no snapshot column.
         let db = Database::open(db_bytes)
             .map_err(|e| format!("cannot parse database {}: {e:?}", args.db.display()))?;
-        if args.fragments {
+        if args.wants_fragments() {
             // Tier-1 + Tier-2 in one pass; both sections rendered together.
             let tiers = carve_with_fragments(&db);
             let full = filter_by_confidence(tiers.full, args.min_confidence.into());
@@ -236,10 +247,7 @@ mod tests {
     use clap::Parser;
 
     fn carve_args(argv: &[&str]) -> CarveArgs {
-        match Cli::try_parse_from(argv)
-            .expect("argv must parse")
-            .command
-        {
+        match Cli::try_parse_from(argv).expect("argv must parse").command {
             Commands::Carve(a) => a,
             Commands::Audit(_) => panic!("expected a carve command"),
         }

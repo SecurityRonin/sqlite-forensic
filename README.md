@@ -20,7 +20,7 @@ This is a Rust library workspace with a CLI (`sqlite4n6`). The fastest path — 
 $ sqlite4n6 carve History.db                       # deleted rows, table view
 $ sqlite4n6 carve History.db --format jsonl         # one JSON object per record
 $ sqlite4n6 carve History.db --min-confidence medium # drop low-confidence carves
-$ sqlite4n6 carve History.db --fragments            # + opt-in partial-row fragments
+$ sqlite4n6 carve History.db --no-fragments         # full rows only (fragments shown by default)
 $ sqlite4n6 audit  History.db                        # graded anomaly findings
 ```
 
@@ -38,7 +38,7 @@ $ sqlite4n6 carve chat.db --no-wal                     # on-disk image only, no 
 
 The `snapshot` column carries the salt-qualified LSN — `commit:(salt1,salt2,commit_frame_index)` for a committed snapshot, `wal-frame:(salt1,salt2,frame_index)` for raw frame residue, `on-disk` for the base image. A record identical across views is collapsed to its earliest committed coordinate. `--no-wal` carves the on-disk image alone (single view, no snapshot column). The evidence file and its sidecars are **never** written.
 
-Two recovery surfaces sit on top of this. A deleted row whose payload outgrew the page (`> usable − 35` bytes) spilled onto an **overflow-page chain**; `carve` reassembles such a row to a full record **when every chain page survives as a freelist leaf** (content-preserving) — a deliberately bounded capability, graded below the in-page tier, because a chain page reallocated as the freelist *trunk* destroys the record. And `carve --fragments` opens an **opt-in Tier-2 surface**: when a row's full identity is destroyed but a distinctive cell survives contiguously (a `TEXT ≥ 4` bytes or a `REAL`), that fragment is salvaged and kept **strictly separate** from the high-precision full-row tier — partial evidence a single surviving cell can still anchor, never mixed into the full-row set.
+Two recovery surfaces sit on top of this. A deleted row whose payload outgrew the page (`> usable − 35` bytes) spilled onto an **overflow-page chain**; `carve` reassembles such a row to a full record **when every chain page survives as a freelist leaf** (content-preserving) — a deliberately bounded capability, graded below the in-page tier, because a chain page reallocated as the freelist *trunk* destroys the record. And `carve` surfaces a **Tier-2 fragment section by default** (`--no-fragments` to suppress): when a row's full identity is destroyed but a distinctive cell survives contiguously (a `TEXT ≥ 4` bytes or a `REAL`), that fragment is salvaged and kept **strictly separate** from the high-precision full-row tier — partial evidence a single surviving cell can still anchor, never mixed into the full-row set.
 
 Or drive the library directly — point the analyzer at the file bytes and get graded findings plus carved deleted records:
 
@@ -74,7 +74,7 @@ The reader (`sqlite-core`) answers *"what does this file actually contain?"*; th
 | Recover deleted rows from in-page free blocks | ✅ | — |
 | Recover dropped-table rows (column count inferred) | ✅ | — |
 | Reassemble deleted rows whose payload spilled to overflow-page chains | ✅ partial | — |
-| Salvage partial rows as opt-in Tier-2 fragments (a distinctive cell survives) | ✅ | — |
+| Salvage partial rows as a separate Tier-2 fragment tier (a distinctive cell survives) | ✅ default | — |
 | Read uncheckpointed WAL overlay as a separate view | ✅ | applied silently |
 | Carve every WAL commit snapshot, LSN-labelled (per-commit timeline) | ✅ | — |
 | Graded, confidence-scored anomaly findings | ✅ | — |

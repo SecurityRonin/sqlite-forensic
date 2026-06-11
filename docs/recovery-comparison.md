@@ -49,10 +49,11 @@ regenerate its table). Corpus and oracle provenance are in
   template derived from a live cell on the same page; the destroyed rowid is
   surfaced as unknown (`0`), never invented. See
   "[Freeblock reconstruction](#freeblock-reconstruction)".
-- **An opt-in Tier-2 fragment surface** salvages partial rows where a full identity
-  is destroyed but a distinctive cell survives (`carve --fragments`). It is kept
-  strictly separate from the full-row tier — it has an expected non-zero
-  false-positive rate, so the default output never includes it. See
+- **A separate Tier-2 fragment surface** salvages partial rows where a full identity
+  is destroyed but a distinctive cell survives. It is shown by default but kept
+  **structurally separate** from the full-row tier (its own labelled section / `kind`
+  column), because it has an expected non-zero false-positive rate; `carve
+  --no-fragments` suppresses it for a pure high-precision full-row run. See
   "[Two-tier recovery](#two-tier-recovery-tier-2-fragments)".
 - **Two recall denominators** are reported because they answer different questions
   — substrate-limited (carver capability) and end-to-end (examiner usefulness).
@@ -365,8 +366,8 @@ Recovery is split into two strictly separated tiers:
 
 - **Tier 1 — full rows** (the matrix above): `carve_all_deleted_records` rebuilds
   complete, scored identities and keeps the structural 0-false-positive guarantee.
-  This is the default, zero-config output.
-- **Tier 2 — fragments** (opt-in, `carve --fragments`): where a freed cell's full
+  Always present in the carve output.
+- **Tier 2 — fragments** (shown by default; `carve --no-fragments` to suppress): where a freed cell's full
   row cannot be reconstructed but a *distinctive* cell survives at the same
   structural anchor, the maximal decodable column prefix is salvaged as a
   `CarvedFragment` — a separate type with no rowid and an incomplete column set,

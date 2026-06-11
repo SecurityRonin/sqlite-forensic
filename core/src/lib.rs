@@ -1770,6 +1770,80 @@ impl WalTimeline {
     pub fn page_size(&self) -> u32 {
         self.page_size
     }
+
+    /// Map this WAL timeline onto the canonical `forensicnomicon::history` cohort
+    /// vocabulary — the `[H]` adapter (#43 / WS-F).
+    ///
+    /// Each materializable [`CommitSnapshot`] becomes one `TemporalState<CommitId>`:
+    /// - **ordering key** — a salt-qualified `LsnKind::SqliteWalFrame` (`frame_seq` is the
+    ///   COMMIT frame index; `commit_seq` is the 0-based commit ordinal within the salt
+    ///   segment). The `(salt1, salt2)` pair keeps the key meaningful across a checkpoint
+    ///   reset, which renumbers frames and rolls the salts.
+    /// - **clock + safety** — the canonical SQLite-WAL profile, single-sourced from
+    ///   [`forensicnomicon::history::profiles`], so no consumer re-asserts the four
+    ///   classifications locally.
+    /// - **handle** — the snapshot's [`CommitId`]; resolve it back via [`Self::snapshot_at`].
+    ///
+    /// The topology is uniformly `SubJournalCommits`: every state is a committed
+    /// transaction, and a checkpoint reset is visible as a salt change *inside* the
+    /// ordering key — there is no separate "disconnected" topology to special-case. The
+    /// cohort is `PathStable` (a `-wal` belongs to exactly one database path), so the
+    /// caller supplies the path identity via `artifact`.
+    #[must_use]
+    pub fn to_temporal_cohort(
+        &self,
+        artifact: forensicnomicon::history::identity::ArtifactRef,
+    ) -> forensicnomicon::history::cohort::TemporalCohort<CommitId> {
+        use forensicnomicon::history::cohort::{TemporalCohort, TemporalState};
+        use forensicnomicon::history::epoch::{CohortTopology, EpochTag, LsnKind};
+        use forensicnomicon::history::identity::IdentityDiscipline;
+        use forensicnomicon::history::profiles;
+
+        let mut commit_seq_in_segment: std::collections::HashMap<WalSegmentId, u32> =
+            std::collections::HashMap::new();
+
+        let states = self
+            .snapshots
+            .iter()
+            .map(|snap| {
+                let id = snap.id();
+                let lsn = snap.lsn();
+                let seq = commit_seq_in_segment.entry(id.segment).or_insert(0);
+                let commit_seq = *seq;
+                *seq += 1;
+
+                // Deterministic and collision-free within a cohort: the
+                // (salt1, salt2, commit_frame_index, db_size_after_commit) quadruple is
+                // unique per commit state. Packed big-endian into the leading 16 bytes.
+                let mut tag = [0u8; 32];
+                tag[0..4].copy_from_slice(&lsn.salt1.to_be_bytes());
+                tag[4..8].copy_from_slice(&lsn.salt2.to_be_bytes());
+                tag[8..12].copy_from_slice(&(id.commit_frame_index as u32).to_be_bytes());
+                tag[12..16].copy_from_slice(&id.db_size_after_commit.to_be_bytes());
+
+                TemporalState {
+                    epoch: EpochTag::from_bytes(tag),
+                    ordering_key: Some(LsnKind::SqliteWalFrame {
+                        salt1: lsn.salt1,
+                        salt2: lsn.salt2,
+                        frame_seq: lsn.frame_index as u32,
+                        commit_seq,
+                    }),
+                    wall_time: None,
+                    clock: profiles::sqlite_wal_clock(),
+                    safety: profiles::SQLITE_WAL_SAFETY,
+                    handle: id,
+                }
+            })
+            .collect();
+
+        TemporalCohort {
+            artifact,
+            discipline: IdentityDiscipline::PathStable,
+            topology: CohortTopology::SubJournalCommits,
+            states,
+        }
+    }
 }
 
 /// The body byte-width of a serial type (file-format §2.1), or `None` for a

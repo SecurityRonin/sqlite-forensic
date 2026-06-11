@@ -16,7 +16,25 @@
 use sqlite_core::{Database, Value};
 use sqlite_forensic::{carve_all_deleted_records, carve_with_fragments, RecoverySource};
 
+mod nemetz_support;
+
 const NEMETZ_0E_01: &[u8] = include_bytes!("../../tests/data/nemetz/0E/0E-01.db");
+
+/// The answer-key `code` cell (column index 2) for a deleted row in a Nemetz db,
+/// pulled byte-for-byte from the committed ground-truth manifest. Lets the
+/// reassembly assertions pin the *entire* spilled payload rather than a
+/// prefix/suffix (Codex #73 review, item 3).
+fn expected_code(nid: &str, id_col0: &str) -> String {
+    for el in nemetz_support::manifest().db(nid).elements() {
+        for row in el.deleted() {
+            let cells = row.cells();
+            if cells.first().map(String::as_str) == Some(id_col0) {
+                return cells[2].clone();
+            }
+        }
+    }
+    panic!("ground-truth manifest missing deleted row {id_col0} in {nid}");
+}
 
 /// The surviving chain (Ella, page-13 leaf) recovers as a full Tier-1 row with
 /// its complete answer-key values and chain provenance `[13]`.
@@ -38,11 +56,15 @@ fn recovers_surviving_overflow_chain_as_full_row() {
     // column, not the rowid alias).
     assert_eq!(ella.rowid, 12);
     // code is the 4095-char TEXT reassembled across the local prefix + page 13.
+    // Pin the ENTIRE payload byte-for-byte against the answer key, not just the
+    // length and the end substrings — a wrong middle byte must fail the test.
     match ella.values.get(2) {
         Some(Value::Text(code)) => {
-            assert_eq!(code.len(), 4095, "code must be fully reassembled");
-            assert!(code.starts_with("KIxfqvOjIlMi"));
-            assert!(code.ends_with("ggZhAWZ9GPDs"));
+            assert_eq!(
+                *code,
+                expected_code("0E-01", "20012"),
+                "reassembled code must byte-equal the ground-truth answer key"
+            );
         }
         other => panic!("code column should be Text, got {other:?}"),
     }

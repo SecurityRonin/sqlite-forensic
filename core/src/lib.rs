@@ -99,6 +99,35 @@ pub struct CarvedCell {
     pub confidence: f32,
 }
 
+/// A **partial** deleted record salvaged from a freed-cell reconstruction that
+/// failed full-row validation: the maximal decodable column prefix at a
+/// structural anchor [`Database::reconstruct_freeblock_records`] already trusts.
+///
+/// Deliberately NOT a [`CarvedCell`]: it has no rowid (clobbered) and an
+/// incomplete value set, so the type system keeps it out of the full-row output
+/// — a fragment can never be silently rendered as a recovered row. Emitted only
+/// at an anchor where full reconstruction failed but at least one *distinctive*
+/// cell (TEXT ≥ 4 bytes of valid UTF-8, or REAL) decoded cleanly, so a lone
+/// coincidental integer pattern never anchors a fragment. Graded
+/// [`FRAGMENT_CONFIDENCE`] — strictly below every full-row class.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CellFragment {
+    /// Byte offset of the failed cell's anchor within the scanned page slice.
+    pub offset: usize,
+    /// Bytes covered by the decoded prefix (anchor to the last decoded body byte).
+    pub byte_len: usize,
+    /// `(column_index, value)` for each column that decoded cleanly, ascending by
+    /// index. Column indexes come from the page's schema template, so they are
+    /// meaningful against the table's column order.
+    pub surviving: Vec<(usize, Value)>,
+    /// Number of the template's columns that did NOT decode (`column_count` minus
+    /// the number of surviving columns).
+    pub missing: usize,
+    /// Always [`FRAGMENT_CONFIDENCE`] for now; the field is kept so future
+    /// per-fragment grading does not change the public type.
+    pub confidence: f32,
+}
+
 /// Parsed 100-byte `SQLite` file header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -199,6 +228,13 @@ const IN_PAGE_CONFIDENCE_FACTOR: f32 = 0.8;
 /// weaker reconstruction than an intact-header carve, hence graded LOW (a
 /// "consistent with a deleted row" lead the examiner weighs, never a certainty).
 const FREEBLOCK_RECONSTRUCT_CONFIDENCE: f32 = 0.4;
+
+/// Confidence assigned to a Tier-2 [`CellFragment`] — a partial recovery whose
+/// full row could not be reconstructed but at least one distinctive cell survived.
+/// Flat 0.2 = the `MinConfidence::Low` threshold, one notch below freeblock
+/// reconstruction's 0.4 (= Medium): a fragment is the weakest lead in the ladder,
+/// "consistent with a partial deleted row", never a recovered row.
+const FRAGMENT_CONFIDENCE: f32 = 0.2;
 
 /// Upper bound on the number of freeblocks walked on a single page, to cap work
 /// on a crafted file whose freeblock `next` pointers form a long or cyclic chain.
@@ -693,6 +729,93 @@ impl Database {
             }
         }
         out
+    }
+
+    /// Tier-2 partial salvage: the [`CellFragment`]s abandoned by
+    /// [`Database::reconstruct_freeblock_records`] on this page.
+    ///
+    /// At every anchor where full reconstruction failed — an illegal serial in
+    /// the surviving tail, a tail that overruns the span, or a body that does not
+    /// fit — the columns that DID decode cleanly before the failure are salvaged
+    /// as the maximal decodable prefix. A fragment is emitted only when that
+    /// prefix contains at least one *distinctive* cell (TEXT ≥ 4 bytes of valid
+    /// UTF-8, or REAL): a lone surviving integer pattern is coincidence-prone and
+    /// never anchors a fragment.
+    ///
+    /// Mutually exclusive with the full reconstructions of
+    /// [`Database::reconstruct_freeblock_records`] **by construction**: an anchor
+    /// yields a cell or a fragment, never both. Inherits the same anchor
+    /// discipline — no sliding scan, no strings-style hunt — so Tier-2 carries
+    /// Tier-1's precision architecture. Bounded and panic-free identically.
+    #[must_use]
+    pub fn reconstruct_freeblock_fragments(&self, page_bytes: &[u8]) -> Vec<CellFragment> {
+        self.reconstruct_freeblock_inner(page_bytes).1
+    }
+
+    /// Shared internal walker producing BOTH tiers in one pass so the cell and
+    /// fragment outputs can never diverge: `(full_cells, fragments)`. The public
+    /// [`Database::reconstruct_freeblock_records`] returns `.0`,
+    /// [`Database::reconstruct_freeblock_fragments`] returns `.1`.
+    fn reconstruct_freeblock_inner(&self, page_bytes: &[u8]) -> (Vec<CarvedCell>, Vec<CellFragment>) {
+        let mut cells = Vec::new();
+        let mut frags = Vec::new();
+        let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
+            SQLITE_HEADER_SIZE
+        } else {
+            0
+        };
+        let Some(&page_type) = page_bytes.get(hdr_off) else {
+            return (cells, frags);
+        };
+        if page_type != 0x0d {
+            return (cells, frags); // only table-leaf pages have freeblock residue
+        }
+        let Some(template) = freeblock_template(page_bytes, hdr_off) else {
+            return (cells, frags);
+        };
+
+        let first_freeblock = be_u16(page_bytes, hdr_off + 1) as usize;
+        let mut fb = first_freeblock;
+        let mut walked = 0usize;
+        let mut visited = std::collections::BTreeSet::new();
+        while fb != 0 && walked < MAX_FREEBLOCKS_PER_PAGE {
+            walked += 1;
+            if !visited.insert(fb) {
+                break; // cyclic next pointer
+            }
+            let next = be_u16(page_bytes, fb) as usize;
+            let size = be_u16(page_bytes, fb + 2) as usize;
+            let Some(fb_end) = fb.checked_add(size) else {
+                break; // cov:unreachable: usize add of two u16-range values
+            };
+            if size >= 4 && fb_end <= page_bytes.len() {
+                template.reconstruct_span_tiered(page_bytes, fb, fb_end, false, &mut cells, &mut frags);
+            }
+            fb = next;
+        }
+
+        let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
+        let cptr_end = hdr_off + 8 + cell_count * 2;
+        let cca = be_u16(page_bytes, hdr_off + 5) as usize;
+        if cca > cptr_end && cca <= page_bytes.len() {
+            for anchor_off in cptr_end..cca {
+                let Some(anchor) =
+                    try_carve_cell_at(page_bytes, anchor_off, Some(template.column_count))
+                else {
+                    continue;
+                };
+                let has_text = anchor.values.iter().any(
+                    |v| matches!(v, Value::Text(t) if !t.is_empty() && !t.contains('\u{FFFD}')),
+                );
+                if !has_text {
+                    continue;
+                }
+                let tail_start = anchor.offset + anchor.byte_len;
+                template.reconstruct_span_tiered(page_bytes, tail_start, cca, true, &mut cells, &mut frags);
+                break; // one anchored run per page — the contiguous freed tail
+            }
+        }
+        (cells, frags)
     }
 
     /// The maximal FREE (unallocated) byte ranges of a table-leaf page — the
@@ -1849,6 +1972,20 @@ impl WalTimeline {
     }
 }
 
+/// Whether a decoded [`Value`] is **distinctive** enough to anchor a Tier-2
+/// fragment emission (the §3.1 gate): TEXT of ≥ 4 bytes of valid UTF-8 (no
+/// replacement char), or a REAL. Bare integers (1–8-byte serial patterns),
+/// NULL, and BLOBs are NOT distinctive alone — a short integer byte-pattern
+/// coincides far too often in a 4 KiB page to serve as identity, so it can ride
+/// along inside a fragment but never justify emitting one.
+fn is_distinctive(value: &Value) -> bool {
+    match value {
+        Value::Text(t) => t.len() >= 4 && !t.contains('\u{FFFD}'),
+        Value::Real(_) => true,
+        Value::Null | Value::Integer(_) | Value::Blob(_) => false,
+    }
+}
+
 /// The body byte-width of a serial type (file-format §2.1), or `None` for a
 /// serial value that cannot legally appear in a record body.
 fn serial_body_len(serial: i64) -> Option<usize> {
@@ -2113,6 +2250,120 @@ impl FreeblockTemplate {
             // non-empty: surviving_serials_off > 0), so the walk always advances.
             cell_start = record_end;
         }
+    }
+
+    /// Tiered variant of [`FreeblockTemplate::reconstruct_span`]: identical full-
+    /// cell walk, but at the anchor where `reconstruct_one` would `break` it
+    /// salvages the maximal decodable column prefix as a [`CellFragment`] (when
+    /// the §3.1 distinctiveness gate passes) before stopping. Fragment salvage
+    /// does NOT extend the walk — it stops at exactly the same position
+    /// [`FreeblockTemplate::reconstruct_span`] does, preserving Tier-1's phantom
+    /// discipline.
+    fn reconstruct_span_tiered(
+        &self,
+        page: &[u8],
+        lo: usize,
+        hi: usize,
+        enforce_follower_mark: bool,
+        cells: &mut Vec<CarvedCell>,
+        frags: &mut Vec<CellFragment>,
+    ) {
+        let mut cell_start = lo;
+        let mut built = 0usize;
+        while cell_start < hi && built < MAX_FREEBLOCKS_PER_PAGE {
+            if enforce_follower_mark && be_u16(page, cell_start) != 0 {
+                break; // not a coalesced freeblock follower — the contiguous run ends
+            }
+            let Some((cell, record_end)) = self.reconstruct_one(page, cell_start, hi) else {
+                // Full reconstruction failed at this anchor; try to salvage the
+                // decodable prefix as a fragment, then stop (do not extend the
+                // walk past the failed anchor).
+                if let Some(frag) = self.salvage_fragment(page, cell_start, hi) {
+                    frags.push(frag);
+                }
+                break;
+            };
+            cells.push(cell);
+            built += 1;
+            cell_start = record_end;
+        }
+    }
+
+    /// Salvage the maximal decodable column prefix at `cell_start` (bounded by
+    /// `span_end`) when full reconstruction failed there. Walks the template +
+    /// surviving serial array forward, decoding each column's body while it fits
+    /// in the span; the first illegal serial, out-of-bounds read, or body that
+    /// overruns the span ends the prefix. Returns a [`CellFragment`] **only** when
+    /// the salvaged prefix contains at least one distinctive cell (TEXT ≥ 4 bytes
+    /// of valid UTF-8, or REAL) — the §3.1 emission gate — otherwise `None`.
+    fn salvage_fragment(&self, page: &[u8], cell_start: usize, span_end: usize) -> Option<CellFragment> {
+        // RED stub: no salvage yet — implemented in the GREEN commit.
+        let _ = (page, cell_start, span_end);
+        return None;
+        #[allow(unreachable_code, clippy::allow_attributes)]
+        let surviving_count = self.column_count - self.known_lead_serials.len();
+        let tail_start = cell_start.checked_add(self.surviving_serials_off)?;
+
+        // Read as many legal surviving serials as decode in-bounds within the span.
+        // The template's leading serials are always legal (they came from a live
+        // cell), so the full serial array is `known_lead ++ legal_surviving`.
+        let mut serials = self.known_lead_serials.clone();
+        let mut pos = tail_start;
+        for _ in 0..surviving_count {
+            let Ok((s, used)) = read_varint(page, pos) else {
+                break;
+            };
+            if serial_body_len(s).is_none() {
+                break; // illegal serial type: surviving serial array ends here
+            }
+            let Some(next) = pos.checked_add(used) else {
+                break; // cov:unreachable: usize add of an in-page varint width
+            };
+            if next > span_end {
+                break; // serial tail overran the span
+            }
+            serials.push(s);
+            pos = next;
+        }
+
+        // Decode column bodies left-to-right, keeping each whose body ends within
+        // the span. The body begins right after the surviving serial tail.
+        let body_start = pos;
+        let mut surviving: Vec<(usize, Value)> = Vec::new();
+        let mut bpos = body_start;
+        for (idx, &s) in serials.iter().enumerate() {
+            let Some(blen) = serial_body_len(s) else {
+                break; // cov:unreachable: only legal serials were pushed above
+            };
+            let Some(body_end) = bpos.checked_add(blen) else {
+                break; // cov:unreachable: usize add of an in-page body length
+            };
+            if body_end > span_end {
+                break; // this column's body overruns the span — prefix ends here
+            }
+            let Some(body) = page.get(bpos..body_end) else {
+                break; // cov:unreachable: body_end <= span_end <= page.len()
+            };
+            let Ok((val, _)) = decode_value(body, 0, s) else {
+                break; // cov:unreachable: serial_body_len-legal serials decode in-bounds
+            };
+            surviving.push((idx, val));
+            bpos = body_end;
+        }
+
+        // Emission gate: at least one distinctive cell (TEXT >= 4 UTF-8 bytes, or
+        // REAL). A lone integer/NULL/blob prefix is coincidence-prone — no fragment.
+        if !surviving.iter().any(|(_, v)| is_distinctive(v)) {
+            return None;
+        }
+        let last_body_end = bpos;
+        Some(CellFragment {
+            offset: cell_start,
+            byte_len: last_body_end.saturating_sub(cell_start),
+            missing: self.column_count - surviving.len(),
+            surviving,
+            confidence: FRAGMENT_CONFIDENCE,
+        })
     }
 
     /// Rebuild the single record whose clobbered cell begins at `cell_start`,
@@ -2761,5 +3012,174 @@ mod tests {
         page[103] = 0xff; // size huge -> runs past page -> skipped
                           // Must not panic and must terminate.
         let _ = db.reconstruct_freeblock_records(&page);
+    }
+
+    // ---- Tier-2 fragment salvage (task #72) --------------------------------
+
+    /// Build a synthetic 256-byte table-leaf (0x0d) page for the fragment tests.
+    ///
+    /// Schema implied by the template live cell: 3 columns
+    /// `(c0: 1-byte int, c1: TEXT-4, c2: TEXT-4)` → serials `[1, 21, 21]`,
+    /// `header_len = 4`. The live cell (the freeblock template source) is placed
+    /// at `live_off`. A single freeblock spanning `[fb, fb + fb_size)` holds the
+    /// freed-cell payload `freed`, whose leading 4 bytes are the stale freeblock
+    /// header (`next`, `size`) — exactly what freeblock conversion clobbers.
+    fn synth_frag_page(live_off: usize, fb: usize, fb_size: usize, freed: &[u8]) -> Vec<u8> {
+        let mut page = vec![0u8; 256];
+        page[0] = 0x0d; // table-leaf
+        page[1] = (fb >> 8) as u8;
+        page[2] = (fb & 0xff) as u8;
+        page[3] = 0x00;
+        page[4] = 0x01; // cell_count = 1
+        page[5] = (live_off >> 8) as u8;
+        page[6] = (live_off & 0xff) as u8; // cellContentArea = live_off
+        page[8] = (live_off >> 8) as u8;
+        page[9] = (live_off & 0xff) as u8; // cell pointer -> live_off
+
+        // Live template cell: payload_len=13, rowid=5, header_len=4, serials
+        // [int1, text4, text4], body 1+4+4.
+        let live = [
+            13u8, 5u8, 0x04, 0x01, 0x15, 0x15, 0x09, b'L', b'i', b'v', b'e', b'R', b'o', b'w', b'!',
+        ];
+        page[live_off..live_off + live.len()].copy_from_slice(&live);
+
+        // Freeblock header at fb: next=0, size=fb_size.
+        page[fb] = 0x00;
+        page[fb + 1] = 0x00;
+        page[fb + 2] = (fb_size >> 8) as u8;
+        page[fb + 3] = (fb_size & 0xff) as u8;
+        page[fb..fb + freed.len()].copy_from_slice(freed);
+        page
+    }
+
+    /// (a) Truncated tail: the freed cell's body overruns the freeblock span, so
+    /// full reconstruction fails — salvage emits the decodable column prefix
+    /// (incl. a distinctive TEXT cell) with correct `missing`/confidence, while
+    /// `reconstruct_freeblock_records` recovers nothing from that anchor.
+    #[test]
+    fn fragment_salvage_truncated_tail() {
+        let db = opened();
+        // surviving serials [21,21] at fb+4,fb+5; body c0(1)+c1(4)+c2(4) at fb+6.
+        // A full record needs fb+15. Span size 12 ends at fb+12: c0,c1 fit, c2
+        // overruns → salvage keeps [c0, c1].
+        let mut freed = vec![0u8; 16];
+        freed[4] = 0x15;
+        freed[5] = 0x15;
+        freed[6] = 0x07;
+        freed[7..11].copy_from_slice(b"Anja");
+        freed[11..15].copy_from_slice(b"Frnk");
+        let page = synth_frag_page(96, 64, 12, &freed);
+
+        let frags = db.reconstruct_freeblock_fragments(&page);
+        assert_eq!(frags.len(), 1, "exactly one fragment salvaged");
+        let f = &frags[0];
+        assert_eq!(f.offset, 64);
+        assert_eq!(
+            f.surviving,
+            vec![(0, Value::Integer(7)), (1, Value::Text("Anja".into()))]
+        );
+        assert_eq!(f.missing, 1, "c2 did not decode");
+        assert!((f.confidence - 0.2).abs() < f32::EPSILON);
+        let cells = db.reconstruct_freeblock_records(&page);
+        assert!(cells.iter().all(|c| c.offset != 64));
+    }
+
+    /// (b) A surviving column whose body cannot fit ends the prefix early —
+    /// salvage keeps the columns decoded before the failure.
+    #[test]
+    fn fragment_salvage_partial_tail() {
+        let db = opened();
+        let mut freed = vec![0u8; 16];
+        freed[4] = 0x15;
+        freed[5] = 0x15;
+        freed[6] = 0x07;
+        freed[7..11].copy_from_slice(b"Lena");
+        let page = synth_frag_page(96, 64, 11, &freed); // c1 fits, c2 overruns
+        let frags = db.reconstruct_freeblock_fragments(&page);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(
+            frags[0].surviving,
+            vec![(0, Value::Integer(7)), (1, Value::Text("Lena".into()))]
+        );
+    }
+
+    /// (c) A fully reconstructable freeblock yields NO fragment (mutual exclusion).
+    #[test]
+    fn fragment_salvage_full_record_yields_no_fragment() {
+        let db = opened();
+        let mut freed = vec![0u8; 16];
+        freed[4] = 0x15;
+        freed[5] = 0x15;
+        freed[6] = 0x07;
+        freed[7..11].copy_from_slice(b"Whol");
+        freed[11..15].copy_from_slice(b"Erow");
+        let page = synth_frag_page(96, 64, 15, &freed);
+        let cells = db.reconstruct_freeblock_records(&page);
+        assert!(cells.iter().any(|c| c.offset == 64), "full record recovered");
+        assert!(
+            db.reconstruct_freeblock_fragments(&page).is_empty(),
+            "no fragment when the full record is recoverable"
+        );
+    }
+
+    /// (d) Salvage yielding only non-distinctive (INTEGER) cells emits NO fragment.
+    #[test]
+    fn fragment_salvage_integer_only_is_rejected() {
+        let db = opened();
+        let mut freed = vec![0u8; 12];
+        freed[4] = 0x01; // surviving 1-byte int
+        freed[5] = 0x01; // surviving 1-byte int
+        freed[6] = 0x07;
+        freed[7] = 0x08;
+        let page = synth_frag_page(96, 64, 8, &freed); // c2 overruns; only ints decode
+        assert!(
+            db.reconstruct_freeblock_fragments(&page).is_empty(),
+            "integer-only prefix is not distinctive — no fragment"
+        );
+    }
+
+    /// (e) Fragment salvage does NOT extend the span walk: a failed head stops
+    /// the walk, emitting at most one fragment, never sliding forward.
+    #[test]
+    fn fragment_salvage_does_not_extend_walk() {
+        let db = opened();
+        let mut freed = vec![0u8; 16];
+        freed[4] = 0x15;
+        freed[5] = 0x15;
+        freed[6] = 0x07;
+        freed[7..11].copy_from_slice(b"Stop");
+        freed[11..15].copy_from_slice(b"Here");
+        let page = synth_frag_page(96, 64, 12, &freed);
+        assert_eq!(db.reconstruct_freeblock_fragments(&page).len(), 1);
+    }
+
+    /// (Step 2) Real-artifact validation: 0D-01 page 2 salvages the genuine
+    /// partial deleted row for id 20004 — `Text("Anja")`/`Text("Frank")` survive
+    /// in a freeblock whose full-row reconstruction fails. Full pass unchanged.
+    const NEMETZ_0D_01: &[u8] = include_bytes!("../../tests/data/nemetz/0D/0D-01.db");
+
+    #[test]
+    fn fragment_salvage_recovers_anja_on_0d01() {
+        let db = Database::open(NEMETZ_0D_01.to_vec()).unwrap();
+        let page = db.raw_page(2).unwrap();
+        let frags = db.reconstruct_freeblock_fragments(page);
+        let f = frags
+            .iter()
+            .find(|f| {
+                f.surviving
+                    .iter()
+                    .any(|(_, v)| matches!(v, Value::Text(t) if t == "Anja"))
+            })
+            .expect("0D-01 page 2 must salvage the Anja fragment");
+        assert!(f
+            .surviving
+            .iter()
+            .any(|(_, v)| matches!(v, Value::Text(t) if t == "Frank")));
+        assert!((f.confidence - 0.2).abs() < f32::EPSILON);
+        let cells = db.reconstruct_freeblock_records(page);
+        assert!(cells.iter().all(|c| !c
+            .values
+            .iter()
+            .any(|v| matches!(v, Value::Text(t) if t == "Anja"))));
     }
 }

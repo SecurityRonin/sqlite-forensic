@@ -327,17 +327,26 @@ fn category_0d_true_positive_floor() {
     );
 }
 
-/// The 0D substrate-recoverable denominator is now the **honest contiguous
+/// The substrate-recoverable denominator is the **honest contiguous
 /// full-row-identity** count: a deleted row is counted recoverable only when its
 /// whole scored record body — every column's SQLite serial encoding, in column
 /// order, exactly as the recall matcher's full-row key (`normalize_row` over all
 /// cells) discriminates on — survives **contiguously** in the database bytes. A
 /// row whose scored identity was destroyed by a later same-rowid overwrite (so
 /// only a coincidental single-column byte match remains) is NO LONGER counted, as
-/// the earlier any-distinctive-column rule wrongly did. This tightens 0D
-/// `d_recoverable` from the inflated 36 to the honest 19 — the substrate is small
-/// because overwrites genuinely destroyed roughly half the deleted rows, not
-/// because the harness is lenient.
+/// the earlier any-distinctive-column rule wrongly did.
+///
+/// The contiguity decision is made **per record by body size**, never by category
+/// (no special case): a record whose payload fits in-page (≤ the page's usable−35
+/// threshold) is a single contiguous run and the contiguity test is exact; a
+/// record large enough to spill onto a non-contiguous overflow-page chain (SQLite
+/// file format, "Cell payload overflow pages") cannot be modelled by a flat-file
+/// contiguity test and is treated conservatively as not-recoverable (chain-aware
+/// overflow recoverability is future work).
+///
+/// For 0D this tightens `d_recoverable` from the inflated 36 to the honest 19 —
+/// the substrate is small because overwrites genuinely destroyed roughly half the
+/// deleted rows, not because the harness is lenient.
 ///
 /// Two checks, both against the regenerated manifest:
 ///  1. the 0D `d_recoverable` total equals the measured honest value, and
@@ -364,6 +373,37 @@ fn category_0d_drecoverable_is_contiguous_identity() {
     assert!(
         total_drec >= total_tp,
         "0D d_recoverable {total_drec} < tp {total_tp} — a recovered row whose identity does not survive is impossible"
+    );
+}
+
+/// The overflow category (0E) is held to the **same** honest per-record
+/// contiguous-identity rule as every other category — no exemption. Most 0E
+/// deleted bodies are large-but-IN-PAGE (≤ the usable−35 threshold) and survive as
+/// a single contiguous run, so the contiguity test applies to them exactly; only
+/// the genuinely-overflowing records (body > threshold, spilling to a
+/// non-contiguous overflow-page chain) are excluded as future work. Under this
+/// honest rule the 0E substrate denominator drops from the inflated 9 (legacy
+/// any-distinctive-column proxy) to 3 — the rows whose full in-page identity
+/// physically survives. The same TP ≤ Drec invariant is asserted.
+#[test]
+fn category_0e_drecoverable_is_contiguous_identity() {
+    let total_drec: usize = all_matrices()
+        .iter()
+        .filter(|m| m.category == "0E")
+        .map(|m| m.d_recoverable)
+        .sum();
+    assert_eq!(
+        total_drec, NEMETZ_0E_DRECOVERABLE,
+        "0E d_recoverable total {total_drec} != honest contiguous-identity denominator {NEMETZ_0E_DRECOVERABLE}"
+    );
+    let total_tp: usize = all_matrices()
+        .iter()
+        .filter(|m| m.category == "0E")
+        .map(|m| m.tp)
+        .sum();
+    assert!(
+        total_drec >= total_tp,
+        "0E d_recoverable {total_drec} < tp {total_tp} — a recovered row whose identity does not survive is impossible"
     );
 }
 
@@ -396,20 +436,26 @@ const NEMETZ_0C_TP_FLOOR: usize = 79;
 // freeblock reconstruction (task #66) recovers every coalesced clobbered cell in
 // a free span (chained freeblock or unallocated gap), not just the span's head —
 // lifting 0D recovery from 11 to 19 at precision 1.000 on every 0D database.
-// fqlite reaches 20; the single remaining row (0D-01) has a clobber/template
-// layout this general reconstruction does not yet anchor (tracked follow-up).
-// The floor is the honestly-measured 19 — never a special-cased 20.
+// Against the honest full-row substrate (19 recoverable rows), the carver recovers
+// all 19. The floor is the honestly-measured 19.
 const NEMETZ_0D_TP_FLOOR: usize = 19;
 // 0D substrate-recoverable denominator under the honest contiguous full-row-identity
 // rule (gen_ground_truth.py now requires the whole scored record body to survive
-// contiguously, mirroring the recall matcher's full-row key). The earlier
-// any-distinctive-column rule inflated this to 36 by counting rows whose scored
-// identity was destroyed by a later same-rowid overwrite but a single column
-// coincidentally survived elsewhere; the honest count is 19, all of which the
-// carver recovers (0D substrate recall 19/19 = 1.000 vs the inflated 19/36 = 0.528).
-// The substrate is small because overwrites genuinely destroyed ~26 of the 45
-// deleted rows, not because the harness is lenient.
+// contiguously, mirroring the recall matcher's full-row key, decided per record by
+// body size). The earlier any-distinctive-column rule inflated this to 36 by
+// counting rows whose scored identity was destroyed by a later same-rowid overwrite
+// but a single column coincidentally survived elsewhere; the honest count is 19,
+// all of which the carver recovers (0D substrate recall 19/19 = 1.000 vs the
+// inflated 19/36 = 0.528). The substrate is small because overwrites genuinely
+// destroyed ~26 of the 45 deleted rows, not because the harness is lenient.
 const NEMETZ_0D_DRECOVERABLE: usize = 19;
+// 0E substrate-recoverable denominator under the SAME honest per-record contiguous
+// rule (no overflow-category exemption). Most 0E deleted bodies are large-but-in-page
+// and contiguous; only the genuinely-overflowing records (body > usable-35, spilling
+// to a non-contiguous overflow-page chain) are excluded as future work. This honest
+// count is 3 (down from the inflated 9 the any-distinctive-column proxy produced),
+// all of which the carver recovers (0E substrate recall 3/3 = 1.000).
+const NEMETZ_0E_DRECOVERABLE: usize = 3;
 // Total phantom FP across the recall corpus (all-empty/NULL inferred records).
 const NEMETZ_FP_CEILING: usize = 10;
 // Dropped/overwritten-table recovery is bounded per DB (max recovered+fp seen).

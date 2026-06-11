@@ -133,7 +133,9 @@ def grouped_bars(ax, rows, metric, title):
     """Grouped bars: category on x, one bar per tool, with value labels."""
     ax.set_title(title, fontsize=11)
     ax.set_ylabel(metric.upper().replace("_", "."))
-    ax.set_ylim(0, 1.0)
+    # Headroom above 1.0 so full-height (1.000) bars and their value labels never
+    # collide with the top spine.
+    ax.set_ylim(0, 1.12)
     x = np.arange(len(CAT_ORDER))
     width = 0.26
     for i, tool in enumerate(TOOL_ORDER):
@@ -160,12 +162,20 @@ def grouped_bars(ax, rows, metric, title):
     ax.set_xticks(x)
     ax.set_xticklabels(CAT_ORDER)
     ax.set_xlabel("category")
-    ax.legend(fontsize=8, loc="upper right")
+    # Legend BELOW the axis (horizontal): the upper area is full of 1.000 bars
+    # (ours/fqlite on 0D, ours on 0E), so an in-plot legend would overlap them.
+    ax.legend(
+        fontsize=8,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.13),
+        ncol=len(TOOL_ORDER),
+        frameon=False,
+    )
 
 
 def main():
     rows = load(CSV_PATH)
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.8))
     panel_pr(axes[0], rows)
     grouped_bars(axes[1], rows, "f1", "F1 (balanced)")
     grouped_bars(axes[2], rows, "f0_5", "F0.5 (precision-weighted)")
@@ -174,7 +184,7 @@ def main():
         "(0C/0D/0E, harness-computed)",
         fontsize=12,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.tight_layout(rect=(0, 0.07, 1, 0.96))
     fig.savefig(PNG_PATH, dpi=130)
     print(f"wrote {PNG_PATH}")
 

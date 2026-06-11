@@ -594,14 +594,103 @@ fn ours_never_rereads_a_live_row() {
 // deleted PRIOR schema version (e.g. a dropped table's old `CREATE TABLE`) has a
 // different identity and is therefore NOT counted — only the LIVE row is.
 
+/// The CURRENT live `sqlite_master` identities of a database, as
+/// `(type, name, tbl_name)` strings rendered with the same `cell()` convention
+/// used for every other tool projection. A recovered record matching one of these
+/// is the live schema row re-surfaced.
+fn live_schema_identities(db: &Database) -> BTreeSet<(String, String, String)> {
+    db.live_schema_rows()
+        .iter()
+        .map(|row| (cell(row.first()), cell(row.get(1)), cell(row.get(2))))
+        .collect()
+}
+
+/// Our carver's count of recovered records equal to a live `sqlite_master` row —
+/// 0 after the precision fix that folds the live schema rows into the live filter.
+fn ours_schema_rereads(db: &Database) -> usize {
+    let live = live_schema_identities(db);
+    carve_all_deleted_records(db)
+        .iter()
+        .filter(|r| {
+            live.contains(&(
+                cell(r.values.first()),
+                cell(r.values.get(1)),
+                cell(r.values.get(2)),
+            ))
+        })
+        .count()
+}
+
+/// undark's count of recovered records equal to a live `sqlite_master` row.
+/// undark emits raw `rowid,addr,col1,col2,...` cell rows; a re-read of the schema
+/// row would surface its `(type, name, tbl_name)` as the first three data fields
+/// (CSV fields 1/2/3 after the rowid+addr prefix). undark does not reconstruct
+/// `sqlite_master`, so this is measured (not assumed) to be 0.
+fn undark_schema_rereads(
+    undark: &Path,
+    db_file: &Path,
+    live: &BTreeSet<(String, String, String)>,
+) -> usize {
+    let out = Command::new(undark)
+        .arg("-i")
+        .arg(db_file)
+        .output()
+        .expect("undark must execute");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut n = 0;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f = split_csv(line);
+        if f.len() >= 4 && live.contains(&(unquote(&f[1]), unquote(&f[2]), unquote(&f[3]))) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// fqlite's count of recovered records equal to a live `sqlite_master` row.
+/// fqlite emits the schema record as `rowid,offset,id,rootpage,type,name,tbl_name,
+/// ncol,sql` — its `(type, name, tbl_name)` are CSV fields 4/5/6. Counted iff that
+/// identity equals a currently-live page-1 schema row (so a genuinely-deleted
+/// PRIOR schema version, which carries a different identity, is not miscounted).
+fn fqlite_schema_rereads(
+    tap: &Path,
+    db_file: &Path,
+    live: &BTreeSet<(String, String, String)>,
+) -> usize {
+    let out = Command::new(tap)
+        .arg(db_file)
+        .output()
+        .expect("fqlite tap must execute");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut n = 0;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f = split_csv(line);
+        if f.len() >= 7 && live.contains(&(unquote(&f[4]), unquote(&f[5]), unquote(&f[6]))) {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Per-tool live `sqlite_master` re-read totals across the in-scope (0C/0D/0E)
-/// corpus, the precision artifact #67 measures: our carver re-reads the live
-/// schema row **0** times (the #64 live-schema filter), undark **0** times (it
-/// never reconstructs `sqlite_master`), and fqlite **28** times (it emits the
-/// live schema-table row as a recovered record on every database — one per
-/// single-table DB, two per two-table DB). Pinned as exact measurements; the
-/// undark/fqlite legs skip when their gate env var is unset (CI stays green
-/// without the tools), while the `ours == 0` guarantee is always asserted.
+/// corpus, the precision artifact this measures: our carver re-reads the live
+/// schema row **0** times (the live-schema precision filter), undark **0** times
+/// (it never reconstructs `sqlite_master`), and fqlite **25** times (it emits the
+/// live schema-table row as a recovered record on every in-scope database — one
+/// per single-table DB, two per two-table DB). The scope is `in_scope()`, the
+/// same 18 databases the head-to-head scores (0C/0D/0E minus the two FLOAT-key
+/// exclusions 0C-06/0C-07); including those two would add 3 more fqlite re-reads
+/// (0C-06 has one schema row, 0C-07 two), for 28 over all twenty 0C/0D/0E
+/// databases. Pinned as exact
+/// measurements; the undark/fqlite legs skip when their gate env var is unset (CI
+/// stays green without the tools), while the `ours == 0` guarantee is always
+/// asserted.
 #[test]
 fn live_sqlite_master_rereads_per_tool() {
     let undark = undark_bin();
@@ -654,7 +743,9 @@ fn live_sqlite_master_rereads_per_tool() {
 }
 
 /// fqlite's measured live `sqlite_master` re-read total across the in-scope
-/// (0C/0D/0E) corpus: it emits the live schema-table row as a recovered record on
-/// every database (one per single-table DB, two per two-table DB), 28 in total.
-/// Pinned so a change in fqlite's schema-row behavior surfaces as a test update.
-const NEMETZ_FQLITE_SCHEMA_REREADS: usize = 28;
+/// (0C/0D/0E) corpus — the 18 databases the head-to-head scores (minus the two
+/// FLOAT-key exclusions 0C-06/0C-07). fqlite emits the live schema-table row as a
+/// recovered record on every in-scope database (one per single-table DB, two per
+/// two-table DB), 25 in total. Pinned so a change in fqlite's schema-row behavior
+/// surfaces as a test update.
+const NEMETZ_FQLITE_SCHEMA_REREADS: usize = 25;

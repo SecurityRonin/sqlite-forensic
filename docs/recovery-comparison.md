@@ -53,7 +53,7 @@ regenerate its table). Corpus and oracle provenance are in
   is destroyed but a distinctive cell survives (`carve --fragments`). It is kept
   strictly separate from the full-row tier — it has an expected non-zero
   false-positive rate, so the default output never includes it. See
-  "[Two-tier recovery](#two-tier-recovery--tier-2-fragments)".
+  "[Two-tier recovery](#two-tier-recovery-tier-2-fragments)".
 - **Two recall denominators** are reported because they answer different questions
   — substrate-limited (carver capability) and end-to-end (examiner usefulness).
 - These are honest measurements of *each tool* against *this* corpus, not a
@@ -238,7 +238,7 @@ Recall is reported with two denominators:
 examiner more than discarding a low-confidence phantom), over precision and
 substrate-limited recall.
 
-The Tier-2 fragment surface (see "[Two-tier recovery](#two-tier-recovery--tier-2-fragments)")
+The Tier-2 fragment surface (see "[Two-tier recovery](#two-tier-recovery-tier-2-fragments)")
 is measured with its own counts, never blended into the full-row matrix above:
 
 - **fragment-recoverable** = the denominator: deleted rows whose full identity is

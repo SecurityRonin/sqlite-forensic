@@ -449,13 +449,17 @@ const NEMETZ_0D_TP_FLOOR: usize = 19;
 // inflated 19/36 = 0.528). The substrate is small because overwrites genuinely
 // destroyed ~26 of the 45 deleted rows, not because the harness is lenient.
 const NEMETZ_0D_DRECOVERABLE: usize = 19;
-// 0E substrate-recoverable denominator under the SAME honest per-record contiguous
-// rule (no overflow-category exemption). Most 0E deleted bodies are large-but-in-page
-// and contiguous; only the genuinely-overflowing records (body > usable-35, spilling
-// to a non-contiguous overflow-page chain) are excluded as future work. This honest
-// count is 3 (down from the inflated 9 the any-distinctive-column proxy produced),
-// all of which the carver recovers (0E substrate recall 3/3 = 1.000).
-const NEMETZ_0E_DRECOVERABLE: usize = 3;
+// 0E substrate-recoverable denominator under the honest per-record rule, now
+// EXTENDED to the overflow class by chain-followability (task #73): a genuinely-
+// overflowing row (body > usable-35) counts when its freed overflow chain is
+// followable through freelist LEAVES to a byte-exact reassembly of the expected
+// payload. Most 0E deleted bodies are large-but-in-page and contiguous; of the two
+// truly-overflowing rows, one (0E-01 'Ella', chain page 13 a freelist leaf)
+// survives byte-perfect and now counts, the other (0E-01 'Matteo', chain page 5
+// reallocated as the freelist trunk) is destroyed and does NOT. The honest count
+// is 4 (3 in-page contiguous + 1 followable chain), all of which the carver
+// recovers (0E substrate recall 4/4 = 1.000).
+const NEMETZ_0E_DRECOVERABLE: usize = 4;
 // Total phantom FP across the recall corpus (all-empty/NULL inferred records).
 const NEMETZ_FP_CEILING: usize = 10;
 // 0D fragment-recoverable denominator (Tier-2): deleted rows whose full identity
@@ -464,8 +468,11 @@ const NEMETZ_FP_CEILING: usize = 10;
 // INTEGER-only "survivors" are excluded (coincidence-prone), so this is the
 // honest ~5, not the integer-pattern-inflated legacy any-column upper bound.
 const NEMETZ_0D_FRAGMENT_RECOVERABLE: usize = 5;
-// 0E fragment-recoverable denominator under the same distinctive-cell rule.
-const NEMETZ_0E_FRAGMENT_RECOVERABLE: usize = 4;
+// 0E fragment-recoverable denominator under the same distinctive-cell rule. Now 3
+// (was 4): chain-aware overflow recovery (task #73) lifted 'Ella' out of the
+// fragment denominator into the substrate-recoverable set (its chain is now
+// followable), since fragment-recoverable short-circuits on substrate.
+const NEMETZ_0E_FRAGMENT_RECOVERABLE: usize = 3;
 // 0C is fully reconstructable, so no row is fragment-recoverable.
 const NEMETZ_0C_FRAGMENT_RECOVERABLE: usize = 0;
 // Dropped/overwritten-table recovery is bounded per DB (max recovered+fp seen).
@@ -560,9 +567,12 @@ fn fragment_substrate_denominators_match_manifest() {
 // docs/recovery-comparison.md). Raising it by an overflow-chain or template-free
 // salvage is future work; this floor pins the current honest yield.
 const NEMETZ_0D_FRAGMENT_TP_FLOOR: usize = 1;
-// 0E fragment-TP floor: 0E fragment substrate is long TEXT split across overflow
-// pages, unreachable by flat contiguity in v1 — measured yield is 0.
-const NEMETZ_0E_FRAGMENT_TP_FLOOR: usize = 0;
+// 0E fragment-TP floor: chain-aware overflow recovery (task #73) salvages the
+// broken-chain 'Matteo' row (0E-01, chain page 5 reallocated as the freelist
+// trunk) as a Tier-2 fragment — its intact local prefix yields id=20003 and
+// name='Matteo'. The chain-resident code/zip are lost, so it is a fragment, not
+// a full row. Measured 0E fragment-TP is 1.
+const NEMETZ_0E_FRAGMENT_TP_FLOOR: usize = 1;
 // Fragment false-positive ceiling across the whole recall corpus: a fragment
 // whose distinctive cells match NO deleted row and NO live row is a
 // fragment-phantom. The Tier-2 mechanism PERMITS a non-zero rate (a lone
@@ -659,10 +669,9 @@ fn fragment_yield_meets_floor() {
         tp_0d >= NEMETZ_0D_FRAGMENT_TP_FLOOR,
         "0D fragment-TP {tp_0d} < floor {NEMETZ_0D_FRAGMENT_TP_FLOOR}"
     );
-    // 0E floor is currently 0 (overflow substrate unreachable in v1); assert the
-    // exact measured value so a future regression that loses a recovered 0E
-    // fragment, or an unexpected gain, both surface rather than silently pass a
-    // `>= 0` tautology.
+    // 0E fragment-TP is the exact measured value (1: the broken-chain 'Matteo'
+    // salvage) so a future regression that loses it, or an unexpected gain, both
+    // surface rather than silently pass a `>= 0` tautology.
     assert_eq!(
         tp_0e, NEMETZ_0E_FRAGMENT_TP_FLOOR,
         "0E fragment-TP {tp_0e} != measured {NEMETZ_0E_FRAGMENT_TP_FLOOR}"

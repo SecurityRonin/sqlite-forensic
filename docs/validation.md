@@ -242,3 +242,42 @@ agreement is required and holds (vacuously, since our set is empty); our carver 
 - **Epistemic stance:** carved records remain confidence-graded observations
   ("consistent with a deleted row"); this validation likewise establishes *consistency
   with* two independent oracles, not proof of correctness.
+
+## Chain-aware overflow recovery (task #73)
+
+Deleted rows whose payload spilled onto a SQLite **overflow-page chain** are recovered
+when every chain page survives as a freelist **leaf** (content-preserving). The
+validation evidence:
+
+- **Independent byte-equality substrate.** The ground-truth generator
+  (`tests/data/nemetz/gen_ground_truth.py`, `chain_followable`) decides recoverability
+  purely from the raw `.db` bytes, with no reference to our carver: it rebuilds the
+  expected record payload from the answer key, finds its local-payload prefix, walks the
+  chain through the file's freelist leaves, and requires the assembled bytes to equal the
+  expected payload **exactly**. This is the substrate oracle for the overflow class.
+- **Real-corpus probe (`0E-01.db`).** Two deleted rows genuinely overflow. `Ella`
+  (`id = 20012`, chain page 13 — a freelist leaf) reassembles byte-perfect and is
+  recovered as a Tier-1 full row with chain provenance `[13]`. `Matteo`
+  (`id = 20003`, chain page 5 — reallocated as the freelist trunk, head clobbered) does
+  **not** reassemble: it is rejected from Tier-1 and surfaces only as a Tier-2 fragment
+  (`id`, `name` from its intact local prefix). Asserted in
+  `forensic/tests/overflow_chain.rs`.
+- **Differential.** Against the `Drec = 4` denominator, ours recovers all 4 at precision
+  1.000; undark 3/4, fqlite 2/4 (`recovery-comparison.md`). The destroyed `Matteo` chain
+  is the corpus's built-in false-positive probe: a carver that "recovers" it as a full
+  row is wrong.
+
+- **Residual risk (documented, not hidden).** Overflow Tier-1 is **not** part of the
+  in-page tier's structural 0-false-positive guarantee. A freelist leaf can be *stale* —
+  allocated, overwritten, freed, and now a leaf holding unrelated bytes that happen to
+  decode. The freelist-leaf requirement plus a strict-UTF-8 reject gate make a clean
+  decode strong evidence, but cannot *prove* the reassembled bytes are the original
+  record (a stale leaf with valid-UTF-8 content of matching length is not detectable).
+  The chain-reassembled row is therefore graded **below** the in-page full-row tier and
+  remains a "consistent with a deleted row" observation, never a verdict. A synthetic
+  negative test (`forensic/tests/overflow_chain.rs`) exercises this rejection path.
+- **Out of scope / unproven.** A freeblock-clobbered *spilled* cell (prefix destroyed
+  AND payload spilled) is reconstructable in principle (P re-derived from the surviving
+  serial array) but has **no instance in this corpus**, so it is validated against a
+  **synthetic fixture only** and marked unproven-by-corpus in the code and here. WAL-frame
+  resolution of spilled cells is also deferred.

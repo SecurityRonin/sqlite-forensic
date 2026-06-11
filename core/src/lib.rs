@@ -62,6 +62,15 @@ pub enum Error {
     MalformedOverflow,
 }
 
+/// A freed overflow-page chain could not be followed to a complete, trustworthy
+/// payload (task #73): a chain page that is not a freelist leaf (live / trunk /
+/// unreachable), a cycle, a premature terminator with bytes still owed, an
+/// out-of-range page, or a declared payload exceeding the freelist's capacity.
+/// Carries no detail by design — any break is a uniform "this chain is not
+/// recoverable as a Tier-1 row", and the candidate degrades to a Tier-2 fragment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainBreak;
+
 /// A single decoded column value from a table row. Mirrors `SQLite`'s storage
 /// classes.
 #[derive(Debug, Clone, PartialEq)]
@@ -126,6 +135,34 @@ pub struct CellFragment {
     /// Always [`FRAGMENT_CONFIDENCE`] for now; the field is kept so future
     /// per-fragment grading does not change the public type.
     pub confidence: f32,
+}
+
+/// A freed table-leaf cell whose declared payload **spills onto an overflow-page
+/// chain** (task #73). Recognized by [`try_carve_spilled_cell_at`] from the
+/// cell's intact local prefix; the chain itself is resolved separately
+/// ([`Database::read_freed_overflow_chain`]) because that needs whole-database
+/// access. A `SpilledCell` is deliberately NOT a [`CarvedCell`]: until its chain
+/// is walked and validated it cannot masquerade as a recovered row (secure by
+/// design — the type system keeps an unresolved spill out of the full-row output).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpilledCell {
+    /// Byte offset of the cell within the scanned slice.
+    pub offset: usize,
+    /// On-page footprint of the cell prefix: `n1 + n2 + local_len + 4`.
+    pub byte_len: usize,
+    /// Declared total payload length `P` (header + full body).
+    pub payload_len: usize,
+    /// Decoded rowid varint (intact-prefix anchors); `0` when the prefix was
+    /// clobbered and the rowid is unrecoverable (template path).
+    pub rowid: i64,
+    /// Full serial-type array, decoded from the local record header.
+    pub serials: Vec<i64>,
+    /// Local payload bytes kept on the leaf page (`local_payload_len(P, usable)`).
+    pub local_len: usize,
+    /// Offset, within the scanned slice, at which the local payload begins.
+    pub local_payload_off: usize,
+    /// First overflow-page number (big-endian u32 at `local_payload_off + local_len`).
+    pub first_overflow: u32,
 }
 
 /// Parsed 100-byte `SQLite` file header.
@@ -219,6 +256,18 @@ const MIN_INFERRED_COLUMNS: usize = 2;
 /// freeblock may have been reused) than whole-page freelist recovery, so it is
 /// graded a notch lower even when it parses cleanly.
 const IN_PAGE_CONFIDENCE_FACTOR: f32 = 0.8;
+
+/// Confidence multiplier applied to a **chain-reassembled overflow** full row
+/// (task #73, [`Database::carve_overflow_records`]). Overflow Tier-1 is NOT part
+/// of the structural 0-false-positive guarantee (Codex ruling #1): a freelist
+/// *leaf* page can be stale — allocated, overwritten, freed, now a leaf holding
+/// unrelated bytes that happen to decode. The freelist-leaf requirement plus the
+/// strict-UTF-8 gate make a clean decode strong evidence, but one indirection
+/// weaker than a contiguous in-page span, so it is graded below the in-page
+/// full-row tier (0.9 × this factor). The residual stale-leaf risk is documented
+/// and the row remains a "consistent with a deleted row" observation, never a
+/// verdict.
+const OVERFLOW_CHAIN_CONFIDENCE_FACTOR: f32 = 0.75;
 
 /// Confidence assigned to a record rebuilt by **freeblock reconstruction**
 /// ([`Database::reconstruct_freeblock_records`]). The cell's first four bytes
@@ -382,7 +431,38 @@ impl Database {
     /// out-of-range page, or a leaf-pointer count larger than a trunk page can
     /// hold aborts with [`Error::MalformedFreelist`] rather than looping.
     pub fn freelist_pages(&self) -> Result<Vec<u32>, Error> {
-        let mut free = Vec::new();
+        let (leaves, trunks) = self.freelist_pages_split()?;
+        // Preserve the historical order: each trunk's leaves, then the trunk.
+        // The split sets are ordered, which is sufficient for every caller (they
+        // treat the result as a set), and keeps a single source of truth.
+        let mut free: Vec<u32> = leaves.into_iter().collect();
+        free.extend(trunks);
+        Ok(free)
+    }
+
+    /// Walk the freelist and return its **leaf** and **trunk** page numbers
+    /// separately (task #73). The distinction is load-bearing for chain-aware
+    /// overflow recovery: a freed page that became a freelist *leaf* keeps its
+    /// former content byte-for-byte, while a *trunk* page has its head
+    /// (next-trunk pointer + leaf count + leaf-number array) written over the
+    /// former content (file-format §"The Freelist"). Only leaves are
+    /// content-preserving, so [`Database::read_freed_overflow_chain`] accepts a
+    /// chain page only when it is a leaf.
+    ///
+    /// Bounded identically to [`Database::freelist_pages`]: a cyclic trunk chain,
+    /// an out-of-range page, or an over-large leaf count aborts with
+    /// [`Error::MalformedFreelist`] rather than looping.
+    pub fn freelist_pages_split(
+        &self,
+    ) -> Result<
+        (
+            std::collections::BTreeSet<u32>,
+            std::collections::BTreeSet<u32>,
+        ),
+        Error,
+    > {
+        let mut leaves = std::collections::BTreeSet::new();
+        let mut trunks = std::collections::BTreeSet::new();
         let mut trunk = be_u32(&self.bytes, SQLITE_FREELIST_TRUNK_OFFSET);
         let total_pages = self.file_page_count();
         // Each trunk page holds at most (page_size/4 - 2) leaf pointers.
@@ -409,13 +489,72 @@ impl Database {
                 if leaf == 0 || leaf > total_pages {
                     return Err(Error::MalformedFreelist);
                 }
-                free.push(leaf);
+                leaves.insert(leaf);
             }
-            // The trunk page itself is also a free page.
-            free.push(trunk);
+            trunks.insert(trunk);
             trunk = next;
         }
-        Ok(free)
+        Ok((leaves, trunks))
+    }
+
+    /// Follow a **freed** overflow-page chain starting at `first`, reading raw
+    /// main-file pages only (carving wants on-disk residue, not the WAL view),
+    /// and assemble up to `remaining` content bytes (task #73). The carve-side
+    /// dual of [`Database::read_overflow_chain`], with one extra discipline that
+    /// makes it the 0-FP-relevant guard: **every chain page must be a freelist
+    /// leaf** (`freed_leaves`). A page that is not a leaf is live, a trunk, or
+    /// unreachable — following its pointer would risk reading reused or clobbered
+    /// content, so it is a [`ChainBreak`] (Codex ruling #2: the leaf requirement,
+    /// not the UTF-8 gate, is what rejects a destroyed chain).
+    ///
+    /// Returns the assembled content and the ordered list of chain pages on
+    /// success. Robustness (Paranoid Gatekeeper, design §4.2): the anti-bomb cap
+    /// rejects upfront any `remaining` above what the freelist leaves can deliver
+    /// (`(usable - 4) × freed_leaves.len()`), so an attacker-declared huge
+    /// payload dies before any allocation; cycles are caught by a visited set;
+    /// a premature `next == 0` with bytes still wanted, an out-of-range page, or
+    /// page 0 mid-chain all break. Never panics — every read is bounds-checked.
+    pub fn read_freed_overflow_chain(
+        &self,
+        first: u32,
+        remaining: usize,
+        usable: usize,
+        freed_leaves: &std::collections::BTreeSet<u32>,
+    ) -> Result<(Vec<u8>, Vec<u32>), ChainBreak> {
+        let per_page = usable.checked_sub(4).filter(|&p| p > 0).ok_or(ChainBreak)?;
+        // Anti-bomb cap: the chain can deliver at most this many bytes. Reject an
+        // absurd declared payload before allocating (design §4.2).
+        let max_deliverable = per_page.checked_mul(freed_leaves.len()).ok_or(ChainBreak)?;
+        if remaining > max_deliverable {
+            return Err(ChainBreak);
+        }
+        let total_pages = self.file_page_count();
+        let mut content = Vec::with_capacity(remaining);
+        let mut chain = Vec::new();
+        let mut visited = std::collections::BTreeSet::new();
+        let mut page = first;
+        let mut left = remaining;
+        while left > 0 {
+            if page == 0 || page > total_pages {
+                return Err(ChainBreak);
+            }
+            // The load-bearing guard: a chain page must be a freelist LEAF.
+            if !freed_leaves.contains(&page) {
+                return Err(ChainBreak);
+            }
+            if !visited.insert(page) {
+                return Err(ChainBreak); // cycle
+            }
+            let slice = self.raw_page(page).ok_or(ChainBreak)?;
+            let next = be_u32(slice, 0);
+            let take = left.min(per_page);
+            let chunk = slice.get(4..4 + take).ok_or(ChainBreak)?;
+            content.extend_from_slice(chunk);
+            chain.push(page);
+            left -= take;
+            page = next;
+        }
+        Ok((content, chain))
     }
 
     /// Raw bytes of the 1-based `page` from the **main file only**, ignoring any
@@ -589,6 +728,259 @@ impl Database {
                 cell.offset += lo;
                 cell.confidence *= IN_PAGE_CONFIDENCE_FACTOR;
                 out.push(cell);
+            }
+        }
+        out
+    }
+
+    /// Recover **spilled** deleted records on a table-leaf page whose payload
+    /// continued onto a freed overflow-page chain (task #73). Scans the page's
+    /// free regions (the complement of the live cells — same discipline as
+    /// [`Database::carve_free_regions`], so a live cell is never re-surfaced) for
+    /// a [`SpilledCell`], then resolves each chain through freelist **leaf** pages
+    /// only and assembles the full payload.
+    ///
+    /// A resolved record is returned only when ALL hold (design §5):
+    /// 1. the chain is intact through freelist leaves (Codex ruling #2: the leaf
+    ///    requirement is the load-bearing 0-FP guard — a trunk/live/off-freelist
+    ///    chain page is rejected);
+    /// 2. the assembled bytes total exactly the declared `P` and decode cleanly;
+    /// 3. **strict UTF-8 on chain-resident TEXT** — an EXTRA reject signal, not a
+    ///    correctness proof (Codex ruling #2: a clobbered chain can still be valid
+    ///    UTF-8, so this cannot prove integrity; it only catches the cases where
+    ///    the lossy decoder would otherwise mask an overwrite as `U+FFFD`).
+    ///
+    /// Each returned tuple is `(cell, chain)` where `chain` is the ordered list of
+    /// overflow pages the bytes came from (for provenance). Confidence is graded
+    /// BELOW the in-page full-row tier (Codex ruling #1: overflow Tier-1 is a
+    /// graded recovery, NOT part of the structural 0-FP guarantee — a freelist
+    /// leaf can be stale, holding unrelated bytes that happen to decode). Bounded
+    /// and panic-free; a malformed page or chain simply yields fewer records.
+    #[must_use]
+    pub fn carve_overflow_records(&self, page_bytes: &[u8]) -> Vec<(CarvedCell, Vec<u32>)> {
+        let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
+            SQLITE_HEADER_SIZE
+        } else {
+            0
+        };
+        let Some(&page_type) = page_bytes.get(hdr_off) else {
+            return Vec::new();
+        };
+        if page_type != 0x0d {
+            return Vec::new(); // only table-leaf pages carry spilled-cell residue
+        }
+        let Ok((freed_leaves, _trunks)) = self.freelist_pages_split() else {
+            return Vec::new();
+        };
+        let usable = self.header.usable_size() as usize;
+
+        let mut out = Vec::new();
+        let regions = self.free_regions_of_leaf(page_bytes, hdr_off);
+        for (lo, hi) in regions {
+            let Some(region) = page_bytes.get(lo..hi) else {
+                continue; // cov:unreachable: free_regions yields in-bounds spans
+            };
+            // Scan every offset for a spilled cell (recognizer abstains on in-page
+            // payloads, so the two carve classes never overlap).
+            let mut off = 0usize;
+            while off < region.len() {
+                let Some(sc) = try_carve_spilled_cell_at(region, off, usable, None) else {
+                    off += 1;
+                    continue;
+                };
+                if let Some((mut cell, chain)) =
+                    self.resolve_spilled(region, &sc, usable, &freed_leaves)
+                {
+                    // Translate the region-local offset to page-local.
+                    cell.offset = lo + sc.offset;
+                    out.push((cell, chain));
+                    off += sc.byte_len.max(1);
+                } else {
+                    off += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve a recognized [`SpilledCell`] to a full [`CarvedCell`] by walking
+    /// its freed overflow chain and decoding the assembled payload, applying the
+    /// strict-UTF-8 chain gate. Returns `Some((cell, chain))` on a fully-validated
+    /// recovery, `None` on any chain break or gate failure (the candidate then
+    /// degrades to a Tier-2 fragment elsewhere).
+    fn resolve_spilled(
+        &self,
+        region: &[u8],
+        sc: &SpilledCell,
+        usable: usize,
+        freed_leaves: &std::collections::BTreeSet<u32>,
+    ) -> Option<(CarvedCell, Vec<u32>)> {
+        let remaining = sc.payload_len.checked_sub(sc.local_len)?;
+        let local_payload =
+            region.get(sc.local_payload_off..sc.local_payload_off + sc.local_len)?;
+        let (chain_content, chain) = self
+            .read_freed_overflow_chain(sc.first_overflow, remaining, usable, freed_leaves)
+            .ok()?;
+        let mut payload = Vec::with_capacity(sc.payload_len);
+        payload.extend_from_slice(local_payload);
+        payload.extend_from_slice(&chain_content);
+        if payload.len() != sc.payload_len {
+            return None; // cov:unreachable: chain delivers exactly `remaining` bytes
+        }
+
+        let values = decode_record(&payload, sc.serials.len(), sc.rowid).ok()?;
+        if values.len() != sc.serials.len() {
+            return None; // cov:unreachable: decode_record yields one value per serial
+        }
+        // Strict-UTF-8 gate on chain-resident TEXT (extra reject signal): the
+        // lossy decoder turns a clobbered byte into U+FFFD, so any replacement
+        // char in a decoded TEXT value means the chain-supplied bytes did not
+        // decode cleanly — reject. NOT a proof of integrity (a stale leaf can hold
+        // valid UTF-8); the freelist-leaf requirement is the load-bearing guard.
+        let any_replacement = values.iter().any(|v| match v {
+            Value::Text(t) => t.contains('\u{FFFD}'),
+            _ => false,
+        });
+        if any_replacement {
+            return None;
+        }
+        // Require at least one distinctive column so a coincidental decode of stale
+        // bytes does not anchor a full row (the same identity bar as fragments).
+        if !values.iter().any(is_distinctive) {
+            return None; // cov:unreachable: the spilled corpus rows carry distinctive TEXT
+        }
+
+        let cell = CarvedCell {
+            offset: sc.offset,
+            byte_len: sc.byte_len,
+            rowid: sc.rowid,
+            values,
+            // Graded below the in-page full-row tier (0.9): an overflow chain adds
+            // one indirection of stale-leaf exposure (Codex ruling #1).
+            confidence: 0.9 * OVERFLOW_CHAIN_CONFIDENCE_FACTOR,
+        };
+        Some((cell, chain))
+    }
+
+    /// Reconstruct **freeblock-clobbered spilled** cells (task #73, design §2.2 /
+    /// Codex ruling #5). When a freed cell whose payload spilled is also
+    /// freeblock-clobbered, its declared `P` is destroyed but **re-derivable** from
+    /// the surviving structure: `P = header_len + Σ serial_body_len` over the full
+    /// (template + surviving) serial array. When that `P` exceeds `usable - 35` the
+    /// record is spilled by construction, so we read the 4-byte first-overflow
+    /// pointer that follows the local payload and resolve the chain through
+    /// freelist leaves, exactly as the intact-prefix path does — but with
+    /// `rowid = 0` (the prefix's rowid varint was clobbered, never invented).
+    ///
+    /// UNPROVEN-BY-CORPUS (Codex ruling #5): no real Nemetz `0E` cell is *both*
+    /// freeblock-clobbered *and* spilled — every measured spilled cell kept an
+    /// intact prefix in the unallocated gap. This path is therefore validated
+    /// against a **synthetic** fixture only; it is the general solution the
+    /// no-special-case rule requires (it applies the same spill formula to the
+    /// clobbered class), but its real-data behavior is not yet observed.
+    ///
+    /// Returns `(cell, chain)` per fully-resolved record. Bounded and panic-free.
+    #[must_use]
+    pub fn carve_overflow_template_records(
+        &self,
+        page_bytes: &[u8],
+    ) -> Vec<(CarvedCell, Vec<u32>)> {
+        let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
+            SQLITE_HEADER_SIZE
+        } else {
+            0
+        };
+        if page_bytes.get(hdr_off) != Some(&0x0d) {
+            return Vec::new();
+        }
+        let Some(template) = freeblock_template(page_bytes, hdr_off) else {
+            return Vec::new();
+        };
+        let Ok((freed_leaves, _trunks)) = self.freelist_pages_split() else {
+            return Vec::new();
+        };
+        let usable = self.header.usable_size() as usize;
+
+        let mut out = Vec::new();
+        // Walk the freeblock chain; at each freeblock head, try a clobbered-spill
+        // reconstruction (the chain pass reaches the clobbered prefix the
+        // intact-prefix recognizer cannot read).
+        let first_freeblock = be_u16(page_bytes, hdr_off + 1) as usize;
+        let mut fb = first_freeblock;
+        let mut walked = 0usize;
+        let mut visited = std::collections::BTreeSet::new();
+        while fb != 0 && walked < MAX_FREEBLOCKS_PER_PAGE {
+            walked += 1;
+            if !visited.insert(fb) {
+                break; // cyclic next pointer
+            }
+            let next = be_u16(page_bytes, fb) as usize;
+            if let Some((cell, chain)) =
+                template.reconstruct_spilled(self, page_bytes, fb, usable, &freed_leaves)
+            {
+                out.push((cell, chain));
+            }
+            fb = next;
+        }
+        out
+    }
+
+    /// Tier-2 salvage for **spilled** cells whose overflow chain is broken (task
+    /// #73, Codex ruling #4): when [`Database::carve_overflow_records`] rejects a
+    /// recognized spilled cell because its chain failed (a trunk-clobbered or
+    /// reused chain page), the cell's intact LOCAL prefix still holds the columns
+    /// whose bodies fit entirely on the leaf page. Those are salvaged as a
+    /// [`CellFragment`] — the same Tier-2 surface freeblock reconstruction uses.
+    ///
+    /// Only columns whose body lies wholly within the local payload are kept; the
+    /// chain-resident columns are lost (untrusted by definition — the chain that
+    /// would supply them is the thing that failed). A fragment is emitted only
+    /// when the salvaged prefix carries ≥ 1 distinctive cell (TEXT ≥ 4 bytes of
+    /// valid UTF-8, or REAL — the §3.1 gate), so a lone integer prefix never
+    /// anchors one. Bounded and panic-free.
+    #[must_use]
+    pub fn carve_overflow_fragments(&self, page_bytes: &[u8]) -> Vec<CellFragment> {
+        let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
+            SQLITE_HEADER_SIZE
+        } else {
+            0
+        };
+        let Some(&page_type) = page_bytes.get(hdr_off) else {
+            return Vec::new();
+        };
+        if page_type != 0x0d {
+            return Vec::new();
+        }
+        let Ok((freed_leaves, _trunks)) = self.freelist_pages_split() else {
+            return Vec::new();
+        };
+        let usable = self.header.usable_size() as usize;
+
+        let mut out = Vec::new();
+        let regions = self.free_regions_of_leaf(page_bytes, hdr_off);
+        for (lo, hi) in regions {
+            let Some(region) = page_bytes.get(lo..hi) else {
+                continue; // cov:unreachable: free_regions yields in-bounds spans
+            };
+            let mut off = 0usize;
+            while off < region.len() {
+                let Some(sc) = try_carve_spilled_cell_at(region, off, usable, None) else {
+                    off += 1;
+                    continue;
+                };
+                // Only broken chains degrade to a fragment — an intact chain is a
+                // Tier-1 row (handled by carve_overflow_records), never both.
+                let remaining = sc.payload_len.saturating_sub(sc.local_len);
+                let chain_ok = self
+                    .read_freed_overflow_chain(sc.first_overflow, remaining, usable, &freed_leaves)
+                    .is_ok();
+                if !chain_ok {
+                    if let Some(mut frag) = salvage_local_prefix(region, &sc) {
+                        frag.offset += lo;
+                        out.push(frag);
+                    }
+                }
+                off += sc.byte_len.max(1);
             }
         }
         out
@@ -2312,6 +2704,131 @@ impl FreeblockTemplate {
             record_end,
         ))
     }
+
+    /// Reconstruct a freeblock-clobbered **spilled** cell at `cell_start` (task
+    /// #73, design §2.2). A spilled cell always carries a multi-byte
+    /// `payload_len` varint, so the 4-byte freeblock clobber destroys the
+    /// `payload_len` + `rowid` varints and the record's `header_len` varint —
+    /// **but not the serial-type array**, which survives intact immediately after
+    /// the clobber. We therefore read the full serial array directly from
+    /// `cell_start + CLOBBER` (using the template only for the column count),
+    /// re-derive `header_len` and `P = header_len + Σ serial_body_len`, and — when
+    /// `P > usable - 35` — resolve the spill: `local_payload_len(P, usable)` bytes
+    /// of payload sit locally (the destroyed header counted within them), the
+    /// 4-byte first-overflow pointer follows, and the chain is resolved through
+    /// freelist leaves. Returns `(cell, chain)` with `rowid = 0`, or `None`.
+    ///
+    /// UNPROVEN-BY-CORPUS (Codex ruling #5): synthetic-fixture validation only.
+    /// No real Nemetz cell is both freeblock-clobbered and spilled.
+    fn reconstruct_spilled(
+        &self,
+        db: &Database,
+        page: &[u8],
+        cell_start: usize,
+        usable: usize,
+        freed_leaves: &std::collections::BTreeSet<u32>,
+    ) -> Option<(CarvedCell, Vec<u32>)> {
+        // The freeblock header clobbers exactly 4 bytes. For a spilled cell those
+        // 4 bytes are payload_len(>=2) + rowid(>=1) + header_len(>=1) varints, so
+        // the serial array begins right after the clobber.
+        const CLOBBER: usize = 4;
+        let serials_start = cell_start.checked_add(CLOBBER)?;
+        let mut serials = Vec::with_capacity(self.column_count);
+        let mut pos = serials_start;
+        for _ in 0..self.column_count {
+            let (s, used) = read_varint(page, pos).ok()?;
+            serial_body_len(s)?;
+            serials.push(s);
+            pos = pos.checked_add(used)?;
+        }
+
+        // Re-derive the record header bytes that were destroyed: header_len is a
+        // varint counting itself plus the serial array.
+        let mut serial_bytes_len = 0usize;
+        for &s in &serials {
+            serial_bytes_len += varint_len(s);
+        }
+        let mut header_len = serial_bytes_len + 1;
+        while varint_len(header_len as i64) + serial_bytes_len != header_len {
+            header_len += 1;
+        }
+        // The clobber removed `header_len`'s own varint plus the prefix; verify the
+        // surviving serial array aligns with the reconstructed header (the bytes
+        // from serials_start to `pos` are the serial array, length serial_bytes_len).
+        if pos.checked_sub(serials_start)? != serial_bytes_len {
+            return None; // cov:unreachable: read_varint widths sum to serial_bytes_len
+        }
+        let mut body_len = 0usize;
+        for &s in &serials {
+            body_len = body_len.checked_add(serial_body_len(s)?)?;
+        }
+        let payload_len = header_len.checked_add(body_len)?;
+        // Only the spilled class — an in-page payload is the existing template path.
+        if payload_len <= usable.checked_sub(35)? {
+            return None;
+        }
+        let local_len = local_payload_len(payload_len, usable);
+
+        // The body starts right after the surviving serial array. The local payload
+        // spans `local_len` bytes of (header ++ body); the destroyed header is
+        // `header_len` of those, so `local_len - header_len` body bytes are present
+        // locally before the 4-byte first-overflow pointer.
+        let body_start = pos;
+        let local_body = local_len.checked_sub(header_len)?;
+        let local_body_end = body_start.checked_add(local_body)?;
+        let ptr_off = local_body_end;
+        let ptr_slice = page.get(ptr_off..ptr_off + 4)?;
+        let first_overflow =
+            u32::from_be_bytes([ptr_slice[0], ptr_slice[1], ptr_slice[2], ptr_slice[3]]);
+        let local_body_bytes = page.get(body_start..local_body_end)?;
+
+        let remaining = payload_len - local_len;
+        let (chain_content, chain) = db
+            .read_freed_overflow_chain(first_overflow, remaining, usable, freed_leaves)
+            .ok()?;
+
+        // Assemble the full payload: reconstructed header ++ local body ++ chain.
+        let mut header = enc_varint_into(header_len);
+        for &s in &serials {
+            header.extend(enc_varint_into(usize::try_from(s).ok()?));
+        }
+        if header.len() != header_len {
+            return None; // cov:unreachable: header_len was solved to this width
+        }
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(&header);
+        payload.extend_from_slice(local_body_bytes);
+        payload.extend_from_slice(&chain_content);
+        if payload.len() != payload_len {
+            return None; // cov:unreachable: local_body + chain == body_len by construction
+        }
+
+        let values = decode_record(&payload, self.column_count, 0).ok()?;
+        if values.len() != self.column_count {
+            return None; // cov:unreachable: one value per serial
+        }
+        let any_replacement = values.iter().any(|v| match v {
+            Value::Text(t) => t.contains('\u{FFFD}'),
+            _ => false,
+        });
+        if any_replacement {
+            return None;
+        }
+        if !values.iter().any(is_distinctive) {
+            return None;
+        }
+
+        Some((
+            CarvedCell {
+                offset: cell_start,
+                byte_len: ptr_off + 4 - cell_start,
+                rowid: 0,
+                values,
+                confidence: FREEBLOCK_RECONSTRUCT_CONFIDENCE * OVERFLOW_CHAIN_CONFIDENCE_FACTOR,
+            },
+            chain,
+        ))
+    }
 }
 
 /// Decode a record body given an explicit serial-type array (the freeblock
@@ -2415,6 +2932,136 @@ fn try_carve_cell_at(
         rowid,
         values,
         confidence,
+    })
+}
+
+/// Recognize a freed **spilled** table-leaf cell at `off` whose payload exceeds
+/// the in-page threshold (`usable - 35`) and therefore continues on an
+/// overflow-page chain (task #73). The sibling of [`try_carve_cell_at`] for the
+/// overflow class: the two partition the candidate space by the spec spill
+/// threshold, so a cell is recognized by exactly one of them.
+///
+/// `expected_columns` is `Some(n)` to require exactly `n` columns, or `None` to
+/// infer the count (≥ [`MIN_INFERRED_COLUMNS`]). Returns a [`SpilledCell`]
+/// (recognition only — the chain is resolved later) when the local prefix is
+/// self-consistent: header fits in the local payload, the serial array consumes
+/// the header cleanly, `header_len + Σ serial_body_len == P` (length closure
+/// over the *declared* P), and the local payload plus its 4-byte overflow
+/// pointer are in-bounds. Never panics — every access is bounds-checked.
+fn try_carve_spilled_cell_at(
+    buf: &[u8],
+    off: usize,
+    usable: usize,
+    expected_columns: Option<usize>,
+) -> Option<SpilledCell> {
+    let (payload_len, n1) = read_varint(buf, off).ok()?;
+    let payload_len = usize::try_from(payload_len).ok()?;
+    // Only the overflow class — in-page payloads belong to `try_carve_cell_at`.
+    if payload_len <= usable.checked_sub(35)? {
+        return None;
+    }
+    let (rowid, n2) = read_varint(buf, off + n1).ok()?;
+    if rowid <= 0 {
+        return None;
+    }
+    let payload_start = off + n1 + n2;
+    let local_len = local_payload_len(payload_len, usable);
+    // The local payload prefix plus the 4-byte first-overflow pointer must be in
+    // bounds of the scanned slice.
+    let prefix = buf.get(payload_start..payload_start + local_len + 4)?;
+
+    // The record header must fit entirely within the local prefix — otherwise the
+    // serial array is not addressable locally and we abstain rather than guess.
+    let (header_len, hn) = read_varint(prefix, 0).ok()?;
+    let header_len = usize::try_from(header_len).ok()?;
+    if header_len > local_len || header_len < hn {
+        return None;
+    }
+    let mut serials = Vec::new();
+    let mut hpos = hn;
+    while hpos < header_len {
+        let (s, used) = read_varint(prefix, hpos).ok()?;
+        serials.push(s);
+        hpos += used;
+    }
+    if hpos != header_len {
+        return None;
+    }
+    match expected_columns {
+        Some(n) if serials.len() != n => return None,
+        None if serials.len() < MIN_INFERRED_COLUMNS => return None,
+        _ => {}
+    }
+
+    // Length closure over the DECLARED payload: header + body must equal P.
+    let mut body_len = 0usize;
+    for &s in &serials {
+        body_len += serial_body_len(s)?;
+    }
+    if header_len + body_len != payload_len {
+        return None;
+    }
+
+    let first_overflow = be_u32(prefix, local_len);
+    Some(SpilledCell {
+        offset: off,
+        byte_len: n1 + n2 + local_len + 4,
+        payload_len,
+        rowid,
+        serials,
+        local_len,
+        local_payload_off: payload_start,
+        first_overflow,
+    })
+}
+
+/// Salvage the columns of a recognized [`SpilledCell`] whose bodies lie wholly
+/// within the local payload (task #73, Codex ruling #4): the chain-resident
+/// columns are dropped (the chain that would supply them failed), and the
+/// surviving local columns become a [`CellFragment`]. Returns `None` unless the
+/// salvaged prefix carries ≥ 1 distinctive cell (the §3.1 emission gate). The
+/// returned fragment's `offset` is region-local; the caller translates it.
+fn salvage_local_prefix(region: &[u8], sc: &SpilledCell) -> Option<CellFragment> {
+    // The body begins right after the local header; decode each column while its
+    // body ends within the local payload bytes (`local_payload_off + local_len`).
+    let local_end = sc.local_payload_off.checked_add(sc.local_len)?;
+    // Recompute the record header length to find where the body starts.
+    let (header_len, _hn) = read_varint(region, sc.local_payload_off).ok()?;
+    let header_len = usize::try_from(header_len).ok()?;
+    let mut bpos = sc.local_payload_off.checked_add(header_len)?;
+
+    let mut surviving: Vec<(usize, Value)> = Vec::new();
+    for (idx, &serial) in sc.serials.iter().enumerate() {
+        let Some(blen) = serial_body_len(serial) else {
+            break; // cov:unreachable: recognizer accepted only legal serials
+        };
+        let Some(body_end) = bpos.checked_add(blen) else {
+            break; // cov:unreachable: usize add of an in-page body length
+        };
+        if body_end > local_end {
+            break; // this column's body spills into the chain — local prefix ends
+        }
+        let Some(body) = region.get(bpos..body_end) else {
+            break; // cov:unreachable: body_end <= local_end <= region.len()
+        };
+        // Column 0 of a rowid-alias table reads as the rowid when serial 0; here a
+        // spilled cell's id column is a stored integer, so decode it directly.
+        let Ok((val, _)) = decode_value(body, 0, serial) else {
+            break; // cov:unreachable: legal serials decode in-bounds
+        };
+        surviving.push((idx, val));
+        bpos = body_end;
+    }
+
+    if !surviving.iter().any(|(_, v)| is_distinctive(v)) {
+        return None;
+    }
+    Some(CellFragment {
+        offset: sc.offset,
+        byte_len: bpos.saturating_sub(sc.local_payload_off),
+        missing: sc.serials.len() - surviving.len(),
+        surviving,
+        confidence: FRAGMENT_CONFIDENCE,
     })
 }
 
@@ -2554,6 +3201,40 @@ fn be_u16(buf: &[u8], off: usize) -> u16 {
         b.copy_from_slice(s);
     }
     u16::from_be_bytes(b)
+}
+
+/// Byte width of the minimal `SQLite` varint encoding of a non-negative `value`
+/// (task #73, used to re-derive a clobbered record's `header_len`). Mirrors the
+/// 7-bit big-endian grouping of [`enc_varint_into`]; a value needing more than 8
+/// groups uses the 9-byte form. Negative inputs (illegal serial types) are
+/// treated as a single byte and rejected upstream by `serial_body_len`.
+fn varint_len(value: i64) -> usize {
+    if value < 0 {
+        return 1; // cov:unreachable: callers pass only non-negative serials/lengths
+    }
+    enc_varint_into(value as usize).len()
+}
+
+/// Minimal `SQLite` varint encoding of a non-negative `value` (task #73). 7-bit
+/// big-endian groups, high bit set on every group but the last (file-format §2).
+fn enc_varint_into(value: usize) -> Vec<u8> {
+    if value == 0 {
+        return vec![0];
+    }
+    let mut groups = Vec::new();
+    let mut n = value as u64;
+    while n > 0 {
+        groups.push((n & 0x7f) as u8);
+        n >>= 7;
+    }
+    groups.reverse();
+    let last = groups.len() - 1;
+    for (i, g) in groups.iter_mut().enumerate() {
+        if i != last {
+            *g |= 0x80;
+        }
+    }
+    groups
 }
 
 /// Bounds-checked big-endian u32; out-of-range yields 0 (never panics).
@@ -3082,5 +3763,622 @@ mod tests {
             .values
             .iter()
             .any(|v| matches!(v, Value::Text(t) if t == "Anja"))));
+    }
+
+    // ---- task #73: chain-aware overflow recovery — spilled-cell recognition ----
+
+    /// Encode a SQLite varint (minimal big-endian 7-bit groups).
+    fn enc_varint(mut n: u64) -> Vec<u8> {
+        if n == 0 {
+            return vec![0];
+        }
+        let mut groups = Vec::new();
+        while n > 0 {
+            groups.push((n & 0x7f) as u8);
+            n >>= 7;
+        }
+        groups.reverse();
+        let last = groups.len() - 1;
+        for (i, g) in groups.iter_mut().enumerate() {
+            if i != last {
+                *g |= 0x80;
+            }
+        }
+        groups
+    }
+
+    /// Build the **local prefix** bytes of a freed spilled table-leaf cell:
+    /// `payload_len varint, rowid varint, record header, local payload bytes,
+    /// 4-byte big-endian first-overflow pointer`. Returns `(bytes, P, local,
+    /// serials)`. The record is `(id INTEGER, name TEXT, code TEXT)` with `code`
+    /// large enough to force a spill past `usable - 35`.
+    fn synth_spilled_prefix(
+        rowid: i64,
+        id: i64,
+        name: &str,
+        code_len: usize,
+        usable: usize,
+        first_overflow: u32,
+    ) -> (Vec<u8>, usize, usize, Vec<i64>) {
+        let id_serial = 1i64; // 1-byte integer
+        let name_serial = 13 + 2 * name.len() as i64; // TEXT
+        let code_serial = 13 + 2 * code_len as i64; // TEXT
+        let serials = vec![id_serial, name_serial, code_serial];
+        let mut serial_bytes = Vec::new();
+        for &s in &serials {
+            serial_bytes.extend(enc_varint(s as u64));
+        }
+        // header_len varint counts itself — solve the fixed point.
+        let mut header_len = serial_bytes.len() + 1;
+        while enc_varint(header_len as u64).len() + serial_bytes.len() != header_len {
+            header_len += 1;
+        }
+        let mut header = enc_varint(header_len as u64);
+        header.extend(&serial_bytes);
+        let body_len = 1 + name.len() + code_len;
+        let payload_len = header.len() + body_len;
+        let local = local_payload_len(payload_len, usable);
+
+        // Full payload = header ++ id-body ++ name-body ++ code-body.
+        let mut payload = header.clone();
+        payload.push(id as u8); // 1-byte id
+        payload.extend(name.as_bytes());
+        payload.extend(std::iter::repeat_n(b'C', code_len));
+        assert_eq!(payload.len(), payload_len);
+
+        // Cell = prefix varints ++ local payload prefix ++ 4-byte overflow ptr.
+        let mut cell = enc_varint(payload_len as u64);
+        cell.extend(enc_varint(rowid as u64));
+        cell.extend(&payload[..local]);
+        cell.extend(first_overflow.to_be_bytes());
+        (cell, payload_len, local, serials)
+    }
+
+    #[test]
+    fn spilled_recognizer_reads_intact_prefix() {
+        let usable = 4096usize;
+        let (cell, p, local, serials) = synth_spilled_prefix(20012, 42, "Ella", 4200, usable, 13);
+        assert!(p > usable - 35, "this record must spill");
+        // Place the cell inside a larger scanned slice at a nonzero offset.
+        let off = 50usize;
+        let mut buf = vec![0u8; off];
+        buf.extend(&cell);
+        let sc = try_carve_spilled_cell_at(&buf, off, usable, Some(3))
+            .expect("must recognize the intact-prefix spilled cell");
+        assert_eq!(sc.payload_len, p);
+        assert_eq!(sc.local_len, local);
+        assert_eq!(sc.rowid, 20012);
+        assert_eq!(sc.first_overflow, 13);
+        assert_eq!(sc.serials, serials);
+        assert_eq!(sc.offset, off);
+    }
+
+    #[test]
+    fn spilled_recognizer_abstains_for_in_page_payload() {
+        let usable = 4096usize;
+        // A small (in-page) payload: the existing carve path owns it.
+        // header (3 serials) + body for a tiny code -> P <= usable-35.
+        let (cell, p, _local, _s) = synth_spilled_prefix(7, 1, "Bob", 10, usable, 9);
+        assert!(p <= usable - 35, "this record must NOT spill");
+        assert!(try_carve_spilled_cell_at(&cell, 0, usable, Some(3)).is_none());
+    }
+
+    #[test]
+    fn spilled_recognizer_abstains_on_truncated_pointer() {
+        let usable = 4096usize;
+        let (cell, _p, _local, _s) = synth_spilled_prefix(20012, 42, "Ella", 4200, usable, 13);
+        // Drop the final 2 bytes so the 4-byte overflow pointer is out of bounds.
+        let truncated = &cell[..cell.len() - 2];
+        assert!(try_carve_spilled_cell_at(truncated, 0, usable, Some(3)).is_none());
+    }
+
+    #[test]
+    fn spilled_recognizer_abstains_on_column_mismatch() {
+        let usable = 4096usize;
+        let (cell, _p, _local, _s) = synth_spilled_prefix(20012, 42, "Ella", 4200, usable, 13);
+        // Expect 5 columns but the record has 3.
+        assert!(try_carve_spilled_cell_at(&cell, 0, usable, Some(5)).is_none());
+        // Inferred (None) still recognizes it.
+        assert!(try_carve_spilled_cell_at(&cell, 0, usable, None).is_some());
+    }
+
+    #[test]
+    fn spilled_recognizer_abstains_on_nonpositive_rowid() {
+        let usable = 4096usize;
+        let (cell, _p, _local, _s) = synth_spilled_prefix(0, 42, "Ella", 4000, usable, 13);
+        assert!(try_carve_spilled_cell_at(&cell, 0, usable, Some(3)).is_none());
+    }
+
+    // ---- task #73: freed overflow-chain walk + freelist leaf/trunk split ----
+
+    /// Build a minimal multi-page `SQLite` DB image with `page_count` pages of
+    /// `page_size` bytes. Page 1 carries a valid 100-byte header (so
+    /// `Database::open` succeeds) with the given freelist trunk pointer and count
+    /// at offsets 32/36. All pages are zero-filled; the caller writes overflow /
+    /// trunk content afterwards. Returns the byte vector.
+    fn synth_db(page_size: usize, page_count: usize, trunk: u32, fl_count: u32) -> Vec<u8> {
+        let mut b = vec![0u8; page_size * page_count];
+        b[..16].copy_from_slice(SQLITE_MAGIC);
+        b[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        b[18] = 1; // file format write version
+        b[19] = 1; // file format read version
+        b[20] = 0; // reserved space
+        b[21] = 64;
+        b[22] = 32;
+        b[23] = 32;
+        b[32..36].copy_from_slice(&trunk.to_be_bytes());
+        b[36..40].copy_from_slice(&fl_count.to_be_bytes());
+        // A minimal table-leaf page-1 body (type 0x0d, 0 cells) so header parsing
+        // and page-count helpers behave.
+        b[100] = 0x0d;
+        b
+    }
+
+    /// Write a freelist trunk page at `page` listing `leaves` and chaining to
+    /// `next_trunk` (0 = end).
+    fn write_trunk(b: &mut [u8], page_size: usize, page: u32, next_trunk: u32, leaves: &[u32]) {
+        let base = (page as usize - 1) * page_size;
+        b[base..base + 4].copy_from_slice(&next_trunk.to_be_bytes());
+        b[base + 4..base + 8].copy_from_slice(&(leaves.len() as u32).to_be_bytes());
+        for (i, &lf) in leaves.iter().enumerate() {
+            b[base + 8 + i * 4..base + 12 + i * 4].copy_from_slice(&lf.to_be_bytes());
+        }
+    }
+
+    /// Write an overflow page at `page`: 4-byte big-endian `next` then `content`.
+    fn write_overflow(b: &mut [u8], page_size: usize, page: u32, next: u32, content: &[u8]) {
+        let base = (page as usize - 1) * page_size;
+        b[base..base + 4].copy_from_slice(&next.to_be_bytes());
+        b[base + 4..base + 4 + content.len()].copy_from_slice(content);
+    }
+
+    #[test]
+    fn freelist_split_separates_leaves_and_trunks() {
+        let ps = 512usize;
+        // Pages: 1 header, 2 trunk, leaves 3,4,5.
+        let mut b = synth_db(ps, 6, 2, 4);
+        write_trunk(&mut b, ps, 2, 0, &[3, 4, 5]);
+        let db = Database::open(b).unwrap();
+        let (leaves, trunks) = db.freelist_pages_split().unwrap();
+        assert_eq!(leaves, [3u32, 4, 5].into_iter().collect());
+        assert_eq!(trunks, [2u32].into_iter().collect());
+        // The legacy combined accessor still returns leaves ++ trunk.
+        let all: std::collections::BTreeSet<u32> =
+            db.freelist_pages().unwrap().into_iter().collect();
+        assert_eq!(all, [2u32, 3, 4, 5].into_iter().collect());
+    }
+
+    #[test]
+    fn freed_chain_assembles_single_leaf_page() {
+        let ps = 512usize;
+        let usable = ps; // reserved 0
+        let mut b = synth_db(ps, 6, 2, 4);
+        write_trunk(&mut b, ps, 2, 0, &[3, 4, 5]);
+        // Chain content on leaf page 3: a single page holds `remaining` bytes.
+        let remaining = 100usize;
+        let content: Vec<u8> = (0..remaining).map(|i| (i % 251) as u8).collect();
+        write_overflow(&mut b, ps, 3, 0, &content);
+        let db = Database::open(b).unwrap();
+        let (leaves, _trunks) = db.freelist_pages_split().unwrap();
+        let (bytes, chain) = db
+            .read_freed_overflow_chain(3, remaining, usable, &leaves)
+            .expect("intact single-leaf chain must assemble");
+        assert_eq!(bytes, content);
+        assert_eq!(chain, vec![3]);
+    }
+
+    #[test]
+    fn freed_chain_assembles_multi_leaf_pages() {
+        let ps = 512usize;
+        let usable = ps;
+        let per_page = usable - 4;
+        let mut b = synth_db(ps, 8, 2, 5);
+        write_trunk(&mut b, ps, 2, 0, &[3, 4, 5, 6]);
+        // 2-page chain: page 3 -> page 4. remaining spans into page 4.
+        let remaining = per_page + 50;
+        let content: Vec<u8> = (0..remaining).map(|i| (i % 251) as u8).collect();
+        write_overflow(&mut b, ps, 3, 4, &content[..per_page]);
+        write_overflow(&mut b, ps, 4, 0, &content[per_page..]);
+        let db = Database::open(b).unwrap();
+        let (leaves, _t) = db.freelist_pages_split().unwrap();
+        let (bytes, chain) = db
+            .read_freed_overflow_chain(3, remaining, usable, &leaves)
+            .expect("intact 2-leaf chain must assemble");
+        assert_eq!(bytes, content);
+        assert_eq!(chain, vec![3, 4]);
+    }
+
+    #[test]
+    fn freed_chain_breaks_on_non_freelist_page() {
+        let ps = 512usize;
+        let usable = ps;
+        let mut b = synth_db(ps, 6, 2, 2);
+        write_trunk(&mut b, ps, 2, 0, &[3]); // only page 3 is a leaf
+        let content = vec![7u8; 100];
+        // The pointer targets page 4, which is NOT on the freelist.
+        write_overflow(&mut b, ps, 4, 0, &content);
+        let db = Database::open(b).unwrap();
+        let (leaves, _t) = db.freelist_pages_split().unwrap();
+        assert!(db
+            .read_freed_overflow_chain(4, 100, usable, &leaves)
+            .is_err());
+    }
+
+    #[test]
+    fn freed_chain_breaks_on_trunk_page() {
+        let ps = 512usize;
+        let usable = ps;
+        let mut b = synth_db(ps, 6, 2, 2);
+        write_trunk(&mut b, ps, 2, 0, &[3]);
+        let db = Database::open(b).unwrap();
+        let (leaves, _t) = db.freelist_pages_split().unwrap();
+        // Page 2 is the trunk — a chain page that is a trunk must break.
+        assert!(db
+            .read_freed_overflow_chain(2, 100, usable, &leaves)
+            .is_err());
+    }
+
+    #[test]
+    fn freed_chain_breaks_on_cycle() {
+        let ps = 512usize;
+        let usable = ps;
+        let per_page = usable - 4;
+        let mut b = synth_db(ps, 6, 2, 3);
+        write_trunk(&mut b, ps, 2, 0, &[3, 4]);
+        // 3 -> 4 -> 3 cycle; remaining never satisfied.
+        write_overflow(&mut b, ps, 3, 4, &vec![1u8; per_page]);
+        write_overflow(&mut b, ps, 4, 3, &vec![2u8; per_page]);
+        let db = Database::open(b).unwrap();
+        let (leaves, _t) = db.freelist_pages_split().unwrap();
+        assert!(db
+            .read_freed_overflow_chain(3, per_page * 10, usable, &leaves)
+            .is_err());
+    }
+
+    #[test]
+    fn freed_chain_breaks_on_premature_zero_pointer() {
+        let ps = 512usize;
+        let usable = ps;
+        let per_page = usable - 4;
+        let mut b = synth_db(ps, 6, 2, 2);
+        write_trunk(&mut b, ps, 2, 0, &[3]);
+        // Page 3 ends the chain (next=0) but `remaining` still wants more bytes.
+        write_overflow(&mut b, ps, 3, 0, &vec![9u8; per_page]);
+        let db = Database::open(b).unwrap();
+        let (leaves, _t) = db.freelist_pages_split().unwrap();
+        assert!(db
+            .read_freed_overflow_chain(3, per_page + 10, usable, &leaves)
+            .is_err());
+    }
+
+    #[test]
+    fn freed_chain_breaks_on_capacity_overflow() {
+        let ps = 512usize;
+        let usable = ps;
+        let mut b = synth_db(ps, 6, 2, 2);
+        write_trunk(&mut b, ps, 2, 0, &[3]);
+        write_overflow(&mut b, ps, 3, 0, &vec![1u8; usable - 4]);
+        let db = Database::open(b).unwrap();
+        let (leaves, _t) = db.freelist_pages_split().unwrap();
+        // remaining far exceeds what one leaf page can deliver — rejected upfront,
+        // never allocating an attacker-declared payload.
+        let absurd = (usable - 4) * leaves.len() + 1;
+        assert!(db
+            .read_freed_overflow_chain(3, absurd, usable, &leaves)
+            .is_err());
+    }
+
+    // ---- task #73 step 5: freeblock-clobbered spilled cell (SYNTHETIC ONLY) ----
+    // Codex ruling #5: there is NO corpus instance for a freeblock-clobbered
+    // *spilled* cell — this path is validated against a synthetic fixture only
+    // and is marked unproven-by-corpus in the production code + docs.
+
+    /// Build a synthetic 4096-byte-page DB with an allocated table-leaf page 2
+    /// holding (a) a LIVE template cell of the `(id INTEGER 1-byte, name TEXT,
+    /// code TEXT)` schema and (b) a freeblock-clobbered SPILLED cell whose 4-byte
+    /// prefix is overwritten by a stale freeblock header, with its overflow chain
+    /// on a freed leaf page. Returns the bytes. `break_chain` routes the chain
+    /// pointer at the freelist trunk instead of a leaf to exercise the rejection.
+    fn synth_clobbered_spill_db(break_chain: bool) -> Vec<u8> {
+        let ps = 4096usize;
+        let usable = ps;
+        // Pages: 1 header, 2 allocated leaf, 3 trunk, 4 leaf (chain), 5 leaf spare.
+        let mut b = synth_db(ps, 6, 3, 2);
+        write_trunk(&mut b, ps, 3, 0, &[4, 5]);
+
+        // Record geometry: id=7 (1-byte), name="Zoe", code 4200×'C'.
+        let name = b"Zoe";
+        let code_len = 4200usize;
+        let serials: [i64; 3] = [1, 13 + 2 * name.len() as i64, 13 + 2 * code_len as i64];
+        let mut serial_bytes = Vec::new();
+        for &s in &serials {
+            serial_bytes.extend(enc_varint(s as u64));
+        }
+        let mut header_len = serial_bytes.len() + 1;
+        while enc_varint(header_len as u64).len() + serial_bytes.len() != header_len {
+            header_len += 1;
+        }
+        let mut header = enc_varint(header_len as u64);
+        header.extend(&serial_bytes);
+        let mut full_payload = header.clone();
+        full_payload.push(7u8); // id body
+        full_payload.extend(name);
+        full_payload.extend(std::iter::repeat_n(b'C', code_len));
+        let payload_len = full_payload.len();
+        let local = local_payload_len(payload_len, usable);
+        let remaining = payload_len - local;
+
+        // --- LIVE template cell at offset 200 on page 2 (a small non-spilling row
+        //     of the SAME schema so freeblock_template derives the column layout).
+        let base2 = ps; // page 2 starts at byte 4096
+        let tmpl_name = b"Al";
+        let tmpl_code = b"xy";
+        let tser: [i64; 3] = [
+            1,
+            13 + 2 * tmpl_name.len() as i64,
+            13 + 2 * tmpl_code.len() as i64,
+        ];
+        let mut tsb = Vec::new();
+        for &s in &tser {
+            tsb.extend(enc_varint(s as u64));
+        }
+        let mut thl = tsb.len() + 1;
+        while enc_varint(thl as u64).len() + tsb.len() != thl {
+            thl += 1;
+        }
+        let mut tpayload = enc_varint(thl as u64);
+        tpayload.extend(&tsb);
+        tpayload.push(1u8);
+        tpayload.extend(tmpl_name);
+        tpayload.extend(tmpl_code);
+        let live_off = 200usize;
+        let mut live_cell = enc_varint(tpayload.len() as u64);
+        live_cell.extend(enc_varint(1u64)); // rowid 1
+        live_cell.extend(&tpayload);
+        b[base2 + live_off..base2 + live_off + live_cell.len()].copy_from_slice(&live_cell);
+
+        // Page-2 leaf header (type 0x0d), 1 live cell, freeblock at 0x100, content
+        // area covering both the live cell and the clobbered spilled cell.
+        b[base2] = 0x0d;
+        // first freeblock pointer (offset 1) -> the clobbered spilled cell at 1000.
+        b[base2 + 1..base2 + 3].copy_from_slice(&1000u16.to_be_bytes());
+        // cell count (offset 3) = 1
+        b[base2 + 3..base2 + 5].copy_from_slice(&1u16.to_be_bytes());
+        // cell content area start (offset 5) — low so both regions are "content".
+        b[base2 + 5..base2 + 7].copy_from_slice(&100u16.to_be_bytes());
+        // cell pointer array (1 entry) at offset 8 -> live cell offset.
+        b[base2 + 8..base2 + 10].copy_from_slice(&(live_off as u16).to_be_bytes());
+
+        // --- Clobbered SPILLED cell at offset 1000 on page 2. Lay down the FULL
+        //     prefix (payload_len varint, rowid varint, header, local payload,
+        //     overflow ptr), then OVERWRITE the first 4 bytes with a stale
+        //     freeblock header (next=0x0000, size) to simulate freeblock clobber.
+        let spill_off = 1000usize;
+        let mut spill_cell = enc_varint(payload_len as u64);
+        spill_cell.extend(enc_varint(1u64)); // rowid (will be clobbered)
+        let prefix_len = spill_cell.len();
+        spill_cell.extend(&full_payload[..local]);
+        let chain_first = if break_chain { 3u32 } else { 4u32 };
+        spill_cell.extend(chain_first.to_be_bytes());
+        b[base2 + spill_off..base2 + spill_off + spill_cell.len()].copy_from_slice(&spill_cell);
+        // Clobber the first 4 bytes with a freeblock header: next=0, size=4.
+        b[base2 + spill_off] = 0;
+        b[base2 + spill_off + 1] = 0;
+        b[base2 + spill_off + 2..base2 + spill_off + 4].copy_from_slice(&4u16.to_be_bytes());
+
+        // --- The overflow chain content on freed leaf page 4 (next=0).
+        write_overflow(&mut b, ps, 4, 0, &full_payload[local..local + remaining]);
+
+        let _ = prefix_len;
+        b
+    }
+
+    #[test]
+    fn clobbered_spilled_cell_reconstructs_with_unknown_rowid() {
+        let db = Database::open(synth_clobbered_spill_db(false)).unwrap();
+        let page2 = db.raw_page(2).unwrap();
+        let recovered = db.carve_overflow_template_records(page2);
+        let (cell, chain) = recovered
+            .iter()
+            .find(|(c, _)| matches!(c.values.get(1), Some(Value::Text(t)) if t == "Zoe"))
+            .expect("synthetic clobbered spilled cell must reconstruct");
+        // rowid destroyed by the freeblock clobber -> surfaced as 0.
+        assert_eq!(cell.rowid, 0);
+        // code fully reassembled across the chain.
+        assert!(matches!(cell.values.get(2), Some(Value::Text(t)) if t.len() == 4200));
+        assert_eq!(chain, &vec![4u32]);
+    }
+
+    #[test]
+    fn clobbered_spilled_broken_chain_yields_no_full_row() {
+        // Chain pointer routed at the freelist TRUNK (page 3) -> rejected.
+        let db = Database::open(synth_clobbered_spill_db(true)).unwrap();
+        let page2 = db.raw_page(2).unwrap();
+        let recovered = db.carve_overflow_template_records(page2);
+        assert!(recovered
+            .iter()
+            .all(|(c, _)| !matches!(c.values.get(1), Some(Value::Text(t)) if t == "Zoe")));
+    }
+
+    #[test]
+    fn enc_varint_into_round_trips_zero_and_multibyte() {
+        // Zero -> single 0 byte (the NULL-serial / empty-header path).
+        assert_eq!(enc_varint_into(0), vec![0]);
+        assert_eq!(varint_len(0), 1);
+        // Multi-byte: 8413 -> 2-byte varint; round-trips via read_varint.
+        let v = enc_varint_into(8413);
+        assert_eq!(varint_len(8413), v.len());
+        assert_eq!(read_varint(&v, 0).unwrap(), (8413, v.len()));
+        // Negative input (illegal serial) treated as 1 byte (defensive).
+        assert_eq!(varint_len(-1), 1);
+    }
+
+    /// Build a 4096-byte-page DB with an allocated table-leaf page 2 holding an
+    /// **intact-prefix** spilled cell in its unallocated gap, with the overflow
+    /// chain on a freed leaf page (page 4). Mirrors the real 0E geometry so
+    /// `carve_overflow_records` (and its fragment dual) can be unit-covered without
+    /// the corpus. `break_chain` routes the pointer at the freelist trunk.
+    fn synth_gap_spill_db(break_chain: bool, code_len: usize, name: &str) -> Vec<u8> {
+        let ps = 4096usize;
+        let usable = ps;
+        let mut b = synth_db(ps, 6, 3, 2);
+        write_trunk(&mut b, ps, 3, 0, &[4, 5]);
+        let base2 = ps;
+
+        // Record: (id INTEGER 1-byte, name TEXT, code TEXT) spilled.
+        let serials: [i64; 3] = [1, 13 + 2 * name.len() as i64, 13 + 2 * code_len as i64];
+        let mut serial_bytes = Vec::new();
+        for &s in &serials {
+            serial_bytes.extend(enc_varint(s as u64));
+        }
+        let mut header_len = serial_bytes.len() + 1;
+        while enc_varint(header_len as u64).len() + serial_bytes.len() != header_len {
+            header_len += 1;
+        }
+        let mut payload = enc_varint(header_len as u64);
+        payload.extend(&serial_bytes);
+        payload.push(9u8); // id body
+        payload.extend(name.as_bytes());
+        payload.extend(std::iter::repeat_n(b'C', code_len));
+        let payload_len = payload.len();
+        let local = local_payload_len(payload_len, usable);
+        let remaining = payload_len - local;
+
+        // Spilled cell at gap offset 1500 on page 2 (intact prefix).
+        let spill_off = 1500usize;
+        let mut cell = enc_varint(payload_len as u64);
+        cell.extend(enc_varint(5u64)); // rowid 5
+        cell.extend(&payload[..local]);
+        let first = if break_chain { 3u32 } else { 4u32 };
+        cell.extend(first.to_be_bytes());
+        b[base2 + spill_off..base2 + spill_off + cell.len()].copy_from_slice(&cell);
+
+        // Page-2 leaf header: 0 live cells, content area at 100 so the gap [8,100..]
+        // is scanned. No live cells keeps free_regions = the whole content area.
+        b[base2] = 0x0d;
+        b[base2 + 1] = 0; // first freeblock = 0
+        b[base2 + 2] = 0;
+        b[base2 + 3..base2 + 5].copy_from_slice(&0u16.to_be_bytes()); // 0 cells
+        b[base2 + 5..base2 + 7].copy_from_slice(&8u16.to_be_bytes()); // cca low
+
+        // Chain content on freed leaf page 4.
+        write_overflow(&mut b, ps, 4, 0, &payload[local..local + remaining]);
+        b
+    }
+
+    #[test]
+    fn carve_overflow_records_resolves_gap_spill() {
+        let db = Database::open(synth_gap_spill_db(false, 4200, "Nora")).unwrap();
+        let page2 = db.raw_page(2).unwrap();
+        let recovered = db.carve_overflow_records(page2);
+        let (cell, chain) = recovered
+            .iter()
+            .find(|(c, _)| matches!(c.values.get(1), Some(Value::Text(t)) if t == "Nora"))
+            .expect("gap-resident spilled cell must resolve to a full row");
+        assert_eq!(cell.rowid, 5);
+        assert!(matches!(cell.values.get(2), Some(Value::Text(t)) if t.len() == 4200));
+        assert_eq!(chain, &vec![4u32]);
+        // Graded below the in-page full-row tier (0.9 * factor).
+        assert!(cell.confidence < 0.72);
+        // Non-leaf page yields nothing; empty slice yields nothing.
+        assert!(db.carve_overflow_records(&[0x05u8; 4096]).is_empty());
+        assert!(db.carve_overflow_records(&[]).is_empty());
+    }
+
+    #[test]
+    fn carve_overflow_records_rejects_trunk_chain() {
+        let db = Database::open(synth_gap_spill_db(true, 4200, "Nora")).unwrap();
+        let page2 = db.raw_page(2).unwrap();
+        // Chain routed at the trunk -> no full row.
+        assert!(db
+            .carve_overflow_records(page2)
+            .iter()
+            .all(|(c, _)| !matches!(c.values.get(1), Some(Value::Text(t)) if t == "Nora")));
+    }
+
+    #[test]
+    fn stale_leaf_chain_with_invalid_utf8_is_rejected() {
+        // NEGATIVE test (the stale-leaf residual): a chain page that IS a freelist
+        // leaf and assembles to the exact declared length, but whose content is
+        // unrelated bytes (invalid UTF-8 in the TEXT column). The freelist-leaf
+        // requirement passes; the strict-UTF-8 extra-signal gate rejects it from
+        // Tier-1. This documents the design's limit (Codex ruling #2): the leaf
+        // requirement cannot prove the bytes are the record — only the UTF-8 gate
+        // catches the cases the lossy decoder would otherwise mask.
+        let ps = 4096usize;
+        let usable = ps;
+        let mut b = synth_db(ps, 6, 3, 2);
+        write_trunk(&mut b, ps, 3, 0, &[4, 5]);
+        let base2 = ps;
+        let name = "Stale";
+        let code_len = 4200usize;
+        let serials: [i64; 3] = [1, 13 + 2 * name.len() as i64, 13 + 2 * code_len as i64];
+        let mut serial_bytes = Vec::new();
+        for &s in &serials {
+            serial_bytes.extend(enc_varint(s as u64));
+        }
+        let mut header_len = serial_bytes.len() + 1;
+        while enc_varint(header_len as u64).len() + serial_bytes.len() != header_len {
+            header_len += 1;
+        }
+        let mut payload = enc_varint(header_len as u64);
+        payload.extend(&serial_bytes);
+        payload.push(9u8);
+        payload.extend(name.as_bytes());
+        payload.extend(std::iter::repeat_n(b'C', code_len));
+        let payload_len = payload.len();
+        let local = local_payload_len(payload_len, usable);
+        let remaining = payload_len - local;
+
+        let spill_off = 1500usize;
+        let mut cell = enc_varint(payload_len as u64);
+        cell.extend(enc_varint(5u64));
+        cell.extend(&payload[..local]);
+        cell.extend(4u32.to_be_bytes());
+        b[base2 + spill_off..base2 + spill_off + cell.len()].copy_from_slice(&cell);
+        b[base2] = 0x0d;
+        b[base2 + 3..base2 + 5].copy_from_slice(&0u16.to_be_bytes());
+        b[base2 + 5..base2 + 7].copy_from_slice(&8u16.to_be_bytes());
+
+        // Stale leaf content: invalid UTF-8 (0xff bytes) where the TEXT body lands.
+        let stale = vec![0xffu8; remaining];
+        write_overflow(&mut b, ps, 4, 0, &stale);
+
+        let db = Database::open(b).unwrap();
+        let page2 = db.raw_page(2).unwrap();
+        // Decodes mechanically (the leaf assembles exactly), but the strict-UTF-8
+        // gate rejects it -> NOT a Tier-1 full row.
+        assert!(db.carve_overflow_records(page2).is_empty());
+    }
+
+    #[test]
+    fn carve_overflow_fragments_salvages_broken_gap_spill() {
+        // Broken chain (trunk) -> the local prefix (id + name) salvages as a fragment.
+        let db = Database::open(synth_gap_spill_db(true, 4200, "Nora")).unwrap();
+        let page2 = db.raw_page(2).unwrap();
+        let frags = db.carve_overflow_fragments(page2);
+        let f = frags
+            .iter()
+            .find(|f| {
+                f.surviving
+                    .iter()
+                    .any(|(_, v)| matches!(v, Value::Text(t) if t == "Nora"))
+            })
+            .expect("broken-chain gap spill must salvage a fragment");
+        // id (col 0) survives locally too.
+        assert!(f
+            .surviving
+            .iter()
+            .any(|(i, v)| *i == 0 && matches!(v, Value::Integer(9))));
+        // An intact chain produces NO fragment (it is a full row instead).
+        let ok = Database::open(synth_gap_spill_db(false, 4200, "Nora")).unwrap();
+        let ok_page = ok.raw_page(2).unwrap();
+        assert!(ok.carve_overflow_fragments(ok_page).iter().all(|f| !f
+            .surviving
+            .iter()
+            .any(|(_, v)| matches!(v, Value::Text(t) if t == "Nora"))));
+        // Non-leaf / empty inputs yield nothing.
+        assert!(db.carve_overflow_fragments(&[0x05u8; 4096]).is_empty());
+        assert!(db.carve_overflow_fragments(&[]).is_empty());
     }
 }

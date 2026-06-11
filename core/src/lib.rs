@@ -3322,4 +3322,182 @@ mod tests {
             synth_spilled_prefix(0, 42, "Ella", 4000, usable, 13);
         assert!(try_carve_spilled_cell_at(&cell, 0, usable, Some(3)).is_none());
     }
+
+    // ---- task #73: freed overflow-chain walk + freelist leaf/trunk split ----
+
+    /// Build a minimal multi-page `SQLite` DB image with `page_count` pages of
+    /// `page_size` bytes. Page 1 carries a valid 100-byte header (so
+    /// `Database::open` succeeds) with the given freelist trunk pointer and count
+    /// at offsets 32/36. All pages are zero-filled; the caller writes overflow /
+    /// trunk content afterwards. Returns the byte vector.
+    fn synth_db(page_size: usize, page_count: usize, trunk: u32, fl_count: u32) -> Vec<u8> {
+        let mut b = vec![0u8; page_size * page_count];
+        b[..16].copy_from_slice(SQLITE_MAGIC);
+        b[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        b[18] = 1; // file format write version
+        b[19] = 1; // file format read version
+        b[20] = 0; // reserved space
+        b[21] = 64;
+        b[22] = 32;
+        b[23] = 32;
+        b[32..36].copy_from_slice(&trunk.to_be_bytes());
+        b[36..40].copy_from_slice(&fl_count.to_be_bytes());
+        // A minimal table-leaf page-1 body (type 0x0d, 0 cells) so header parsing
+        // and page-count helpers behave.
+        b[100] = 0x0d;
+        b
+    }
+
+    /// Write a freelist trunk page at `page` listing `leaves` and chaining to
+    /// `next_trunk` (0 = end).
+    fn write_trunk(b: &mut [u8], page_size: usize, page: u32, next_trunk: u32, leaves: &[u32]) {
+        let base = (page as usize - 1) * page_size;
+        b[base..base + 4].copy_from_slice(&next_trunk.to_be_bytes());
+        b[base + 4..base + 8].copy_from_slice(&(leaves.len() as u32).to_be_bytes());
+        for (i, &lf) in leaves.iter().enumerate() {
+            b[base + 8 + i * 4..base + 12 + i * 4].copy_from_slice(&lf.to_be_bytes());
+        }
+    }
+
+    /// Write an overflow page at `page`: 4-byte big-endian `next` then `content`.
+    fn write_overflow(b: &mut [u8], page_size: usize, page: u32, next: u32, content: &[u8]) {
+        let base = (page as usize - 1) * page_size;
+        b[base..base + 4].copy_from_slice(&next.to_be_bytes());
+        b[base + 4..base + 4 + content.len()].copy_from_slice(content);
+    }
+
+    #[test]
+    fn freelist_split_separates_leaves_and_trunks() {
+        let ps = 512usize;
+        // Pages: 1 header, 2 trunk, leaves 3,4,5.
+        let mut b = synth_db(ps, 6, 2, 4);
+        write_trunk(&mut b, ps, 2, 0, &[3, 4, 5]);
+        let db = Database::open(b).unwrap();
+        let (leaves, trunks) = db.freelist_pages_split().unwrap();
+        assert_eq!(leaves, [3u32, 4, 5].into_iter().collect());
+        assert_eq!(trunks, [2u32].into_iter().collect());
+        // The legacy combined accessor still returns leaves ++ trunk.
+        let all: std::collections::BTreeSet<u32> = db.freelist_pages().unwrap().into_iter().collect();
+        assert_eq!(all, [2u32, 3, 4, 5].into_iter().collect());
+    }
+
+    #[test]
+    fn freed_chain_assembles_single_leaf_page() {
+        let ps = 512usize;
+        let usable = ps; // reserved 0
+        let mut b = synth_db(ps, 6, 2, 4);
+        write_trunk(&mut b, ps, 2, 0, &[3, 4, 5]);
+        // Chain content on leaf page 3: a single page holds `remaining` bytes.
+        let remaining = 100usize;
+        let content: Vec<u8> = (0..remaining).map(|i| (i % 251) as u8).collect();
+        write_overflow(&mut b, ps, 3, 0, &content);
+        let db = Database::open(b).unwrap();
+        let (leaves, _trunks) = db.freelist_pages_split().unwrap();
+        let (bytes, chain) = db
+            .read_freed_overflow_chain(3, remaining, usable, &leaves)
+            .expect("intact single-leaf chain must assemble");
+        assert_eq!(bytes, content);
+        assert_eq!(chain, vec![3]);
+    }
+
+    #[test]
+    fn freed_chain_assembles_multi_leaf_pages() {
+        let ps = 512usize;
+        let usable = ps;
+        let per_page = usable - 4;
+        let mut b = synth_db(ps, 8, 2, 5);
+        write_trunk(&mut b, ps, 2, 0, &[3, 4, 5, 6]);
+        // 2-page chain: page 3 -> page 4. remaining spans into page 4.
+        let remaining = per_page + 50;
+        let content: Vec<u8> = (0..remaining).map(|i| (i % 251) as u8).collect();
+        write_overflow(&mut b, ps, 3, 4, &content[..per_page]);
+        write_overflow(&mut b, ps, 4, 0, &content[per_page..]);
+        let db = Database::open(b).unwrap();
+        let (leaves, _t) = db.freelist_pages_split().unwrap();
+        let (bytes, chain) = db
+            .read_freed_overflow_chain(3, remaining, usable, &leaves)
+            .expect("intact 2-leaf chain must assemble");
+        assert_eq!(bytes, content);
+        assert_eq!(chain, vec![3, 4]);
+    }
+
+    #[test]
+    fn freed_chain_breaks_on_non_freelist_page() {
+        let ps = 512usize;
+        let usable = ps;
+        let mut b = synth_db(ps, 6, 2, 2);
+        write_trunk(&mut b, ps, 2, 0, &[3]); // only page 3 is a leaf
+        let content = vec![7u8; 100];
+        // The pointer targets page 4, which is NOT on the freelist.
+        write_overflow(&mut b, ps, 4, 0, &content);
+        let db = Database::open(b).unwrap();
+        let (leaves, _t) = db.freelist_pages_split().unwrap();
+        assert!(db
+            .read_freed_overflow_chain(4, 100, usable, &leaves)
+            .is_err());
+    }
+
+    #[test]
+    fn freed_chain_breaks_on_trunk_page() {
+        let ps = 512usize;
+        let usable = ps;
+        let mut b = synth_db(ps, 6, 2, 2);
+        write_trunk(&mut b, ps, 2, 0, &[3]);
+        let db = Database::open(b).unwrap();
+        let (leaves, _t) = db.freelist_pages_split().unwrap();
+        // Page 2 is the trunk — a chain page that is a trunk must break.
+        assert!(db
+            .read_freed_overflow_chain(2, 100, usable, &leaves)
+            .is_err());
+    }
+
+    #[test]
+    fn freed_chain_breaks_on_cycle() {
+        let ps = 512usize;
+        let usable = ps;
+        let per_page = usable - 4;
+        let mut b = synth_db(ps, 6, 2, 3);
+        write_trunk(&mut b, ps, 2, 0, &[3, 4]);
+        // 3 -> 4 -> 3 cycle; remaining never satisfied.
+        write_overflow(&mut b, ps, 3, 4, &vec![1u8; per_page]);
+        write_overflow(&mut b, ps, 4, 3, &vec![2u8; per_page]);
+        let db = Database::open(b).unwrap();
+        let (leaves, _t) = db.freelist_pages_split().unwrap();
+        assert!(db
+            .read_freed_overflow_chain(3, per_page * 10, usable, &leaves)
+            .is_err());
+    }
+
+    #[test]
+    fn freed_chain_breaks_on_premature_zero_pointer() {
+        let ps = 512usize;
+        let usable = ps;
+        let per_page = usable - 4;
+        let mut b = synth_db(ps, 6, 2, 2);
+        write_trunk(&mut b, ps, 2, 0, &[3]);
+        // Page 3 ends the chain (next=0) but `remaining` still wants more bytes.
+        write_overflow(&mut b, ps, 3, 0, &vec![9u8; per_page]);
+        let db = Database::open(b).unwrap();
+        let (leaves, _t) = db.freelist_pages_split().unwrap();
+        assert!(db
+            .read_freed_overflow_chain(3, per_page + 10, usable, &leaves)
+            .is_err());
+    }
+
+    #[test]
+    fn freed_chain_breaks_on_capacity_overflow() {
+        let ps = 512usize;
+        let usable = ps;
+        let mut b = synth_db(ps, 6, 2, 2);
+        write_trunk(&mut b, ps, 2, 0, &[3]);
+        write_overflow(&mut b, ps, 3, 0, &vec![1u8; usable - 4]);
+        let db = Database::open(b).unwrap();
+        let (leaves, _t) = db.freelist_pages_split().unwrap();
+        // remaining far exceeds what one leaf page can deliver — rejected upfront,
+        // never allocating an attacker-declared payload.
+        let absurd = (usable - 4) * leaves.len() + 1;
+        assert!(db
+            .read_freed_overflow_chain(3, absurd, usable, &leaves)
+            .is_err());
+    }
 }

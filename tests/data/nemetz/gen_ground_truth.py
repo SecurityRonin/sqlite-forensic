@@ -50,6 +50,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import struct
 import xml.etree.ElementTree as ET
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -308,6 +309,57 @@ def substrate_recoverable(
     return contiguous_identity_present(raw, cells, coltypes)
 
 
+def _distinctive_cell_body(cell: str, ctype: str | None) -> bytes | None:
+    """The serial-body bytes of a cell ONLY when the cell is *distinctive* — the
+    Tier-2 fragment rule (identical to the Rust extractor's `is_distinctive`):
+
+      * TEXT with a UTF-8 body of >= 4 bytes, or
+      * REAL (8-byte IEEE-754).
+
+    INTEGER (and NULL/empty/BLOB) return None: a 1-8-byte integer serial pattern
+    coincides far too often in a 4 KiB page to anchor identity, so it can ride
+    along inside a fragment but never justify counting one. Using the *same*
+    distinctiveness rule for the denominator as the extractor uses for emission
+    keeps numerator and denominator measuring one concept.
+    """
+    if cell is None or cell == "":
+        return None
+    if ctype == "REAL":
+        try:
+            return struct.pack(">d", float(cell))
+        except (ValueError, struct.error):
+            return None
+    if ctype == "INTEGER":
+        return None  # bare integer: not distinctive (coincidence-prone)
+    body = cell.encode("utf-8")  # TEXT / other affinities stored verbatim UTF-8
+    return body if len(body) >= 4 else None
+
+
+def fragment_recoverable(
+    category: str, raw: bytes, cells: list[str], coltypes: list[dict], substrate: bool
+) -> bool:
+    """Whether the deleted row is **fragment-recoverable** (Tier-2): its full
+    scored identity is destroyed (`not substrate`) yet at least one *distinctive*
+    cell's whole serial body still survives contiguously somewhere in the .db
+    bytes.
+
+    Disjoint from `substrate_recoverable` by construction (a row is at most one
+    of the two). The dropped-table categories (0A/0B) have no row-level recall
+    denominator, so they are never fragment-counted. The denominator counts
+    survival *anywhere in the file*, including inside live-cell extents the carver
+    must never scan, so fragment recall < 1.0 is expected and honest — the
+    extractor reaches only fragments at a freeblock/gap anchor with a usable
+    template.
+    """
+    if substrate or category in DROPPED_TABLE_CATEGORIES:
+        return False
+    for cell, col in zip(cells, coltypes):
+        body = _distinctive_cell_body(cell, col.get("type"))
+        if body is not None and body in raw:
+            return True
+    return False
+
+
 def main() -> None:
     manifest: dict[str, dict] = {}
     for category in CATEGORIES:
@@ -326,11 +378,15 @@ def main() -> None:
                 for row in element.iter("row"):
                     cells = row_cells(row)
                     if row.get("deleted") == "1":
+                        substrate = substrate_recoverable(
+                            category, raw, cells, coltypes
+                        )
                         deleted.append(
                             {
                                 "cells": cells,
-                                "substrate_recoverable": substrate_recoverable(
-                                    category, raw, cells, coltypes
+                                "substrate_recoverable": substrate,
+                                "fragment_recoverable": fragment_recoverable(
+                                    category, raw, cells, coltypes, substrate
                                 ),
                             }
                         )

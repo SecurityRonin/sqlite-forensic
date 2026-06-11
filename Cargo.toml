@@ -4,7 +4,7 @@ members = ["core", "forensic", "cli"]
 
 [workspace.dependencies]
 # KNOWLEDGE-layer format constants + the shared report model (Severity/Observation).
-forensicnomicon = { path = "../forensicnomicon" }
+forensicnomicon = "0.4"
 # The native reader, consumed by the forensic analyzer.
 sqlite-core = { version = "0.1.0", path = "core" }
 # The anomaly auditor, consumed by the sqlite4n6 CLI.

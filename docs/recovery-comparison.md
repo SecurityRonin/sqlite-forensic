@@ -15,7 +15,7 @@ regenerate its table). Corpus and oracle provenance are in
 
 ## Executive summary
 
-- **Freeblock-aware reconstruction (task #56) closed most of the in-page recall
+- **Freeblock-aware reconstruction closed most of the in-page recall
   gap at the highest precision of any tool.** On the in-page-deletion category
   `0C`, our carver now recovers **63** of the 84 recoverable deleted rows
   (recall 0.750, up from 23 / 0.274), against fqlite **67** (0.798) and undark
@@ -106,7 +106,7 @@ then `python3 docs/plot_comparison.py` to rerender the PNG.
 ### Honest read — who wins where, and why
 
 - **In-page deletion (`0C`): ours and fqlite now lead together; undark trails.**
-  With freeblock reconstruction (task #56) our recall rose 0.274 → **0.750**,
+  With freeblock reconstruction our recall rose 0.274 → **0.750**,
   essentially matching fqlite's **0.798** — but at **precision 0.955** (3
   phantoms) versus fqlite's **0.807** (16 phantoms). fqlite keeps a small recall
   edge; we keep a clear precision edge and re-read no live row. Neither tool
@@ -115,7 +115,7 @@ then `python3 docs/plot_comparison.py` to rerender the PNG.
   ours and fqlite hold perfect precision; undark fails on precision.** undark
   re-surfaces **56** live rows as deleted here (precision 0.091) — it mis-parses
   these overwritten tables and re-reads the live cells. Span-walking freeblock
-  reconstruction (task #66) — rebuilding *every* coalesced cell in a free span,
+  reconstruction — rebuilding *every* coalesced cell in a free span,
   not just the head — lifted our recall 0.056 → **0.528**, nearly matching
   fqlite's 0.556 at precision 1.000; the lone remaining row (0D-01) has a
   clobber/template layout we do not yet anchor. Both keep 0 live-re-reads.
@@ -126,10 +126,10 @@ then `python3 docs/plot_comparison.py` to rerender the PNG.
   with no false positive. (Freeblock reconstruction adds nothing on `0E` — these
   records spill to overflow, so the residue is not a simple in-page freeblock.)
 
-The consistent picture: **after task #56, our carver matches fqlite's in-page
+The consistent picture: **our carver matches fqlite's in-page
 recall while keeping the highest precision of all three tools on every category
 and never re-reading a live row; it Pareto-dominates fqlite on overflow and,
-after span-walk reconstruction (task #66), nearly matches it on overwritten
+after span-walk reconstruction, nearly matches it on overwritten
 records (`0D`, 0.528 vs 0.556); fqlite keeps only a slim recall edge — on `0C`
 by tolerating more phantoms, on `0D` by one unanchored row (both precision
 1.000); undark trails on both recall and precision and over-reports live rows
@@ -227,7 +227,7 @@ correctness is measured by the DC3 differential below.)
 
 ## Freeblock reconstruction
 
-This was the dominant FN class before task #56, and the fix that closed it.
+This was the dominant FN class before freeblock-aware reconstruction, and the fix that closed it.
 When SQLite frees a cell from an allocated page, it converts the cell into a
 **freeblock** (file-format §1.6): the first two bytes become the next-freeblock
 pointer and the next two the freeblock size — **overwriting the cell's first four
@@ -260,9 +260,9 @@ GPL tool's source.
 ## What the numbers do and do NOT claim
 
 - They claim an **honest, reproducible measurement** of all three tools against
-  *this* independent corpus: after task #56, our carver matches fqlite's in-page
+  *this* independent corpus: our carver matches fqlite's in-page
   recall at the highest precision of the three and never re-reads a live row;
-  it Pareto-dominates fqlite on overflow (`0E`) and, after task #66's span-walk
+  it Pareto-dominates fqlite on overflow (`0E`) and, after span-walk
   reconstruction, nearly matches it on overwritten records (`0D`); fqlite keeps
   only a slim recall edge — `0C` by tolerating more phantoms, `0D` by one
   unanchored row; undark trails on both and over-reports live rows as deleted on

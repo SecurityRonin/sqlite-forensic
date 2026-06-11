@@ -20,6 +20,7 @@ This is a Rust library workspace with a CLI (`sqlite4n6`). The fastest path — 
 $ sqlite4n6 carve History.db                       # deleted rows, table view
 $ sqlite4n6 carve History.db --format jsonl         # one JSON object per record
 $ sqlite4n6 carve History.db --min-confidence medium # drop low-confidence carves
+$ sqlite4n6 carve History.db --fragments            # + opt-in partial-row fragments
 $ sqlite4n6 audit  History.db                        # graded anomaly findings
 ```
 

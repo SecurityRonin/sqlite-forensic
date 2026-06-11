@@ -135,6 +135,38 @@ by tolerating more phantoms, on `0D` by one unanchored row (both precision
 1.000); undark trails on both recall and precision and over-reports live rows
 as deleted.**
 
+### Live `sqlite_master` re-reads — a precision artifact, measured per tool
+
+A subtler precision failure than a phantom row is re-surfacing the database's
+**current `sqlite_master` schema row** — the live page-1
+`(type, name, tbl_name, rootpage, sql)` table-definition record — as if it were a
+recovered *deleted* record. It was never deleted, so reporting it as recovered
+mis-presents a live object as evidence. This is distinct from the user-row
+live-re-read in the matrix above (which counts a carved row equal to a live
+*user-table* row): the schema row is not a user-table row, so it never enters
+that `alive` set and a separate measurement is needed.
+
+The detector is general, derived from the schema itself (not a per-database
+constant): a recovered record counts as a live schema re-read iff its
+`(type, name, tbl_name)` identity equals a row returned by the live page-1 schema
+read. Measured across the in-scope corpus (the same 18 databases the head-to-head
+scores — `0C`/`0D`/`0E` minus the two FLOAT-key exclusions):
+
+| tool | live `sqlite_master` re-reads |
+|---|---|
+| **ours** | **0** |
+| undark | **0** |
+| fqlite | **25** |
+
+fqlite emits the live schema-table row as a recovered record on **every**
+in-scope database (one per single-table DB, two per two-table DB). Our carver
+emits **0** — the live schema rows are folded into the same value-based live-row
+filter that suppresses re-reads of live user rows, so the schema record is
+recognised as live and dropped. undark emits **0** because it does not
+reconstruct `sqlite_master` at all (it surfaces only raw cell rows). The count is
+reproducible from `forensic/tests/nemetz_tool_comparison.rs`
+(`live_sqlite_master_rereads_per_tool`) with `UNDARK_BIN` and `FQLITE_TAP` set.
+
 ## How the matrix is computed
 
 For each database, the carver's output is matched against the answer key by full

@@ -71,7 +71,11 @@ fn no_fragment_duplicates_a_full_record() {
                     .iter()
                     .all(|(idx, v)| rec.values.get(*idx) == Some(v))
             });
-            assert!(!dup, "fragment {:?} duplicates a full record", frag.surviving);
+            assert!(
+                !dup,
+                "fragment {:?} duplicates a full record",
+                frag.surviving
+            );
         }
     }
 }

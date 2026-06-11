@@ -353,7 +353,11 @@ fn fragment_surviving_cell(frag: &CarvedFragment) -> String {
         .map(|(idx, v)| format!("col{idx}='{}'", value_to_cell(v)))
         .collect();
     if frag.missing > 0 {
-        let noun = if frag.missing == 1 { "column" } else { "columns" };
+        let noun = if frag.missing == 1 {
+            "column"
+        } else {
+            "columns"
+        };
         parts.push(format!("(+{} {noun} destroyed)", frag.missing));
     }
     parts.join(" ")
@@ -1073,7 +1077,10 @@ mod tests {
     #[test]
     fn fragments_csv_carries_kind_column() {
         let lines = render_fragments(&[frag()], OutputFormat::Csv);
-        assert_eq!(lines[0], "kind,page,offset,confidence,source,missing,surviving");
+        assert_eq!(
+            lines[0],
+            "kind,page,offset,confidence,source,missing,surviving"
+        );
         assert!(lines[1].starts_with("fragment,2,3965,0.20,"));
     }
 
@@ -1097,7 +1104,12 @@ mod tests {
     fn tiered_default_full_rows_unchanged_jsonl() {
         // Without fragments, the JSONL full-row output is byte-identical to
         // render_carve (no `kind` key added to full rows — published contract).
-        let records = vec![rec(7, 0.9, RecoverySource::FreelistPage, vec![Value::Integer(7)])];
+        let records = vec![rec(
+            7,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Integer(7)],
+        )];
         let plain = render_carve(&records, OutputFormat::Jsonl, false);
         let tiered = render_carve_tiered(&records, &[], OutputFormat::Jsonl, false);
         assert_eq!(plain, tiered, "no fragments → full-row JSONL unchanged");
@@ -1106,7 +1118,12 @@ mod tests {
 
     #[test]
     fn tiered_csv_adds_kind_column_to_both_sections() {
-        let records = vec![rec(7, 0.9, RecoverySource::FreelistPage, vec![Value::Integer(7)])];
+        let records = vec![rec(
+            7,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Integer(7)],
+        )];
         let lines = render_carve_tiered(&records, &[frag()], OutputFormat::Csv, false);
         assert_eq!(
             lines[0],

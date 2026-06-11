@@ -368,14 +368,9 @@ fn fragment_surviving_cell(frag: &CarvedFragment) -> String {
 /// mistaken for a full row. Empty input yields no lines.
 #[must_use]
 pub fn render_fragments(frags: &[CarvedFragment], format: OutputFormat) -> Vec<String> {
-    // RED stub: real rendering wired in the GREEN commit.
-    let _ = (frags, format);
-    return Vec::new();
-    #[allow(unreachable_code)]
     if frags.is_empty() {
         return Vec::new();
     }
-    #[allow(unreachable_code)]
     match format {
         OutputFormat::Table => render_fragments_table(frags),
         OutputFormat::Csv => render_fragments_csv(frags),
@@ -469,34 +464,30 @@ pub fn render_carve_tiered(
     if rowid_only {
         return full.iter().map(|r| rowid_cell(r.rowid)).collect();
     }
-    match format {
-        OutputFormat::Csv => {
-            // Both sections carry a leading `kind` column under `--fragments`.
-            let mut lines =
-                vec!["kind,page,offset,rowid,recovery_source,confidence,values".to_string()];
-            for rec in full {
-                let lead = carve_lead_cells(rec);
-                let values: Vec<String> = rec.values.iter().map(value_to_cell).collect();
-                lines.push(format!(
-                    "row,{},{},{},{},{},{}",
-                    csv_escape(&lead[0]),
-                    csv_escape(&lead[1]),
-                    csv_escape(&lead[2]),
-                    csv_escape(&lead[3]),
-                    csv_escape(&lead[4]),
-                    csv_escape(&values.join(" | "))
-                ));
-            }
-            lines.extend(render_fragments(fragments, format));
-            lines
+    if format == OutputFormat::Csv {
+        // Both sections carry a leading `kind` column under `--fragments`.
+        let mut lines =
+            vec!["kind,page,offset,rowid,recovery_source,confidence,values".to_string()];
+        for rec in full {
+            let lead = carve_lead_cells(rec);
+            let values: Vec<String> = rec.values.iter().map(value_to_cell).collect();
+            lines.push(format!(
+                "row,{},{},{},{},{},{}",
+                csv_escape(&lead[0]),
+                csv_escape(&lead[1]),
+                csv_escape(&lead[2]),
+                csv_escape(&lead[3]),
+                csv_escape(&lead[4]),
+                csv_escape(&values.join(" | "))
+            ));
         }
-        // Table / JSONL: full-row output unchanged, fragment section appended.
-        _ => {
-            let mut lines = render_carve(full, format, false);
-            lines.extend(render_fragments(fragments, format));
-            lines
-        }
+        lines.extend(render_fragments(fragments, format));
+        return lines;
     }
+    // Table / JSONL: full-row output unchanged, fragment section appended.
+    let mut lines = render_carve(full, format, false);
+    lines.extend(render_fragments(fragments, format));
+    lines
 }
 
 // ---- carve rendering with the snapshot/LSN column --------------------------

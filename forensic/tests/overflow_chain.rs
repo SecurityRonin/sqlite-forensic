@@ -116,3 +116,46 @@ fn carve_with_fragments_full_tier_includes_surviving_chain() {
         .iter()
         .any(|r| matches!(r.values.first(), Some(Value::Integer(20012)))));
 }
+
+/// Tier-2 broken-chain fragment (Codex ruling #4): Matteo's trunk-clobbered
+/// chain cannot be a Tier-1 row, but its LOCAL prefix survives intact on page 4,
+/// so the columns that decode locally — `id = 20003`, `name = "Matteo"` — are
+/// salvaged as a Tier-2 fragment. The fragment carries ONLY the local-prefix
+/// columns; the chain-resident `code`/`zip` are lost (untrusted by definition).
+#[test]
+fn matteo_broken_chain_surfaces_as_fragment() {
+    let db = Database::open(NEMETZ_0E_01.to_vec()).unwrap();
+    let tiers = carve_with_fragments(&db);
+
+    let matteo = tiers
+        .fragments
+        .iter()
+        .find(|f| {
+            f.surviving
+                .iter()
+                .any(|(_, v)| matches!(v, Value::Text(t) if t == "Matteo"))
+        })
+        .expect("Matteo's broken chain must surface as a Tier-2 fragment");
+
+    // id (column 0) and name (column 1) survive locally.
+    assert!(matteo
+        .surviving
+        .iter()
+        .any(|(i, v)| *i == 0 && matches!(v, Value::Integer(20003))));
+    assert!(matteo
+        .surviving
+        .iter()
+        .any(|(i, v)| *i == 1 && matches!(v, Value::Text(t) if t == "Matteo")));
+
+    // The full chain-resident code (4091 chars) is NOT in the fragment.
+    assert!(!matteo
+        .surviving
+        .iter()
+        .any(|(_, v)| matches!(v, Value::Text(t) if t.len() == 4091)));
+
+    // And Matteo is NOT in the full tier (it was rejected from Tier-1).
+    assert!(!tiers.full.iter().any(|r| {
+        matches!(r.values.first(), Some(Value::Integer(20003)))
+            && matches!(r.values.get(2), Some(Value::Text(c)) if c.len() == 4091)
+    }));
+}

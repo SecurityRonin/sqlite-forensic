@@ -276,6 +276,130 @@ def contiguous_identity_present(
     return body in raw
 
 
+def _local_payload_len(total: int, usable: int) -> int:
+    """SQLite's local-payload split for a table-leaf cell (file format §1.6).
+
+    Port of the Rust `local_payload_len`: the number of payload bytes kept on the
+    leaf page; when it equals `total` the record does not spill.
+    """
+    x = usable - 35
+    if total <= x:
+        return total
+    m = (usable - 12) * 32 // 255 - 23
+    k = m + (total - m) % (usable - 4)
+    return k if k <= x else m
+
+
+def _record_payload_bytes(cells: list[str], coltypes: list[dict]) -> bytes | None:
+    """The full record payload (header ++ body) the way SQLite stores it, or None
+    if any column cannot be serial-encoded. Mirrors `record_payload_len` but emits
+    the actual bytes so the overflow chain can be assembled and byte-compared.
+    """
+    serials: list[int] = []
+    body = b""
+    for cell, col in zip(cells, coltypes):
+        st = _serial_type(cell, col.get("type"))
+        if st is None:
+            return None
+        serials.append(st)
+        b = _serial_body(cell, col.get("type"))
+        if b is None:
+            return None
+        body += b
+    serial_bytes = b"".join(_varint(s) for s in serials)
+    hdr = len(serial_bytes)
+    header_len = hdr + 1
+    while len(_varint(header_len)) + hdr != header_len:
+        header_len += 1
+    return _varint(header_len) + serial_bytes + body
+
+
+def _freelist_leaves(raw: bytes, page_size: int) -> set[int]:
+    """The set of freelist **leaf** page numbers (file format §"The Freelist").
+
+    Only leaf pages preserve their former content byte-for-byte; a trunk page has
+    its head (next-trunk pointer + leaf count + leaf-number array) written over the
+    former content. So chain-followability requires every chain page to be a leaf.
+    Bounded against a crafted cyclic trunk chain.
+    """
+    npages = len(raw) // page_size
+    leaves: set[int] = set()
+    trunk = int.from_bytes(raw[32:36], "big")
+    visited = 0
+    while trunk != 0 and visited <= npages:
+        visited += 1
+        base = (trunk - 1) * page_size
+        nxt = int.from_bytes(raw[base : base + 4], "big")
+        count = int.from_bytes(raw[base + 4 : base + 8], "big")
+        if count > page_size // 4:
+            break
+        for i in range(count):
+            off = base + 8 + i * 4
+            leaf = int.from_bytes(raw[off : off + 4], "big")
+            if 0 < leaf <= npages:
+                leaves.add(leaf)
+        trunk = nxt
+    return leaves
+
+
+def chain_followable(raw: bytes, cells: list[str], coltypes: list[dict]) -> bool:
+    """Whether a deleted **overflow** row's scored identity physically survives and
+    is structurally addressable through a freed overflow-page chain (task #73).
+
+    The honest substrate criterion for the overflow class (Codex ruling #6),
+    computed purely from the file bytes and independent of our carver: build the
+    expected full payload, find EVERY occurrence of its local-payload prefix in the
+    raw file, and for each read the 4-byte big-endian first-overflow pointer that
+    follows it and walk the chain — accepting a page only when it is a freelist
+    LEAF (content-preserving) — assembling local-prefix ++ chain content. The row
+    is recoverable iff some occurrence assembles to byte-exactly the expected
+    payload. A chain page reallocated as the freelist trunk (or off the freelist)
+    breaks the walk, so a record whose chain bytes were overwritten is correctly
+    NOT counted (e.g. 0E-01 rowid 3 'Matteo' -> page 5 trunk -> False).
+    """
+    payload = _record_payload_bytes(cells, coltypes)
+    if payload is None:
+        return False
+    page_size, usable = page_geometry(raw)
+    npages = len(raw) // page_size
+    total = len(payload)
+    local = _local_payload_len(total, usable)
+    if local >= total:
+        return False  # not actually spilled
+    prefix = payload[:local]
+    leaves = _freelist_leaves(raw, page_size)
+    per_page = usable - 4
+    expected = payload
+
+    start = 0
+    while True:
+        idx = raw.find(prefix, start)
+        if idx < 0:
+            return False
+        start = idx + 1
+        ptr_off = idx + local
+        if ptr_off + 4 > len(raw):
+            continue
+        page = int.from_bytes(raw[ptr_off : ptr_off + 4], "big")
+        assembled = bytearray(prefix)
+        remaining = total - local
+        visited: set[int] = set()
+        broke = False
+        while remaining > 0:
+            if page == 0 or page > npages or page not in leaves or page in visited:
+                broke = True
+                break
+            visited.add(page)
+            base = (page - 1) * page_size
+            nxt = int.from_bytes(raw[base : base + 4], "big")
+            take = min(remaining, per_page)
+            assembled += raw[base + 4 : base + 4 + take]
+            remaining -= take
+            page = nxt
+        if not broke and bytes(assembled) == expected:
+            return True
+
+
 def substrate_recoverable(
     category: str, raw: bytes, cells: list[str], coltypes: list[dict]
 ) -> bool:
@@ -288,10 +412,12 @@ def substrate_recoverable(
         a single contiguous run and the honest contiguous full-row-identity test
         applies;
       * if the payload exceeds that threshold the record overflows onto a
-        non-contiguous overflow-page chain (SQLite "Cell payload overflow pages"),
-        which a flat-file contiguity test cannot model, so it is treated
-        conservatively as NOT recoverable (chain-aware overflow recovery is future
-        work).
+        non-contiguous overflow-page chain (SQLite "Cell payload overflow pages").
+        Chain-aware overflow recovery (task #73): the row is recoverable iff its
+        chain is followable through freelist LEAVES to a byte-exact reassembly of
+        the expected payload — i.e. the chain bytes physically survived AND are
+        structurally addressable. A chain page reallocated as the freelist trunk
+        (or otherwise reused) destroys the bytes, so the record is NOT counted.
     """
     if category in DROPPED_TABLE_CATEGORIES:
         return any_distinctive_column_present(raw, cells, coltypes)
@@ -305,7 +431,9 @@ def substrate_recoverable(
     _page_size, usable = page_geometry(raw)
     in_page_threshold = usable - 35
     if payload > in_page_threshold:
-        return False  # genuine overflow: body spans a non-contiguous chain
+        # Genuine overflow: the body is non-contiguous. Recoverable only when the
+        # freed overflow chain is followable to a byte-exact reassembly.
+        return chain_followable(raw, cells, coltypes)
     return contiguous_identity_present(raw, cells, coltypes)
 
 

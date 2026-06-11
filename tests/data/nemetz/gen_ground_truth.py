@@ -22,23 +22,27 @@ For each table element it records:
     D_destroyed for the two-denominator recall).
 
 Substrate-recoverable is decided by an honest **contiguous full-row-identity**
-test for the in-page record-deletion categories (`0C`, `0D`): a row counts
-recoverable only when its whole record body — every column's SQLite serial
-encoding, concatenated in column order — survives as a single contiguous byte run
-in the file. This mirrors exactly what the recall matcher scores (its key is the
-full row, `normalize_row` over all cells), so a row whose scored identity was
-destroyed by a later same-rowid overwrite — leaving only a coincidental single
-surviving column — is correctly NOT counted.
+test, applied **per record by body size** — never per category, so there is no
+special-case exemption. A row counts recoverable only when its whole record body
+— every column's SQLite serial encoding, concatenated in column order — survives
+as a single contiguous byte run in the file. This mirrors exactly what the recall
+matcher scores (its key is the full row, `normalize_row` over all cells), so a row
+whose scored identity was destroyed by a later same-rowid overwrite — leaving only
+a coincidental single surviving column — is correctly NOT counted.
 
-The overflow category (`0E`) is a documented domain discontinuity: its record
-bodies (here 1.3-4.1 KB) exceed the in-page payload limit and SQLite stores the
-spill on a chain of overflow pages (file-format section "Cell payload overflow
-pages"). The body is therefore non-contiguous in the flat file by construction,
-so a contiguity test would understate recoverability there; `0E` (and the
-dropped-table categories `0A`/`0B`, which carry no row-level recall denominator)
-keep the legacy any-distinctive-column survival proxy. The contiguity rule is
-applied exactly where the record is contiguous (in-page) and not where the format
-itself makes it non-contiguous (overflow).
+The one documented domain branch is **genuine overflow**: a record whose payload
+exceeds the page's in-page limit (`usable - 35`, where `usable = page_size -
+reserved`) spills onto a chain of overflow pages (SQLite file format, "Cell
+payload overflow pages"), so its body is non-contiguous in the flat file by
+construction and a flat contiguity test cannot model it. Such a record is treated
+conservatively as NOT contiguous-recoverable (chain-aware overflow recoverability
+is future work). This is decided per record from the actual body size and the
+DB-header page geometry — not by category. In this corpus most `0E` deleted bodies
+are large-but-in-page and contiguous (so they ARE tested honestly); only the few
+truly-overflowing records fall into the overflow branch. The dropped-table
+categories `0A`/`0B` (no row-level recall denominator) are still computed with the
+legacy any-distinctive-column proxy, which their flag is not used by any recall
+matrix.
 """
 
 from __future__ import annotations
@@ -71,11 +75,103 @@ def row_cells(row: ET.Element) -> list[str]:
     return [c.findtext("content") or "" for c in row.findall("column")]
 
 
-# Categories whose deletions are IN-PAGE (the freed cell, and any later overwrite,
-# live entirely within one page), so the record body is a single contiguous run
-# and the honest contiguous full-row-identity test is faithful. 0E is excluded —
-# its records overflow onto a non-contiguous overflow-page chain (see module docs).
-CONTIGUOUS_IDENTITY_CATEGORIES = ("0C", "0D")
+# Dropped-table categories: their deleted-row substrate flag feeds no recall matrix
+# (the whole table is gone), so they keep the legacy any-distinctive-column proxy
+# rather than the per-record contiguity rule the recall categories (0C/0D/0E) use.
+DROPPED_TABLE_CATEGORIES = ("0A", "0B")
+
+
+def page_geometry(raw: bytes) -> tuple[int, int]:
+    """The (page_size, usable_size) of a SQLite DB from its file header.
+
+    Page size is the big-endian u16 at offset 16 (the value 1 means 65536); the
+    reserved-bytes-per-page count is the u8 at offset 20. usable = page_size -
+    reserved (SQLite file format, "The database header").
+    """
+    import struct
+
+    raw_ps = struct.unpack(">H", raw[16:18])[0]
+    page_size = 65536 if raw_ps == 1 else raw_ps
+    reserved = raw[20]
+    return page_size, page_size - reserved
+
+
+def _varint(n: int) -> bytes:
+    """Minimal SQLite varint encoding of a non-negative integer (1-9 bytes)."""
+    if n == 0:
+        return b"\x00"
+    out: list[int] = []
+    while n > 0:
+        out.append(n & 0x7F)
+        n >>= 7
+    out.reverse()
+    return bytes((b | 0x80) if i < len(out) - 1 else b for i, b in enumerate(out))
+
+
+def record_payload_len(cells: list[str], coltypes: list[dict]) -> int | None:
+    """Total record payload length (header + body) for one row, the quantity SQLite
+    compares against the in-page threshold to decide overflow. Returns None if any
+    column cannot be encoded (the caller then declines the contiguity branch).
+    """
+    serials: list[int] = []
+    body_len = 0
+    for cell, col in zip(cells, coltypes):
+        st = _serial_type(cell, col.get("type"))
+        if st is None:
+            return None
+        serials.append(st)
+        body_len += _serial_content_len(st)
+    serial_bytes = b"".join(_varint(s) for s in serials)
+    hdr = len(serial_bytes)
+    # The header length is a varint that counts itself; solve the fixed point.
+    header_len = hdr + 1
+    while len(_varint(header_len)) + hdr != header_len:
+        header_len += 1
+    return header_len + body_len
+
+
+def _serial_type(cell: str, ctype: str | None) -> int | None:
+    """The SQLite serial type code for a cell value (None if not encodable)."""
+    if cell is None or cell == "":
+        return 0
+    if ctype == "INTEGER":
+        try:
+            value = int(cell)
+        except ValueError:
+            return None
+        body = _minimal_int_bytes(value)
+        if body is None:
+            return None
+        return {1: 1, 2: 2, 3: 3, 4: 4, 6: 5, 8: 6}[len(body)]
+    if ctype == "REAL":
+        try:
+            float(cell)
+        except ValueError:
+            return None
+        return 7
+    return 13 + 2 * len(cell.encode("utf-8"))  # TEXT (and other affinities verbatim)
+
+
+def _serial_content_len(serial_type: int) -> int:
+    """Body byte count for a serial type (SQLite file format, record format)."""
+    if serial_type in (0, 8, 9):
+        return 0
+    if serial_type in (1, 2, 3, 4):
+        return serial_type
+    if serial_type == 5:
+        return 6
+    if serial_type in (6, 7):
+        return 8
+    return (serial_type - 12) // 2  # BLOB (even) / TEXT (odd) >= 12
+
+
+def _minimal_int_bytes(value: int) -> bytes | None:
+    for width in (1, 2, 3, 4, 6, 8):
+        try:
+            return value.to_bytes(width, "big", signed=True)
+        except OverflowError:
+            continue
+    return None
 
 
 def any_distinctive_column_present(
@@ -86,9 +182,8 @@ def any_distinctive_column_present(
     TEXT >= 4 chars is searched as UTF-8; INTEGER is searched as its 1/2/3/4/6/8
     byte big-endian two's-complement encodings (SQLite serial types 1-6); REAL is
     searched as its 8-byte big-endian IEEE-754 encoding (serial type 7). Used for
-    the overflow category (0E) and the dropped-table categories (0A/0B), where the
-    record body is non-contiguous (overflow chain) or absent from the recall
-    denominator, so a contiguity test does not apply.
+    the dropped-table categories (0A/0B), whose flag feeds no recall matrix, and as
+    a conservative fallback when a row's columns cannot be serial-encoded.
     """
     import struct
 
@@ -184,12 +279,33 @@ def substrate_recoverable(
     category: str, raw: bytes, cells: list[str], coltypes: list[dict]
 ) -> bool:
     """Whether the deleted row's bytes still permit reconstructing its scored
-    identity — honest contiguous full-row-identity for the in-page categories,
-    the legacy any-distinctive-column proxy for overflow / dropped-table ones.
+    identity. Decided **per record by body size**, not by category:
+
+      * the dropped-table categories (0A/0B) keep the legacy any-distinctive-column
+        proxy — their flag feeds no recall matrix;
+      * otherwise, if the record payload fits in-page (<= usable - 35) the body is
+        a single contiguous run and the honest contiguous full-row-identity test
+        applies;
+      * if the payload exceeds that threshold the record overflows onto a
+        non-contiguous overflow-page chain (SQLite "Cell payload overflow pages"),
+        which a flat-file contiguity test cannot model, so it is treated
+        conservatively as NOT recoverable (chain-aware overflow recovery is future
+        work).
     """
-    if category in CONTIGUOUS_IDENTITY_CATEGORIES:
-        return contiguous_identity_present(raw, cells, coltypes)
-    return any_distinctive_column_present(raw, cells, coltypes)
+    if category in DROPPED_TABLE_CATEGORIES:
+        return any_distinctive_column_present(raw, cells, coltypes)
+
+    payload = record_payload_len(cells, coltypes)
+    if payload is None:
+        # A column we cannot serial-encode: fall back to the conservative proxy
+        # rather than assert a contiguous identity we cannot construct.
+        return any_distinctive_column_present(raw, cells, coltypes)
+
+    _page_size, usable = page_geometry(raw)
+    in_page_threshold = usable - 35
+    if payload > in_page_threshold:
+        return False  # genuine overflow: body spans a non-contiguous chain
+    return contiguous_identity_present(raw, cells, coltypes)
 
 
 def main() -> None:

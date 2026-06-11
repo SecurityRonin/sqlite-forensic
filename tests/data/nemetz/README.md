@@ -67,15 +67,20 @@ ground truth), the alive rows (used to tell a live-re-read from a phantom FP),
 and per deleted row `substrate_recoverable` — whether the row's **full scored
 identity** still physically survives in the `.db` (computed independently of our
 carver, partitioning `D_recoverable` from `D_destroyed` for the two-denominator
-recall). For the in-page record-deletion categories (`0C`, `0D`) this is the
-honest **contiguous full-row-identity** test: the whole record body (every
-column's SQLite serial encoding, in column order) must survive as one contiguous
-byte run, mirroring the recall matcher's full-row key — so a row whose scored
-identity a later same-rowid overwrite destroyed (only a coincidental single column
-surviving) is correctly excluded. The overflow category (`0E`) keeps the legacy
-any-distinctive-column proxy because its records spill onto a non-contiguous
-overflow-page chain, where a flat-file contiguity test does not apply. The harness
-reads this manifest, never the `.xml` at test time.
+recall). This is the honest **contiguous full-row-identity** test, decided **per
+record by body size** (never by category): the whole record body (every column's
+SQLite serial encoding, in column order) must survive as one contiguous byte run,
+mirroring the recall matcher's full-row key — so a row whose scored identity a
+later same-rowid overwrite destroyed (only a coincidental single column surviving)
+is correctly excluded. The one documented branch is genuine overflow: a record
+whose payload exceeds the in-page limit (`usable − 35`) spills to a non-contiguous
+overflow-page chain (SQLite "Cell payload overflow pages"), which a flat-file
+contiguity test cannot model, so it is conservatively counted as not-recoverable
+(chain-aware overflow recovery is future work). This branch is detected per record
+from the body size and the DB-header page geometry — most `0E` deleted bodies are
+large-but-in-page and so are tested honestly. The dropped-table categories
+`0A`/`0B` (no recall denominator) keep the legacy any-distinctive-column proxy.
+The harness reads this manifest, never the `.xml` at test time.
 
 ## MD5 manifest (vendored databases)
 

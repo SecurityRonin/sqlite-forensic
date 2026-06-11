@@ -13,11 +13,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlite4n6::{
-    carve_wal_snapshots, filter_by_confidence, render_audit, render_carve,
-    render_carve_with_snapshot, MinConfidence, OutputFormat,
+    carve_wal_snapshots, filter_by_confidence, render_audit, render_carve, render_carve_tiered,
+    render_carve_with_snapshot, render_fragments, MinConfidence, OutputFormat,
 };
 use sqlite_core::Database;
-use sqlite_forensic::{audit, carve_all_deleted_records};
+use sqlite_forensic::{audit, carve_all_deleted_records, carve_with_fragments};
 
 /// sqlite4n6 — read-only SQLite forensic analysis CLI.
 #[derive(Parser, Debug)]
@@ -101,6 +101,13 @@ struct CarveArgs {
     /// snapshot column).
     #[arg(long, conflicts_with = "wal")]
     no_wal: bool,
+
+    /// Also emit Tier-2 partial fragments — lower-confidence partial rows
+    /// salvaged where a full row could not be reconstructed but a distinctive
+    /// cell survived. Off by default (the high-precision full-row output is the
+    /// zero-config path). Fragments are sourced from the on-disk image only.
+    #[arg(long, conflicts_with = "rowid_only")]
+    fragments: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -182,14 +189,32 @@ fn run_carve(args: &CarveArgs) -> Result<(), String> {
         for line in render_carve_with_snapshot(&records, args.format.into(), args.rowid_only) {
             println!("{line}");
         }
+        // v1 fragments are sourced from the on-disk image only (no WAL fragment
+        // pass yet); print the opt-in section under the WAL-applied view's `db`.
+        if args.fragments {
+            let fragments = carve_with_fragments(&db).fragments;
+            for line in render_fragments(&fragments, args.format.into()) {
+                println!("{line}");
+            }
+        }
     } else {
         // On-disk-only view: single view, no snapshot column.
         let db = Database::open(db_bytes)
             .map_err(|e| format!("cannot parse database {}: {e:?}", args.db.display()))?;
-        let records = carve_all_deleted_records(&db);
-        let records = filter_by_confidence(records, args.min_confidence.into());
-        for line in render_carve(&records, args.format.into(), args.rowid_only) {
-            println!("{line}");
+        if args.fragments {
+            // Tier-1 + Tier-2 in one pass; both sections rendered together.
+            let tiers = carve_with_fragments(&db);
+            let full = filter_by_confidence(tiers.full, args.min_confidence.into());
+            for line in render_carve_tiered(&full, &tiers.fragments, args.format.into(), args.rowid_only)
+            {
+                println!("{line}");
+            }
+        } else {
+            let records = carve_all_deleted_records(&db);
+            let records = filter_by_confidence(records, args.min_confidence.into());
+            for line in render_carve(&records, args.format.into(), args.rowid_only) {
+                println!("{line}");
+            }
         }
     }
     Ok(())
@@ -202,4 +227,25 @@ fn run_audit(args: &AuditArgs) -> Result<(), String> {
         println!("{line}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    /// `--rowid-only --fragments` is a usage error (fragments have no rowid), so
+    /// clap rejects the combination — fail loud, not silently ignore one flag.
+    #[test]
+    fn rowid_only_and_fragments_conflict() {
+        let res = Cli::try_parse_from(["sqlite4n6", "carve", "db.sqlite", "--rowid-only", "--fragments"]);
+        assert!(res.is_err(), "--rowid-only --fragments must be rejected");
+    }
+
+    /// `--fragments` alone parses cleanly (the opt-in path).
+    #[test]
+    fn fragments_flag_parses() {
+        let res = Cli::try_parse_from(["sqlite4n6", "carve", "db.sqlite", "--fragments"]);
+        assert!(res.is_ok(), "--fragments alone must parse");
+    }
 }

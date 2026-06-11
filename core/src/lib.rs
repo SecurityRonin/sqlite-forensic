@@ -749,73 +749,8 @@ impl Database {
     /// Tier-1's precision architecture. Bounded and panic-free identically.
     #[must_use]
     pub fn reconstruct_freeblock_fragments(&self, page_bytes: &[u8]) -> Vec<CellFragment> {
-        self.reconstruct_freeblock_inner(page_bytes).1
-    }
-
-    /// Shared internal walker producing BOTH tiers in one pass so the cell and
-    /// fragment outputs can never diverge: `(full_cells, fragments)`. The public
-    /// [`Database::reconstruct_freeblock_records`] returns `.0`,
-    /// [`Database::reconstruct_freeblock_fragments`] returns `.1`.
-    fn reconstruct_freeblock_inner(&self, page_bytes: &[u8]) -> (Vec<CarvedCell>, Vec<CellFragment>) {
-        let mut cells = Vec::new();
-        let mut frags = Vec::new();
-        let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
-            SQLITE_HEADER_SIZE
-        } else {
-            0
-        };
-        let Some(&page_type) = page_bytes.get(hdr_off) else {
-            return (cells, frags);
-        };
-        if page_type != 0x0d {
-            return (cells, frags); // only table-leaf pages have freeblock residue
-        }
-        let Some(template) = freeblock_template(page_bytes, hdr_off) else {
-            return (cells, frags);
-        };
-
-        let first_freeblock = be_u16(page_bytes, hdr_off + 1) as usize;
-        let mut fb = first_freeblock;
-        let mut walked = 0usize;
-        let mut visited = std::collections::BTreeSet::new();
-        while fb != 0 && walked < MAX_FREEBLOCKS_PER_PAGE {
-            walked += 1;
-            if !visited.insert(fb) {
-                break; // cyclic next pointer
-            }
-            let next = be_u16(page_bytes, fb) as usize;
-            let size = be_u16(page_bytes, fb + 2) as usize;
-            let Some(fb_end) = fb.checked_add(size) else {
-                break; // cov:unreachable: usize add of two u16-range values
-            };
-            if size >= 4 && fb_end <= page_bytes.len() {
-                template.reconstruct_span_tiered(page_bytes, fb, fb_end, false, &mut cells, &mut frags);
-            }
-            fb = next;
-        }
-
-        let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
-        let cptr_end = hdr_off + 8 + cell_count * 2;
-        let cca = be_u16(page_bytes, hdr_off + 5) as usize;
-        if cca > cptr_end && cca <= page_bytes.len() {
-            for anchor_off in cptr_end..cca {
-                let Some(anchor) =
-                    try_carve_cell_at(page_bytes, anchor_off, Some(template.column_count))
-                else {
-                    continue;
-                };
-                let has_text = anchor.values.iter().any(
-                    |v| matches!(v, Value::Text(t) if !t.is_empty() && !t.contains('\u{FFFD}')),
-                );
-                if !has_text {
-                    continue;
-                }
-                let tail_start = anchor.offset + anchor.byte_len;
-                template.reconstruct_span_tiered(page_bytes, tail_start, cca, true, &mut cells, &mut frags);
-                break; // one anchored run per page — the contiguous freed tail
-            }
-        }
-        (cells, frags)
+        let _ = self;
+        reconstruct_freeblock_inner(page_bytes).1
     }
 
     /// The maximal FREE (unallocated) byte ranges of a table-leaf page — the
@@ -1976,7 +1911,7 @@ impl WalTimeline {
 /// fragment emission (the §3.1 gate): TEXT of ≥ 4 bytes of valid UTF-8 (no
 /// replacement char), or a REAL. Bare integers (1–8-byte serial patterns),
 /// NULL, and BLOBs are NOT distinctive alone — a short integer byte-pattern
-/// coincides far too often in a 4 KiB page to serve as identity, so it can ride
+/// coincides far too often in a 4 `KiB` page to serve as identity, so it can ride
 /// along inside a fragment but never justify emitting one.
 fn is_distinctive(value: &Value) -> bool {
     match value {
@@ -2061,6 +1996,75 @@ fn free_regions(live: &[(usize, usize)], lo: usize, hi: usize) -> Vec<(usize, us
 /// overwrites. Returns `None` when no live cell parses or the prefix is wider
 /// than the 4 bytes a freeblock header clobbers (the simple template cannot then
 /// place the surviving serial tail).
+/// Shared internal walker producing BOTH recovery tiers in one pass so the cell
+/// and fragment outputs can never diverge: `(full_cells, fragments)`.
+/// [`Database::reconstruct_freeblock_records`] takes `.0`,
+/// [`Database::reconstruct_freeblock_fragments`] takes `.1`. A free function (it
+/// needs no `Database` state — only the page bytes and the page-derived
+/// template), keeping the two public entry points a thin projection of one walk.
+fn reconstruct_freeblock_inner(page_bytes: &[u8]) -> (Vec<CarvedCell>, Vec<CellFragment>) {
+    let mut cells = Vec::new();
+    let mut frags = Vec::new();
+    let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
+        SQLITE_HEADER_SIZE
+    } else {
+        0
+    };
+    let Some(&page_type) = page_bytes.get(hdr_off) else {
+        return (cells, frags);
+    };
+    if page_type != 0x0d {
+        return (cells, frags); // only table-leaf pages have freeblock residue
+    }
+    let Some(template) = freeblock_template(page_bytes, hdr_off) else {
+        return (cells, frags);
+    };
+
+    let first_freeblock = be_u16(page_bytes, hdr_off + 1) as usize;
+    let mut fb = first_freeblock;
+    let mut walked = 0usize;
+    let mut visited = std::collections::BTreeSet::new();
+    while fb != 0 && walked < MAX_FREEBLOCKS_PER_PAGE {
+        walked += 1;
+        if !visited.insert(fb) {
+            break; // cyclic next pointer
+        }
+        let next = be_u16(page_bytes, fb) as usize;
+        let size = be_u16(page_bytes, fb + 2) as usize;
+        let Some(fb_end) = fb.checked_add(size) else {
+            break; // cov:unreachable: usize add of two u16-range values
+        };
+        if size >= 4 && fb_end <= page_bytes.len() {
+            template.reconstruct_span_tiered(page_bytes, fb, fb_end, false, &mut cells, &mut frags);
+        }
+        fb = next;
+    }
+
+    let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
+    let cptr_end = hdr_off + 8 + cell_count * 2;
+    let cca = be_u16(page_bytes, hdr_off + 5) as usize;
+    if cca > cptr_end && cca <= page_bytes.len() {
+        for anchor_off in cptr_end..cca {
+            let Some(anchor) =
+                try_carve_cell_at(page_bytes, anchor_off, Some(template.column_count))
+            else {
+                continue;
+            };
+            let has_text = anchor
+                .values
+                .iter()
+                .any(|v| matches!(v, Value::Text(t) if !t.is_empty() && !t.contains('\u{FFFD}')));
+            if !has_text {
+                continue;
+            }
+            let tail_start = anchor.offset + anchor.byte_len;
+            template.reconstruct_span_tiered(page_bytes, tail_start, cca, true, &mut cells, &mut frags);
+            break; // one anchored run per page — the contiguous freed tail
+        }
+    }
+    (cells, frags)
+}
+
 fn freeblock_template(page_bytes: &[u8], hdr_off: usize) -> Option<FreeblockTemplate> {
     let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
     let cell_ptr_array = hdr_off + 8;
@@ -2297,10 +2301,6 @@ impl FreeblockTemplate {
     /// the salvaged prefix contains at least one distinctive cell (TEXT ≥ 4 bytes
     /// of valid UTF-8, or REAL) — the §3.1 emission gate — otherwise `None`.
     fn salvage_fragment(&self, page: &[u8], cell_start: usize, span_end: usize) -> Option<CellFragment> {
-        // RED stub: no salvage yet — implemented in the GREEN commit.
-        let _ = (page, cell_start, span_end);
-        return None;
-        #[allow(unreachable_code, clippy::allow_attributes)]
         let surviving_count = self.column_count - self.known_lead_serials.len();
         let tail_start = cell_start.checked_add(self.surviving_serials_off)?;
 
@@ -3043,12 +3043,14 @@ mod tests {
         ];
         page[live_off..live_off + live.len()].copy_from_slice(&live);
 
-        // Freeblock header at fb: next=0, size=fb_size.
+        // Lay the freed-cell bytes first, then stamp the stale freeblock header
+        // (next=0, size=fb_size) over its first 4 bytes — exactly what freeblock
+        // conversion does (the header clobbers the freed cell's leading 4 bytes).
+        page[fb..fb + freed.len()].copy_from_slice(freed);
         page[fb] = 0x00;
         page[fb + 1] = 0x00;
         page[fb + 2] = (fb_size >> 8) as u8;
         page[fb + 3] = (fb_size & 0xff) as u8;
-        page[fb..fb + freed.len()].copy_from_slice(freed);
         page
     }
 

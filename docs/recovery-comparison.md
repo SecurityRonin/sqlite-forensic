@@ -405,10 +405,10 @@ includes fragments.
 | 0D | 45 | 19 | 5 | 1 | 0 |
 | 0E | 12 | 3 | 4 | 0 | 0 |
 
-(The legacy any-distinctive-column proxy would count 17 "fragment-only" 0D rows,
-but 12 of those survive only as 1–4-byte integer patterns indistinguishable from
-coincidence — an integer-pattern-inflated upper bound, not the metric. The honest
-distinctive-cell denominator is 5.)
+(A `0D` row counts as fragment-recoverable only when a genuinely distinctive cell
+survives — a `TEXT ≥ 4` UTF-8 bytes or a `REAL`. Bare 1–4-byte integers are
+excluded: they match coincidental byte runs across a page, so they are not
+evidence a row survived. On `0D` the distinctive-cell denominator is 5.)
 
 fqlite and undark have no comparable fragment tier, so the head-to-head matrix
 stays full-row-only (apples-to-apples); fragments are an ours-only capability

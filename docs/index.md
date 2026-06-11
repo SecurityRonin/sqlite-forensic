@@ -20,7 +20,7 @@ for rec in carve_all_deleted_records(&db) { /* recovered deleted rows */ }
 sqlite-forensic reads the raw SQLite file format — header, b-tree, freelist + overflow chains, and a read-only WAL overlay — and does two things the live `sqlite3`/rusqlite path cannot:
 
 - **Grades anomalies** (`sqlite-forensic::audit`) into severity-ranked, confidence-scored `forensicnomicon::report::Finding`s: non-empty freelist, uncheckpointed WAL state, page-count mismatch, non-standard reserved space.
-- **Carves deleted records** (`carve_all_deleted_records`) from freelist pages, in-page free blocks, and dropped-table pages — column count inferred per record — while structurally refusing to re-surface a live row.
+- **Carves deleted records** (`carve_all_deleted_records`) from freelist pages, in-page free blocks, dropped-table pages, and freed overflow-page chains (reassembled when every chain page survives as a freelist leaf) — column count inferred per record — while structurally refusing to re-surface a live row. An opt-in Tier-2 surface (`carve_with_fragments`) salvages partial rows where a distinctive cell survives but full identity is destroyed.
 
 ---
 

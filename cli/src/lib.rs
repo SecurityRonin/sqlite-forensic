@@ -684,6 +684,7 @@ mod tests {
             allocated: false,
             source,
             wal: None,
+            overflow: None,
         }
     }
 
@@ -865,6 +866,7 @@ mod tests {
                 salt1: 3_131_615_003,
                 salt2: 3_836_839_008,
             }),
+            overflow: None,
         }
     }
 

@@ -257,6 +257,18 @@ const MIN_INFERRED_COLUMNS: usize = 2;
 /// graded a notch lower even when it parses cleanly.
 const IN_PAGE_CONFIDENCE_FACTOR: f32 = 0.8;
 
+/// Confidence multiplier applied to a **chain-reassembled overflow** full row
+/// (task #73, [`Database::carve_overflow_records`]). Overflow Tier-1 is NOT part
+/// of the structural 0-false-positive guarantee (Codex ruling #1): a freelist
+/// *leaf* page can be stale — allocated, overwritten, freed, now a leaf holding
+/// unrelated bytes that happen to decode. The freelist-leaf requirement plus the
+/// strict-UTF-8 gate make a clean decode strong evidence, but one indirection
+/// weaker than a contiguous in-page span, so it is graded below the in-page
+/// full-row tier (0.9 × this factor). The residual stale-leaf risk is documented
+/// and the row remains a "consistent with a deleted row" observation, never a
+/// verdict.
+const OVERFLOW_CHAIN_CONFIDENCE_FACTOR: f32 = 0.75;
+
 /// Confidence assigned to a record rebuilt by **freeblock reconstruction**
 /// ([`Database::reconstruct_freeblock_records`]). The cell's first four bytes
 /// (payload-length + rowid varints, the record `header_len`, and the leading
@@ -713,6 +725,134 @@ impl Database {
             }
         }
         out
+    }
+
+    /// Recover **spilled** deleted records on a table-leaf page whose payload
+    /// continued onto a freed overflow-page chain (task #73). Scans the page's
+    /// free regions (the complement of the live cells — same discipline as
+    /// [`Database::carve_free_regions`], so a live cell is never re-surfaced) for
+    /// a [`SpilledCell`], then resolves each chain through freelist **leaf** pages
+    /// only and assembles the full payload.
+    ///
+    /// A resolved record is returned only when ALL hold (design §5):
+    /// 1. the chain is intact through freelist leaves (Codex ruling #2: the leaf
+    ///    requirement is the load-bearing 0-FP guard — a trunk/live/off-freelist
+    ///    chain page is rejected);
+    /// 2. the assembled bytes total exactly the declared `P` and decode cleanly;
+    /// 3. **strict UTF-8 on chain-resident TEXT** — an EXTRA reject signal, not a
+    ///    correctness proof (Codex ruling #2: a clobbered chain can still be valid
+    ///    UTF-8, so this cannot prove integrity; it only catches the cases where
+    ///    the lossy decoder would otherwise mask an overwrite as `U+FFFD`).
+    ///
+    /// Each returned tuple is `(cell, chain)` where `chain` is the ordered list of
+    /// overflow pages the bytes came from (for provenance). Confidence is graded
+    /// BELOW the in-page full-row tier (Codex ruling #1: overflow Tier-1 is a
+    /// graded recovery, NOT part of the structural 0-FP guarantee — a freelist
+    /// leaf can be stale, holding unrelated bytes that happen to decode). Bounded
+    /// and panic-free; a malformed page or chain simply yields fewer records.
+    #[must_use]
+    pub fn carve_overflow_records(&self, page_bytes: &[u8]) -> Vec<(CarvedCell, Vec<u32>)> {
+        let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
+            SQLITE_HEADER_SIZE
+        } else {
+            0
+        };
+        let Some(&page_type) = page_bytes.get(hdr_off) else {
+            return Vec::new();
+        };
+        if page_type != 0x0d {
+            return Vec::new(); // only table-leaf pages carry spilled-cell residue
+        }
+        let Ok((freed_leaves, _trunks)) = self.freelist_pages_split() else {
+            return Vec::new();
+        };
+        let usable = self.header.usable_size() as usize;
+
+        let mut out = Vec::new();
+        let regions = self.free_regions_of_leaf(page_bytes, hdr_off);
+        for (lo, hi) in regions {
+            let Some(region) = page_bytes.get(lo..hi) else {
+                continue; // cov:unreachable: free_regions yields in-bounds spans
+            };
+            // Scan every offset for a spilled cell (recognizer abstains on in-page
+            // payloads, so the two carve classes never overlap).
+            let mut off = 0usize;
+            while off < region.len() {
+                let Some(sc) = try_carve_spilled_cell_at(region, off, usable, None) else {
+                    off += 1;
+                    continue;
+                };
+                if let Some((mut cell, chain)) =
+                    self.resolve_spilled(region, &sc, usable, &freed_leaves)
+                {
+                    // Translate the region-local offset to page-local.
+                    cell.offset = lo + sc.offset;
+                    out.push((cell, chain));
+                    off += sc.byte_len.max(1);
+                } else {
+                    off += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve a recognized [`SpilledCell`] to a full [`CarvedCell`] by walking
+    /// its freed overflow chain and decoding the assembled payload, applying the
+    /// strict-UTF-8 chain gate. Returns `Some((cell, chain))` on a fully-validated
+    /// recovery, `None` on any chain break or gate failure (the candidate then
+    /// degrades to a Tier-2 fragment elsewhere).
+    fn resolve_spilled(
+        &self,
+        region: &[u8],
+        sc: &SpilledCell,
+        usable: usize,
+        freed_leaves: &std::collections::BTreeSet<u32>,
+    ) -> Option<(CarvedCell, Vec<u32>)> {
+        let remaining = sc.payload_len.checked_sub(sc.local_len)?;
+        let local_payload = region.get(sc.local_payload_off..sc.local_payload_off + sc.local_len)?;
+        let (chain_content, chain) = self
+            .read_freed_overflow_chain(sc.first_overflow, remaining, usable, freed_leaves)
+            .ok()?;
+        let mut payload = Vec::with_capacity(sc.payload_len);
+        payload.extend_from_slice(local_payload);
+        payload.extend_from_slice(&chain_content);
+        if payload.len() != sc.payload_len {
+            return None; // cov:unreachable: chain delivers exactly `remaining` bytes
+        }
+
+        let values = decode_record(&payload, sc.serials.len(), sc.rowid).ok()?;
+        if values.len() != sc.serials.len() {
+            return None; // cov:unreachable: decode_record yields one value per serial
+        }
+        // Strict-UTF-8 gate on chain-resident TEXT (extra reject signal): the
+        // lossy decoder turns a clobbered byte into U+FFFD, so any replacement
+        // char in a decoded TEXT value means the chain-supplied bytes did not
+        // decode cleanly — reject. NOT a proof of integrity (a stale leaf can hold
+        // valid UTF-8); the freelist-leaf requirement is the load-bearing guard.
+        let any_replacement = values.iter().any(|v| match v {
+            Value::Text(t) => t.contains('\u{FFFD}'),
+            _ => false,
+        });
+        if any_replacement {
+            return None;
+        }
+        // Require at least one distinctive column so a coincidental decode of stale
+        // bytes does not anchor a full row (the same identity bar as fragments).
+        if !values.iter().any(is_distinctive) {
+            return None; // cov:unreachable: the spilled corpus rows carry distinctive TEXT
+        }
+
+        let cell = CarvedCell {
+            offset: sc.offset,
+            byte_len: sc.byte_len,
+            rowid: sc.rowid,
+            values,
+            // Graded below the in-page full-row tier (0.9): an overflow chain adds
+            // one indirection of stale-leaf exposure (Codex ruling #1).
+            confidence: 0.9 * OVERFLOW_CHAIN_CONFIDENCE_FACTOR,
+        };
+        Some((cell, chain))
     }
 
     /// Reconstruct deleted records from the **freeblock chain** of an allocated

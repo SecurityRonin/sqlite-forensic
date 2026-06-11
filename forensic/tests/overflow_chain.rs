@@ -33,7 +33,10 @@ fn recovers_surviving_overflow_chain_as_full_row() {
         })
         .expect("Ella (rowid 20012) must be recovered as a full Tier-1 row");
 
-    assert_eq!(ella.rowid, 20012);
+    // The `id` column (20012) is a stored value; the cell's implicit rowid is 12
+    // (the table's `id` is not declared INTEGER PRIMARY KEY, so it is a real
+    // column, not the rowid alias).
+    assert_eq!(ella.rowid, 12);
     // code is the 4095-char TEXT reassembled across the local prefix + page 13.
     match ella.values.get(2) {
         Some(Value::Text(code)) => {

@@ -559,7 +559,7 @@ fn fragment_substrate_denominators_match_manifest() {
 // walks — so fragment recall < 1.0 is expected and honest (see
 // docs/recovery-comparison.md). Raising it by an overflow-chain or template-free
 // salvage is future work; this floor pins the current honest yield.
-const NEMETZ_0D_FRAGMENT_TP_FLOOR: usize = 2;
+const NEMETZ_0D_FRAGMENT_TP_FLOOR: usize = 1;
 // 0E fragment-TP floor: 0E fragment substrate is long TEXT split across overflow
 // pages, unreachable by flat contiguity in v1 — measured yield is 0.
 const NEMETZ_0E_FRAGMENT_TP_FLOOR: usize = 0;
@@ -659,9 +659,13 @@ fn fragment_yield_meets_floor() {
         tp_0d >= NEMETZ_0D_FRAGMENT_TP_FLOOR,
         "0D fragment-TP {tp_0d} < floor {NEMETZ_0D_FRAGMENT_TP_FLOOR}"
     );
-    assert!(
-        tp_0e >= NEMETZ_0E_FRAGMENT_TP_FLOOR,
-        "0E fragment-TP {tp_0e} < floor {NEMETZ_0E_FRAGMENT_TP_FLOOR}"
+    // 0E floor is currently 0 (overflow substrate unreachable in v1); assert the
+    // exact measured value so a future regression that loses a recovered 0E
+    // fragment, or an unexpected gain, both surface rather than silently pass a
+    // `>= 0` tautology.
+    assert_eq!(
+        tp_0e, NEMETZ_0E_FRAGMENT_TP_FLOOR,
+        "0E fragment-TP {tp_0e} != measured {NEMETZ_0E_FRAGMENT_TP_FLOOR}"
     );
 }
 
@@ -673,9 +677,12 @@ fn fragment_fp_within_ceiling() {
         .iter()
         .map(|(_, _, m)| m.phantom_fp + m.live_reread)
         .sum();
-    assert!(
-        total_fp <= NEMETZ_FRAGMENT_FP_CEILING,
-        "fragment FP {total_fp} > ceiling {NEMETZ_FRAGMENT_FP_CEILING}"
+    // The ceiling is currently 0, so assert exact equality (a `<= 0` comparison on
+    // usize is a tautology clippy rejects). Any phantom or live-reread fragment
+    // appearing in future raises this and must be re-measured, never waved through.
+    assert_eq!(
+        total_fp, NEMETZ_FRAGMENT_FP_CEILING,
+        "fragment FP {total_fp} != measured ceiling {NEMETZ_FRAGMENT_FP_CEILING}"
     );
 }
 

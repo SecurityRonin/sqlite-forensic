@@ -724,6 +724,22 @@ pub fn carve_with_fragments(db: &Database) -> CarveTiers {
                 wal: None,
             });
         }
+        // Broken-chain overflow fragments (task #73, Codex ruling #4): a spilled
+        // cell whose overflow chain was destroyed (e.g. a trunk-clobbered chain
+        // page) still has an intact local prefix; salvage its locally-decodable
+        // columns. The chain-resident columns are lost (untrusted), so this is a
+        // Tier-2 lead, never a full row.
+        for frag in db.carve_overflow_fragments(page_bytes) {
+            fragments.push(CarvedFragment {
+                page,
+                offset: frag.offset,
+                surviving: frag.surviving,
+                missing: frag.missing,
+                confidence: frag.confidence,
+                source: RecoverySource::InPageFreeBlock,
+                wal: None,
+            });
+        }
     }
 
     // Layer 3: live-row suppression. A fragment whose surviving set matches the

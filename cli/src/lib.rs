@@ -331,7 +331,7 @@ fn render_carve_jsonl(records: &[CarvedRecord]) -> Vec<String> {
         .collect()
 }
 
-// ---- Tier-2 fragment rendering (opt-in `--fragments`) ----------------------
+// ---- Tier-2 fragment rendering (shown by default; `--no-fragments` opts out) -
 
 /// The fixed leading cells of a fragment row: page, offset, confidence, source.
 /// Fragments carry NO rowid (it was clobbered), so there is no rowid cell.
@@ -385,8 +385,8 @@ pub fn render_fragments(frags: &[CarvedFragment], format: OutputFormat) -> Vec<S
 fn render_fragments_table(frags: &[CarvedFragment]) -> Vec<String> {
     let mut lines = vec![
         String::new(),
-        "# fragments — partial rows, lower confidence (opt-in; not part of the \
-         full-row zero-false-positive output)"
+        "# fragments — partial rows, lower confidence (separate from the \
+         full-row zero-false-positive output; --no-fragments to suppress)"
             .to_string(),
         format!(
             "{:>6}  {:>8}  {:>5}  {:<24}  surviving",
@@ -451,13 +451,13 @@ fn render_fragments_jsonl(frags: &[CarvedFragment]) -> Vec<String> {
         .collect()
 }
 
-/// Render full rows + the Tier-2 fragment section for the opt-in `--fragments`
-/// path. The full-row output is byte-identical to [`render_carve`] EXCEPT in CSV,
-/// where both sections gain a leading `kind` column (`row` / `fragment`) — the
-/// flag is the explicit opt-in to that schema change, so no zero-config CSV
-/// consumer breaks. `rowid_only` collapses to bare rowids of the FULL rows only
-/// (fragments have no rowid); callers gate `--rowid-only --fragments` as a
-/// conflict, so this branch renders full rowids and no fragment section.
+/// Render full rows + the Tier-2 fragment section (the default carve output).
+/// The full-row output is byte-identical to [`render_carve`] EXCEPT in CSV, where
+/// both sections gain a leading `kind` column (`row` / `fragment`) so a consumer
+/// can split the tiers unambiguously. `rowid_only` collapses to bare rowids of the
+/// FULL rows only; callers suppress fragments whenever `rowid_only` is set (a
+/// fragment has no rowid), so this `rowid_only` branch is a defensive guard that
+/// renders full rowids and no fragment section.
 #[must_use]
 pub fn render_carve_tiered(
     full: &[CarvedRecord],
@@ -469,7 +469,7 @@ pub fn render_carve_tiered(
         return full.iter().map(|r| rowid_cell(r.rowid)).collect();
     }
     if format == OutputFormat::Csv {
-        // Both sections carry a leading `kind` column under `--fragments`.
+        // Both sections carry a leading `kind` column so the tiers split cleanly.
         let mut lines =
             vec!["kind,page,offset,rowid,recovery_source,confidence,values".to_string()];
         for rec in full {

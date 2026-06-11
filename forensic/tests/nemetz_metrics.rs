@@ -327,12 +327,45 @@ fn category_0d_true_positive_floor() {
     );
 }
 
-// NOTE (#68): a stricter, more honest D_recoverable denominator — counting a 0D
-// row recoverable only when its scored (col1,col2) identity survives *contiguously*
-// (not just any distinctive column anywhere) — would tighten 0D Drec 36 -> ~20 and
-// revalue 0D substrate recall ~0.53 -> ~0.95. Deferred to #68: it must align
-// gen_ground_truth.py's substrate test with the recall matcher's exact key. The
-// span-walk recall fix (this change) ships first.
+/// The 0D substrate-recoverable denominator is now the **honest contiguous
+/// full-row-identity** count: a deleted row is counted recoverable only when its
+/// whole scored record body — every column's SQLite serial encoding, in column
+/// order, exactly as the recall matcher's full-row key (`normalize_row` over all
+/// cells) discriminates on — survives **contiguously** in the database bytes. A
+/// row whose scored identity was destroyed by a later same-rowid overwrite (so
+/// only a coincidental single-column byte match remains) is NO LONGER counted, as
+/// the earlier any-distinctive-column rule wrongly did. This tightens 0D
+/// `d_recoverable` from the inflated 36 to the honest 19 — the substrate is small
+/// because overwrites genuinely destroyed roughly half the deleted rows, not
+/// because the harness is lenient.
+///
+/// Two checks, both against the regenerated manifest:
+///  1. the 0D `d_recoverable` total equals the measured honest value, and
+///  2. it never falls below the 0D true-positive total — TP > Drec would be a
+///     logical impossibility (we cannot recover a row whose identity does not
+///     survive), so this guards the denominator against silently re-inflating
+///     above what the carver could ever reach.
+#[test]
+fn category_0d_drecoverable_is_contiguous_identity() {
+    let total_drec: usize = all_matrices()
+        .iter()
+        .filter(|m| m.category == "0D")
+        .map(|m| m.d_recoverable)
+        .sum();
+    assert_eq!(
+        total_drec, NEMETZ_0D_DRECOVERABLE,
+        "0D d_recoverable total {total_drec} != honest contiguous-identity denominator {NEMETZ_0D_DRECOVERABLE}"
+    );
+    let total_tp: usize = all_matrices()
+        .iter()
+        .filter(|m| m.category == "0D")
+        .map(|m| m.tp)
+        .sum();
+    assert!(
+        total_drec >= total_tp,
+        "0D d_recoverable {total_drec} < tp {total_tp} — a recovered row whose identity does not survive is impossible"
+    );
+}
 
 /// The total phantom-FP count across the recall corpus, pinned so a new
 /// systematic FP class fails CI. Phantoms here are low-confidence all-empty/NULL
@@ -367,11 +400,16 @@ const NEMETZ_0C_TP_FLOOR: usize = 79;
 // layout this general reconstruction does not yet anchor (tracked follow-up).
 // The floor is the honestly-measured 19 — never a special-cased 20.
 const NEMETZ_0D_TP_FLOOR: usize = 19;
-// 0D substrate-recoverable denominator: the honest contiguous-(col1,col2)-identity
-// count (~20, which would revalue 0D substrate recall ~0.53 -> ~0.95) is deferred
-// to #68 — it needs gen_ground_truth.py's substrate test aligned with the recall
-// matcher's exact scoring key. Until then d_recoverable uses the conservative
-// any-distinctive-column byte-present rule, so the 0D substrate denominator is 36.
+// 0D substrate-recoverable denominator under the honest contiguous full-row-identity
+// rule (gen_ground_truth.py now requires the whole scored record body to survive
+// contiguously, mirroring the recall matcher's full-row key). The earlier
+// any-distinctive-column rule inflated this to 36 by counting rows whose scored
+// identity was destroyed by a later same-rowid overwrite but a single column
+// coincidentally survived elsewhere; the honest count is 19, all of which the
+// carver recovers (0D substrate recall 19/19 = 1.000 vs the inflated 19/36 = 0.528).
+// The substrate is small because overwrites genuinely destroyed ~26 of the 45
+// deleted rows, not because the harness is lenient.
+const NEMETZ_0D_DRECOVERABLE: usize = 19;
 // Total phantom FP across the recall corpus (all-empty/NULL inferred records).
 const NEMETZ_FP_CEILING: usize = 10;
 // Dropped/overwritten-table recovery is bounded per DB (max recovered+fp seen).

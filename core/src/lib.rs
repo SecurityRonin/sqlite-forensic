@@ -27,6 +27,11 @@ use forensicnomicon::sqlite::{
 /// promote it into `forensicnomicon::sqlite`.
 const RESERVED_SPACE_OFFSET: usize = 20;
 
+/// Byte offset of the 4-byte big-endian text-encoding field in the file header
+/// (file-format §1.3.1). forensicnomicon does not yet expose this; promote it
+/// into `forensicnomicon::sqlite` alongside [`RESERVED_SPACE_OFFSET`].
+const TEXT_ENCODING_OFFSET: usize = 56;
+
 /// Byte offset of the in-header database size, in pages (file-format §1.3.6).
 /// 4-byte big-endian. Valid only when it equals the change counter at offset 24
 /// (a "size is valid" sentinel); the file-length fallback covers the rest.
@@ -165,6 +170,40 @@ pub struct SpilledCell {
     pub first_overflow: u32,
 }
 
+/// Database text encoding (file-format §1.3, header byte 56). Determines how
+/// `TEXT` column bytes are decoded; a fixed property set at database creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextEncoding {
+    /// `1` (and `0`, an unwritten database): UTF-8.
+    #[default]
+    Utf8,
+    /// `2`: UTF-16 little-endian.
+    Utf16Le,
+    /// `3`: UTF-16 big-endian.
+    Utf16Be,
+}
+
+impl TextEncoding {
+    /// Decode a `TEXT` value's raw bytes per this encoding. Lossy so a corrupt
+    /// byte sequence yields U+FFFD rather than a panic or an error.
+    fn decode(self, bytes: &[u8]) -> String {
+        match self {
+            Self::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+            Self::Utf16Le => Self::decode_utf16(bytes, u16::from_le_bytes),
+            Self::Utf16Be => Self::decode_utf16(bytes, u16::from_be_bytes),
+        }
+    }
+
+    fn decode_utf16(bytes: &[u8], conv: fn([u8; 2]) -> u16) -> String {
+        // A trailing odd byte (truncated UTF-16) is dropped by chunks_exact.
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| conv([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    }
+}
+
 /// Parsed 100-byte `SQLite` file header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -172,6 +211,8 @@ pub struct Header {
     pub page_size: u32,
     /// Reserved bytes at the end of each page (usually 0).
     pub reserved: u8,
+    /// Text encoding for `TEXT` columns (header byte 56).
+    pub text_encoding: TextEncoding,
 }
 
 impl Header {
@@ -590,7 +631,7 @@ impl Database {
         }
         let mut off = 0usize;
         while off < page_bytes.len() {
-            if let Some(cell) = try_carve_cell_at(page_bytes, off, Some(column_count)) {
+            if let Some(cell) = try_carve_cell_at(page_bytes, off, Some(column_count), self.header.text_encoding) {
                 // Skip past this record to avoid re-reporting sub-slices of it.
                 off += cell.byte_len.max(1);
                 out.push(cell);
@@ -618,7 +659,7 @@ impl Database {
         let mut out = Vec::new();
         let mut off = 0usize;
         while off < page_bytes.len() {
-            if let Some(cell) = try_carve_cell_at(page_bytes, off, None) {
+            if let Some(cell) = try_carve_cell_at(page_bytes, off, None, self.header.text_encoding) {
                 off += cell.byte_len.max(1);
                 out.push(cell);
             } else {
@@ -666,7 +707,7 @@ impl Database {
             if cell_off == 0 || cell_off >= page_bytes.len() {
                 continue; // cov:unreachable: a valid leaf points cells within page
             }
-            if let Some(cell) = try_carve_cell_at(page_bytes, cell_off, None) {
+            if let Some(cell) = try_carve_cell_at(page_bytes, cell_off, None, self.header.text_encoding) {
                 out.push(cell);
             }
         }
@@ -828,7 +869,7 @@ impl Database {
             return None; // cov:unreachable: chain delivers exactly `remaining` bytes
         }
 
-        let values = decode_record(&payload, sc.serials.len(), sc.rowid).ok()?;
+        let values = decode_record(&payload, sc.serials.len(), sc.rowid, self.header.text_encoding).ok()?;
         if values.len() != sc.serials.len() {
             return None; // cov:unreachable: decode_record yields one value per serial
         }
@@ -893,7 +934,7 @@ impl Database {
         if page_bytes.get(hdr_off) != Some(&0x0d) {
             return Vec::new();
         }
-        let Some(template) = freeblock_template(page_bytes, hdr_off) else {
+        let Some(template) = freeblock_template(page_bytes, hdr_off, self.header.text_encoding) else {
             return Vec::new();
         };
         let Ok((freed_leaves, _trunks)) = self.freelist_pages_split() else {
@@ -975,7 +1016,7 @@ impl Database {
                     .read_freed_overflow_chain(sc.first_overflow, remaining, usable, &freed_leaves)
                     .is_ok();
                 if !chain_ok {
-                    if let Some(mut frag) = salvage_local_prefix(region, &sc) {
+                    if let Some(mut frag) = salvage_local_prefix(region, &sc, self.header.text_encoding) {
                         frag.offset += lo;
                         out.push(frag);
                     }
@@ -1023,7 +1064,7 @@ impl Database {
         // can never diverge. The walk (freeblock-chain pass + unallocated-gap pass)
         // and its precision discipline live in [`reconstruct_freeblock_inner`].
         let _ = self;
-        reconstruct_freeblock_inner(page_bytes).0
+        reconstruct_freeblock_inner(page_bytes, self.header.text_encoding).0
     }
 
     /// Tier-2 partial salvage: the [`CellFragment`]s abandoned by
@@ -1045,7 +1086,7 @@ impl Database {
     #[must_use]
     pub fn reconstruct_freeblock_fragments(&self, page_bytes: &[u8]) -> Vec<CellFragment> {
         let _ = self;
-        reconstruct_freeblock_inner(page_bytes).1
+        reconstruct_freeblock_inner(page_bytes, self.header.text_encoding).1
     }
 
     /// The maximal FREE (unallocated) byte ranges of a table-leaf page — the
@@ -1217,7 +1258,7 @@ impl Database {
                     // parse hiccup (e.g. a table narrower than MIN_INFERRED_COLUMNS),
                     // fall back to the rowid alone (empty values) so the row is
                     // still known to be live.
-                    if let Some(cell) = try_carve_cell_at(slice, cell_off, None) {
+                    if let Some(cell) = try_carve_cell_at(slice, cell_off, None, self.header.text_encoding) {
                         rows.insert(cell.rowid, cell.values);
                     } else if let Some(rowid) = live_cell_rowid(slice, cell_off) {
                         rows.entry(rowid).or_default(); // cov:unreachable: a >=2-col live cell always decodes above
@@ -1415,7 +1456,7 @@ impl Database {
             buf
         };
 
-        let values = decode_record(&payload, column_count, rowid)?;
+        let values = decode_record(&payload, column_count, rowid, self.header.text_encoding)?;
         Ok(Row { rowid, values })
     }
 
@@ -2297,7 +2338,10 @@ fn free_regions(live: &[(usize, usize)], lo: usize, hi: usize) -> Vec<(usize, us
 /// [`Database::reconstruct_freeblock_fragments`] takes `.1`. A free function (it
 /// needs no `Database` state — only the page bytes and the page-derived
 /// template), keeping the two public entry points a thin projection of one walk.
-fn reconstruct_freeblock_inner(page_bytes: &[u8]) -> (Vec<CarvedCell>, Vec<CellFragment>) {
+fn reconstruct_freeblock_inner(
+    page_bytes: &[u8],
+    enc: TextEncoding,
+) -> (Vec<CarvedCell>, Vec<CellFragment>) {
     let mut cells = Vec::new();
     let mut frags = Vec::new();
     let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
@@ -2311,7 +2355,7 @@ fn reconstruct_freeblock_inner(page_bytes: &[u8]) -> (Vec<CarvedCell>, Vec<CellF
     if page_type != 0x0d {
         return (cells, frags); // only table-leaf pages have freeblock residue
     }
-    let Some(template) = freeblock_template(page_bytes, hdr_off) else {
+    let Some(template) = freeblock_template(page_bytes, hdr_off, enc) else {
         return (cells, frags);
     };
 
@@ -2341,7 +2385,7 @@ fn reconstruct_freeblock_inner(page_bytes: &[u8]) -> (Vec<CarvedCell>, Vec<CellF
     if cca > cptr_end && cca <= page_bytes.len() {
         for anchor_off in cptr_end..cca {
             let Some(anchor) =
-                try_carve_cell_at(page_bytes, anchor_off, Some(template.column_count))
+                try_carve_cell_at(page_bytes, anchor_off, Some(template.column_count), enc)
             else {
                 continue;
             };
@@ -2361,7 +2405,7 @@ fn reconstruct_freeblock_inner(page_bytes: &[u8]) -> (Vec<CarvedCell>, Vec<CellF
     (cells, frags)
 }
 
-fn freeblock_template(page_bytes: &[u8], hdr_off: usize) -> Option<FreeblockTemplate> {
+fn freeblock_template(page_bytes: &[u8], hdr_off: usize, enc: TextEncoding) -> Option<FreeblockTemplate> {
     let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
     let cell_ptr_array = hdr_off + 8;
     for i in 0..cell_count {
@@ -2408,7 +2452,7 @@ fn freeblock_template(page_bytes: &[u8], hdr_off: usize) -> Option<FreeblockTemp
         if !ok || hpos != header_len || serials.len() < MIN_INFERRED_COLUMNS {
             continue; // cov:unreachable: a live cell's header parses cleanly with >= 2 columns
         }
-        return FreeblockTemplate::build(prefix_len, header_len, hn, &serials);
+        return FreeblockTemplate::build(prefix_len, header_len, hn, &serials, enc);
     }
     None
 }
@@ -2432,6 +2476,9 @@ struct FreeblockTemplate {
     /// Offset, relative to the freeblock start, at which the **surviving** serial
     /// tail begins (== `prefix_len + first_surviving_serial_header_offset`).
     surviving_serials_off: usize,
+    /// Text encoding of the owning database, so reconstructed text decodes per
+    /// the header (UTF-8 / UTF-16) rather than assuming UTF-8.
+    text_encoding: TextEncoding,
 }
 
 impl FreeblockTemplate {
@@ -2444,6 +2491,7 @@ impl FreeblockTemplate {
         _header_len: usize,
         _hn: usize,
         serials: &[(i64, usize, usize)],
+        enc: TextEncoding,
     ) -> Option<FreeblockTemplate> {
         // Bytes of the record header the 4-byte freeblock header destroys.
         let clobbered_header_bytes = 4usize.checked_sub(prefix_len)?;
@@ -2470,6 +2518,7 @@ impl FreeblockTemplate {
             column_count: serials.len(),
             known_lead_serials: known_lead,
             surviving_serials_off,
+            text_encoding: enc,
         })
     }
 
@@ -2618,7 +2667,7 @@ impl FreeblockTemplate {
             let Some(body) = page.get(bpos..body_end) else {
                 break; // cov:unreachable: body_end <= span_end <= page.len()
             };
-            let Ok((val, _)) = decode_value(body, 0, s) else {
+            let Ok((val, _)) = decode_value(body, 0, s, self.text_encoding) else {
                 break; // cov:unreachable: serial_body_len-legal serials decode in-bounds
             };
             surviving.push((idx, val));
@@ -2688,7 +2737,7 @@ impl FreeblockTemplate {
         // The rowid is destroyed; pass 0 so a serial-0 column reads as NULL rather
         // than a fabricated rowid.
         let body = page.get(body_start..record_end)?;
-        let values = decode_synthetic_record(&serials, body)?;
+        let values = decode_synthetic_record(&serials, body, self.text_encoding)?;
         if values.len() != self.column_count {
             return None; // cov:unreachable: one value per serial by construction
         }
@@ -2803,7 +2852,7 @@ impl FreeblockTemplate {
             return None; // cov:unreachable: local_body + chain == body_len by construction
         }
 
-        let values = decode_record(&payload, self.column_count, 0).ok()?;
+        let values = decode_record(&payload, self.column_count, 0, db.header.text_encoding).ok()?;
         if values.len() != self.column_count {
             return None; // cov:unreachable: one value per serial
         }
@@ -2835,11 +2884,11 @@ impl FreeblockTemplate {
 /// reconstructor supplies the array; the on-disk `header_len` + leading serials
 /// were destroyed). Mirrors [`decode_record`]'s body pass. Returns `None` on any
 /// out-of-bounds read so a malformed reconstruction is rejected, never panics.
-fn decode_synthetic_record(serials: &[i64], body: &[u8]) -> Option<Vec<Value>> {
+fn decode_synthetic_record(serials: &[i64], body: &[u8], enc: TextEncoding) -> Option<Vec<Value>> {
     let mut values = Vec::with_capacity(serials.len());
     let mut bpos = 0usize;
     for &serial in serials {
-        let (val, size) = decode_value(body, bpos, serial).ok()?;
+        let (val, size) = decode_value(body, bpos, serial, enc).ok()?;
         values.push(val);
         bpos = bpos.checked_add(size)?;
     }
@@ -2857,6 +2906,7 @@ fn try_carve_cell_at(
     buf: &[u8],
     off: usize,
     expected_columns: Option<usize>,
+    enc: TextEncoding,
 ) -> Option<CarvedCell> {
     // Cell prefix: payload_len varint, rowid varint.
     let (payload_len, n1) = read_varint(buf, off).ok()?;
@@ -2911,7 +2961,7 @@ fn try_carve_cell_at(
     }
 
     // Decode the record (reusing the live decoder for storage-class fidelity).
-    let values = decode_record(payload, column_count, rowid).ok()?;
+    let values = decode_record(payload, column_count, rowid, enc).ok()?;
     if values.len() != column_count {
         return None; // cov:unreachable: decode_record yields one value per serial
     }
@@ -3021,7 +3071,7 @@ fn try_carve_spilled_cell_at(
 /// surviving local columns become a [`CellFragment`]. Returns `None` unless the
 /// salvaged prefix carries ≥ 1 distinctive cell (the §3.1 emission gate). The
 /// returned fragment's `offset` is region-local; the caller translates it.
-fn salvage_local_prefix(region: &[u8], sc: &SpilledCell) -> Option<CellFragment> {
+fn salvage_local_prefix(region: &[u8], sc: &SpilledCell, enc: TextEncoding) -> Option<CellFragment> {
     // The body begins right after the local header; decode each column while its
     // body ends within the local payload bytes (`local_payload_off + local_len`).
     let local_end = sc.local_payload_off.checked_add(sc.local_len)?;
@@ -3046,7 +3096,7 @@ fn salvage_local_prefix(region: &[u8], sc: &SpilledCell) -> Option<CellFragment>
         };
         // Column 0 of a rowid-alias table reads as the rowid when serial 0; here a
         // spilled cell's id column is a stored integer, so decode it directly.
-        let Ok((val, _)) = decode_value(body, 0, serial) else {
+        let Ok((val, _)) = decode_value(body, 0, serial, enc) else {
             break; // cov:unreachable: legal serials decode in-bounds
         };
         surviving.push((idx, val));
@@ -3078,15 +3128,29 @@ fn parse_header(bytes: &[u8]) -> Result<Header, Error> {
         return Err(Error::BadPageSize(page_size));
     }
     let reserved = *head.get(RESERVED_SPACE_OFFSET).ok_or(Error::TooShort)?;
+    // Header byte 56 (BE u32): 1/0 = UTF-8, 2 = UTF-16LE, 3 = UTF-16BE
+    // (file-format §1.3.1). Tolerant: an unexpected value degrades to UTF-8
+    // rather than rejecting the database.
+    let text_encoding = match be_u32(head, TEXT_ENCODING_OFFSET) {
+        2 => TextEncoding::Utf16Le,
+        3 => TextEncoding::Utf16Be,
+        _ => TextEncoding::Utf8,
+    };
     Ok(Header {
         page_size,
         reserved,
+        text_encoding,
     })
 }
 
 /// Decode a record (payload) into values. Serial type 0 on the first column of
 /// a rowid table is the `INTEGER PRIMARY KEY` alias → the cell's rowid.
-fn decode_record(payload: &[u8], _column_count: usize, rowid: i64) -> Result<Vec<Value>, Error> {
+fn decode_record(
+    payload: &[u8],
+    _column_count: usize,
+    rowid: i64,
+    enc: TextEncoding,
+) -> Result<Vec<Value>, Error> {
     let (header_len, n) = read_varint(payload, 0)?;
     let header_len = header_len as usize;
     if header_len > payload.len() {
@@ -3104,7 +3168,7 @@ fn decode_record(payload: &[u8], _column_count: usize, rowid: i64) -> Result<Vec
     let mut values = Vec::with_capacity(serials.len());
     let mut bpos = header_len;
     for (idx, &serial) in serials.iter().enumerate() {
-        let (val, size) = decode_value(payload, bpos, serial)?;
+        let (val, size) = decode_value(payload, bpos, serial, enc)?;
         let val = if idx == 0 && serial == 0 {
             // INTEGER PRIMARY KEY alias: NULL in column 0 reads the rowid.
             Value::Integer(rowid)
@@ -3119,7 +3183,12 @@ fn decode_record(payload: &[u8], _column_count: usize, rowid: i64) -> Result<Vec
 
 /// Decode a single value of the given serial type at `off`. Returns the value
 /// and the number of body bytes it consumed.
-fn decode_value(buf: &[u8], off: usize, serial: i64) -> Result<(Value, usize), Error> {
+fn decode_value(
+    buf: &[u8],
+    off: usize,
+    serial: i64,
+    enc: TextEncoding,
+) -> Result<(Value, usize), Error> {
     Ok(match serial {
         // 0 = NULL; 10/11 are reserved for internal use and surfaced as NULL.
         0 | 10 | 11 => (Value::Null, 0),
@@ -3150,13 +3219,11 @@ fn decode_value(buf: &[u8], off: usize, serial: i64) -> Result<(Value, usize), E
             (Value::Blob(bytes.to_vec()), len)
         }
         n => {
-            // odd, >= 13: UTF-8 text. Lossy decode so a corrupt byte can't panic.
+            // odd, >= 13: text, decoded per the database's text encoding
+            // (UTF-8 / UTF-16LE / UTF-16BE). Lossy so a corrupt byte can't panic.
             let len = ((n - 13) / 2) as usize;
             let bytes = buf.get(off..off + len).ok_or(Error::TruncatedCell)?;
-            (
-                Value::Text(String::from_utf8_lossy(bytes).into_owned()),
-                len,
-            )
+            (Value::Text(enc.decode(bytes)), len)
         }
     })
 }
@@ -3274,18 +3341,18 @@ mod tests {
 
     #[test]
     fn decode_value_text_and_blob() {
-        let (v, n) = decode_value(b"hi", 0, 17).unwrap(); // 17 => text len (17-13)/2 = 2
+        let (v, n) = decode_value(b"hi", 0, 17, TextEncoding::Utf8).unwrap(); // 17 => text len (17-13)/2 =2
         assert_eq!(v, Value::Text("hi".into()));
         assert_eq!(n, 2);
-        let (v, n) = decode_value(&[0xAA, 0xBB], 0, 16).unwrap(); // 16 => blob len 2
+        let (v, n) = decode_value(&[0xAA, 0xBB], 0, 16, TextEncoding::Utf8).unwrap(); // 16 => blob len 2
         assert_eq!(v, Value::Blob(vec![0xAA, 0xBB]));
         assert_eq!(n, 2);
     }
 
     #[test]
     fn decode_value_int_literals() {
-        assert_eq!(decode_value(&[], 0, 8).unwrap(), (Value::Integer(0), 0));
-        assert_eq!(decode_value(&[], 0, 9).unwrap(), (Value::Integer(1), 0));
+        assert_eq!(decode_value(&[], 0, 8, TextEncoding::Utf8).unwrap(), (Value::Integer(0), 0));
+        assert_eq!(decode_value(&[], 0, 9, TextEncoding::Utf8).unwrap(), (Value::Integer(1), 0));
     }
 
     #[test]

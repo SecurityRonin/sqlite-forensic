@@ -63,3 +63,11 @@ fn utf16le_database_text_decodes_correctly() {
         "UTF-16LE text must decode per header byte 56, not as lossy UTF-8"
     );
 }
+
+#[test]
+fn utf16be_database_text_decodes_correctly() {
+    // The UTF-16BE branch is exercised by a real big-endian database — not left
+    // synthetic-only (the validation-axis trap this whole audit exists to avoid).
+    let Some(p) = fixture("utf16be.sqlite") else { return };
+    assert_eq!(read_only_text(&p), "héllo wörld", "UTF-16BE must decode per header byte 56");
+}

@@ -1,8 +1,8 @@
 [package]
 name = "sqlite-core"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Native, read-only, panic-free SQLite file-format reader for forensics (WS-C spike prototype)."
 
 [lib]

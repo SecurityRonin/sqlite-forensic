@@ -2,6 +2,13 @@
 resolver = "2"
 members = ["core", "forensic", "cli"]
 
+# Single source of truth for fields shared by every member (DRY): bump version /
+# edition / license here once; members inherit via `field.workspace = true`.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
 [workspace.dependencies]
 # KNOWLEDGE-layer format constants + the shared report model (Severity/Observation).
 forensicnomicon = "0.4"

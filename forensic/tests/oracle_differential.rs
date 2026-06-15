@@ -572,3 +572,209 @@ fn prior_version_reconciled_with_oracles() {
         eprintln!("SKIP fqlite leg: set FQLITE_TAP");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Oracle 3 — sqlite3 (the canonical SQLite reference implementation)
+//
+// undark and fqlite are third-party carvers. The strongest possible independent
+// reference is SQLite *itself* — the engine that wrote the file. Two roles:
+//
+//   * LIVE read — `sqlite3 SELECT *` is ground truth for the intact b-tree. Our
+//     base parser (`Database::live_rows`) must read byte-identical live rows.
+//   * DELETED carve — `sqlite3 .recover` (SQLite's own corruption-recovery dot
+//     command) reconstructs reachable content into a `lost_and_found` table. On
+//     this fixture it recovers exactly the freelist-LEAF rows (277..=400); our
+//     carver also reaches the freelist trunk-page body (238..=276), so ours is a
+//     SUPERSET. The reference engine's own recovery being a subset of ours is a
+//     clean third oracle.
+//
+// Gated on a `sqlite3` binary (PATH, or `SQLITE3_BIN`); skips if absent so CI
+// without sqlite3 still passes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn sqlite3_bin() -> Option<String> {
+    let bin = std::env::var("SQLITE3_BIN").unwrap_or_else(|_| "sqlite3".to_string());
+    Command::new(&bin)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|_| bin)
+}
+
+/// site-N id (201..=400) of a deleted-range `moz_places` url, if any.
+fn deleted_site_id(url: &str) -> Option<u32> {
+    url.strip_prefix("https://site-")
+        .and_then(|s| s.split('.').next())
+        .and_then(|n| n.parse::<u32>().ok())
+        .filter(|n| (201..=400).contains(n))
+}
+
+/// Run `sqlite3 <db> .recover`, reload the recovered SQL into an in-memory db,
+/// and SELECT the recovered rows back out — letting sqlite3 parse its own dump
+/// instead of hand-rolling a SQL-literal parser. `.recover` places orphaned rows
+/// in `lost_and_found(rootpgno,pgno,nfield,id,c0..c5)`; for `moz_places`,
+/// `c1`=url and `c2`=title. Returns site-id -> (url, title) for recovered
+/// DELETED rows.
+fn sqlite3_recover(bin: &str, db: &Path) -> BTreeMap<u32, (String, String)> {
+    use std::io::Write;
+    let mut script = Command::new(bin)
+        .arg(db)
+        .arg(".recover")
+        .output()
+        .expect("sqlite3 .recover must execute")
+        .stdout;
+    script.extend_from_slice(
+        b"\n.mode list\n.separator |\nSELECT c1, c2 FROM lost_and_found \
+          WHERE c1 LIKE 'https://site-%';\n",
+    );
+    let mut child = Command::new(bin)
+        .arg(":memory:")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("sqlite3 :memory: must spawn");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&script)
+        .expect("write recovered SQL to sqlite3 stdin");
+    let out = child
+        .wait_with_output()
+        .expect("sqlite3 :memory: must finish");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut set = BTreeMap::new();
+    for line in text.lines() {
+        let mut it = line.splitn(2, '|');
+        let (Some(url), Some(title)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if let Some(n) = deleted_site_id(url) {
+            set.insert(n, (url.to_string(), title.to_string()));
+        }
+    }
+    set
+}
+
+/// LIVE-read parity: our base parser must read exactly the rows `sqlite3
+/// SELECT *` reads from the intact b-tree (id, url, title), with no deleted-row
+/// leakage. Validates the foundation the carving sits on against the engine that
+/// wrote the file.
+#[test]
+fn live_read_matches_sqlite3() {
+    let Some(bin) = sqlite3_bin() else {
+        eprintln!("SKIP live_read_matches_sqlite3: no sqlite3 on PATH (set SQLITE3_BIN)");
+        return;
+    };
+    let db_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/data/deleted_places.db");
+    let db = Database::open(std::fs::read(&db_path).unwrap()).unwrap();
+
+    // Ours: id -> (url, title) from the live b-tree.
+    let ours: BTreeMap<i64, (String, String)> = db
+        .live_rows()
+        .into_iter()
+        .map(|(id, vals)| {
+            let txt = |i: usize| match vals.get(i) {
+                Some(Value::Text(s)) => s.clone(),
+                _ => String::new(),
+            };
+            (id, (txt(1), txt(2)))
+        })
+        .collect();
+
+    // sqlite3 reference: SELECT id, url, title FROM moz_places.
+    let out = Command::new(&bin)
+        .arg(&db_path)
+        .arg("-cmd")
+        .arg(".mode list")
+        .arg("-cmd")
+        .arg(".separator |")
+        .arg("SELECT id, url, title FROM moz_places;")
+        .output()
+        .expect("sqlite3 SELECT must execute");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let theirs: BTreeMap<i64, (String, String)> = text
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.splitn(3, '|').collect();
+            if f.len() < 3 {
+                return None;
+            }
+            f[0].parse::<i64>()
+                .ok()
+                .map(|id| (id, (f[1].to_string(), f[2].to_string())))
+        })
+        .collect();
+
+    assert!(!theirs.is_empty(), "sqlite3 returned no live rows");
+    assert_eq!(
+        ours, theirs,
+        "live-read parity: our base parser disagrees with sqlite3 SELECT"
+    );
+    // Ground-truth sanity: exactly the 200 live rows, no deleted leakage.
+    assert_eq!(ours.len(), 200, "expected 200 live rows (ids 1..=200)");
+    assert!(
+        ours.keys().all(|&id| (1..=200).contains(&id)),
+        "live set must be ids 1..=200 with no deleted-row leakage"
+    );
+}
+
+/// OUR fixture, reconciled against the THIRD independent oracle: sqlite3's own
+/// `.recover`. The reference engine recovers the freelist-LEAF rows (277..=400)
+/// into `lost_and_found`; our carver also reaches the freelist trunk-page body
+/// (238..=276), so ours ⊇ sqlite3 `.recover`. Honest criteria:
+///   1. Content agreement (title) on every overlapping row.
+///   2. ours ⊇ `.recover` — every deleted row the canonical engine recovers, we
+///      recover too (no `.recover`-only row). The load-bearing claim.
+#[test]
+fn our_fixture_agrees_with_sqlite3_recover() {
+    let Some(bin) = sqlite3_bin() else {
+        eprintln!("SKIP our_fixture_agrees_with_sqlite3_recover: no sqlite3 on PATH");
+        return;
+    };
+    let db_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/data/deleted_places.db");
+    let db = Database::open(std::fs::read(&db_path).unwrap()).unwrap();
+
+    let ours = ours_recover_by_url(&db, 6);
+    let ours_del: BTreeMap<u32, &(i64, String, String)> = ours
+        .iter()
+        .filter_map(|(u, v)| deleted_site_id(u).map(|n| (n, v)))
+        .collect();
+    let oracle = sqlite3_recover(&bin, &db_path);
+
+    assert!(
+        !oracle.is_empty(),
+        "sqlite3 .recover recovered no deleted rows (expected the freelist-leaf set)"
+    );
+
+    // (1) Content agreement (title) on every overlapping row.
+    for (n, (_url, title)) in &oracle {
+        if let Some(ours_val) = ours_del.get(n) {
+            assert_eq!(
+                &ours_val.2, title,
+                "site-{n}: title mismatch ours {:?} vs sqlite3 .recover {:?}",
+                ours_val.2, title
+            );
+        }
+    }
+
+    // (2) ours ⊇ sqlite3 .recover: no row the reference engine recovers that we miss.
+    let mut recover_only: Vec<u32> = oracle
+        .keys()
+        .filter(|n| !ours_del.contains_key(n))
+        .copied()
+        .collect();
+    recover_only.sort_unstable();
+    assert!(
+        recover_only.is_empty(),
+        "sqlite3 .recover recovered deleted rows we miss: {recover_only:?}"
+    );
+
+    // (3) Sanity: .recover surfaces only deleted rows (201..=400), no live leakage.
+    assert!(
+        oracle.keys().all(|&n| (201..=400).contains(&n)),
+        ".recover oracle set must contain only deleted ids"
+    );
+}

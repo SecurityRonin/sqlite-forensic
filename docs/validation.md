@@ -30,20 +30,32 @@ fixture we generated. The machine-checkable form of this evidence is
 ## Summary
 
 - **Conclusion:** on the freelist-page deletion scenario our carver is designed for,
-  its output is **consistent with** TWO independent reference carvers — `undark` (C)
-  and `fqlite` (Java) — with **100% content agreement on every overlapping row** and no
-  false positives. Where all three tools overlap on our fixture, they agree exactly.
+  its output is **consistent with** three independent references — `undark` (C),
+  `fqlite` (Java), and SQLite's own `.recover` — with **100% content agreement on every
+  overlapping row** and no false positives. Where the tools overlap on our fixture, they
+  agree exactly.
 - **Two independent oracles, two corpora.** `undark` and a headless source-instrumented
   tap of `fqlite`'s recovery engine are both used as oracles; our `deleted_places.db`
   fixture and the third-party DC3 `sqlite_dissect` corpus are both used as input.
+- **The reference implementation itself, as a third oracle.** SQLite's own
+  `sqlite3 .recover` is added as a third deleted-record oracle: on the fixture it
+  recovers the freelist-**leaf** subset (124 rows, ids 277..=400) into its
+  `lost_and_found` table — **every one of which our carver also recovers** (ours ⊇
+  `.recover`). Separately, `sqlite3 SELECT *` validates the **live-read foundation**:
+  our base parser reads **byte-identical** rows to the engine that wrote the file
+  (all 200 live rows, no deleted-row leakage). Both are machine-checked in
+  `oracle_differential.rs` (`our_fixture_agrees_with_sqlite3_recover`,
+  `live_read_matches_sqlite3`), gated on a `sqlite3` binary so CI without it still
+  passes. Three different authors, three algorithms (C / Java / SQLite's own C),
+  plus the canonical engine as the live-read yardstick.
 - **Divergences are diagnosed at the page level, not papered over.** Each tool draws the
   freelist-vs-allocated and trunk-vs-leaf boundaries slightly differently; every
   ours-vs-oracle difference is explained by *which page* a row lives on and *which pages
   each tool scans*. None is a defect in our freelist-carving path.
 - We make no claim that our carver is "proven correct". The evidence supports only that
-  its freelist-page recovery is **consistent with** two independent tools' recovery.
+  its freelist-page recovery is **consistent with** three independent tools' recovery.
 
-## The two oracles
+## The oracles
 
 ### Oracle 1 — `undark` (C)
 
@@ -90,6 +102,40 @@ API map, the JavaFX-coupling findings, and the minimal changes a clean
 misaligned/garbled column boundaries on these fixtures — recovering corrupt `title`
 values and surfacing live rows — so it was rejected as a yardstick. Its *test databases*,
 authored by DC3, are still used as independent *input*; see below.)
+
+### Oracle 3 — `sqlite3` (the canonical reference implementation)
+
+`undark` and `fqlite` are third-party carvers. The strongest possible independent
+reference is **SQLite itself** — the engine that wrote the file. It serves two distinct
+roles, both gated on a `sqlite3` binary (`SQLITE3_BIN` overrides; tests skip if absent):
+
+| | |
+|---|---|
+| Tool | `sqlite3` (the `.recover` dot-command + `SELECT`) |
+| Version | 3.45.3 (validated); any modern `sqlite3` with `.recover` |
+| Upstream | <https://sqlite.org/cli.html#recover> |
+| Roles | (a) deleted-record carving oracle via `.recover`; (b) live-read yardstick via `SELECT` |
+| Test gate | `SQLITE3_BIN` (defaults to `sqlite3` on `PATH`) |
+| Machine-checkable | `our_fixture_agrees_with_sqlite3_recover`, `live_read_matches_sqlite3` |
+
+**Role (a) — `.recover` as a third carving oracle.** `sqlite3 .recover` is SQLite's own
+corruption-recovery command; it reconstructs reachable content into a `lost_and_found`
+table. On the fixture it recovers **exactly the freelist-leaf rows (124 rows, ids
+277..=400)** — the subset every carver agrees on — and **nothing our carver misses**. Our
+carver additionally reaches the freelist **trunk-page body** (238..=276), so
+**ours ⊇ `.recover`**: the reference engine's own recovery is contained in ours, with full
+content agreement on the overlap. The harness reloads `.recover`'s dump into an in-memory
+db and `SELECT`s the rows back out, so SQLite parses its own output (no hand-rolled
+SQL-literal parser).
+
+**Role (b) — `SELECT` as the live-read yardstick.** Before any carving, the base parser
+must read the *intact* b-tree correctly. `live_read_matches_sqlite3` asserts our
+`Database::live_rows()` is **byte-identical** to `sqlite3 SELECT id, url, title FROM
+moz_places` — all **200 live rows (ids 1..=200)**, no deleted-row leakage. This validates
+the foundation the carving sits on against the engine that authored the file. (Note: the
+carving oracles above already use `sqlite3` incidentally to compute the live set that
+distinguishes recovered-deleted rowids from live ones; this test makes that dependency an
+explicit, asserted parity check.)
 
 ### `undark` build recipe (macOS / clang)
 
@@ -154,26 +200,33 @@ always recover the rowid). Agreement is defined on this projection.
 freelist. Ground truth: 200 live (1..=200), 200 deleted (201..=400). Freelist =
 trunk page 9 + leaf pages 10,11,12,13.
 
-Three-way recovery over the deleted range (ids 201..=400):
+Recovery over the deleted range (ids 201..=400):
 
 | tool | recovers | which rows |
 |---|---|---|
 | our carver | **162** | 238..=400 (except 250) |
 | undark | **163** | 237..=400 (except 250) |
-| fqlite | **126** | 235, 237, and 277..=400 (except none) |
+| fqlite | **126** | 235, 237, and 277..=400 |
+| `sqlite3 .recover` | **124** | 277..=400 (freelist-leaf only) |
+
+`sqlite3 .recover` recovers the freelist-**leaf** rows (277..=400) into `lost_and_found`
+and nothing else — it reaches neither the freelist trunk-page body (238..=276, which our
+carver and undark recover) nor the allocated-page in-page free blocks (235, 237, which
+undark and fqlite recover). Its set is therefore a strict subset of ours, with full
+content agreement: **every row the reference engine recovers, we recover too.**
 
 Agreement:
 
 | comparison | result |
 |---|---|
-| content agreement (url + title) on every overlapping row | **100%, 0 mismatches** (all three tools) |
+| content agreement (url + title) on every overlapping row | **100%, 0 mismatches** (all four tools) |
 | our false positives (rows we carve no oracle corroborates) | **0** |
 | ours vs undark | ours ⊇ undark minus 1 row (237); **162/163 = 99.4%** |
 | ours vs fqlite | ours adds 238..=276; fqlite adds 235, 237 — all explained below |
 
 **Why the three tools draw the freelist boundary differently — page-level diagnosis:**
 
-- **Rows 277..=400 live on freelist *leaf* pages 10–13.** All three tools carve these. ✓
+- **Rows 277..=400 live on freelist *leaf* pages 10–13.** All four tools carve these. ✓
 - **Rows 238..=276 live on page 9, the freelist *trunk* page.** Our carver and undark
   scan the trunk page body (below its small 8-byte trunk header + leaf-pointer array) and
   recover them. **fqlite reads page 9 only as a trunk** (next-pointer + leaf-pointer
@@ -233,9 +286,12 @@ agreement is required and holds (vacuously, since our set is empty); our carver 
 ## What this validates, and what it does not
 
 - **Validates:** the freelist-page carving path — the scenario our carver targets — is
-  consistent with **two** independent tools' recovery (100% content agreement, no false
-  positives; 99.4% recall vs undark, and full agreement vs fqlite outside the trunk-page
-  rows fqlite structurally skips).
+  consistent with **three** independent tools' recovery (100% content agreement, no false
+  positives; 99.4% recall vs undark, full agreement vs fqlite outside the trunk-page rows
+  fqlite structurally skips, and a clean superset of SQLite's own `.recover`). Separately,
+  the **live-read foundation** is byte-identical to `sqlite3 SELECT *` (the canonical
+  engine) on all 200 intact rows — so the b-tree parse the carving builds on is validated
+  against the implementation that authored the file.
 - **Does not validate / out of scope:** in-page free-block recovery and dropped-table
   recovery. Both undark and fqlite recover these; our carver does not — surfaced here as
   the documented divergence and the candidate next feature, not claimed as working.

@@ -24,6 +24,37 @@ $ sqlite4n6 carve ChatStorage.sqlite --no-fragments          # full rows only (f
 $ sqlite4n6 audit ChatStorage.sqlite                         # graded anomaly findings
 ```
 
+## Install
+
+Pick the channel for your platform — each lands the `sqlite4n6` binary on your `PATH`.
+
+**macOS / Linux (Homebrew):**
+
+```console
+$ brew install securityronin/tap/sqlite4n6
+```
+
+**Debian / Ubuntu (apt):**
+
+```console
+$ curl -1sLf 'https://dl.cloudsmith.io/public/securityronin/sqlite-forensic/setup.deb.sh' | sudo -E bash
+$ sudo apt install sqlite4n6
+```
+
+**Windows (winget):**
+
+```console
+> winget install SecurityRonin.sqlite4n6
+```
+
+**Prebuilt binaries** — grab a `.tar.gz` (macOS/Linux), `.msi` (Windows), or `.deb` (Debian/Ubuntu) for your architecture from the [latest release](https://github.com/SecurityRonin/sqlite-forensic/releases/latest); every asset is listed in `checksums.txt` for verification.
+
+**From source (Rust toolchain):**
+
+```console
+$ cargo install --git https://github.com/SecurityRonin/sqlite-forensic sqlite4n6
+```
+
 When a `-wal` sidecar is present, `carve` auto-detects it and carves the **full per-commit WAL timeline** — every materializable state, each labelled with its log-sequence coordinate: the on-disk base image, **each commit snapshot** of the WAL, and the uncheckpointed WAL-frame residue. A row deleted late in a transaction history is still a live cell in an *earlier* commit's page image, so the snapshot column tells you the exact committed state a deleted row was last alive in. This is the real N-snapshot temporal model — not a two-point on-disk-vs-latest approximation.
 
 ```console

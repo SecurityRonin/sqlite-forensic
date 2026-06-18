@@ -56,7 +56,7 @@
                     <Component Id='License' Guid='*'>
                         <File Id='LicenseFile'
                             DiskId='1'
-                            Source='wix\License.rtf'
+                            Source='cli\wix\License.rtf'
                             KeyPath='yes'/>
                     </Component>
 
@@ -114,7 +114,7 @@
             <UIRef Id='WixUI_FeatureTree'/>
         </UI>
 
-        <WixVariable Id='WixUILicenseRtf' Value='wix\License.rtf'/>
+        <WixVariable Id='WixUILicenseRtf' Value='cli\wix\License.rtf'/>
 
     </Product>
 

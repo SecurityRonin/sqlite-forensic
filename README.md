@@ -138,9 +138,9 @@ Carved records remain **confidence-graded observations** ("consistent with a del
 
 ---
 
-## RapidTriage ecosystem
+## Issen ecosystem
 
-sqlite-forensic is the SQLite file-format parser in the [RapidTriage](https://github.com/SecurityRonin/rapidtriage) DFIR toolkit:
+sqlite-forensic is the SQLite file-format parser in the [Issen](https://github.com/SecurityRonin/issen) DFIR toolkit:
 
 | Crate | Artifact family |
 |---|---|

@@ -64,11 +64,12 @@ jobs:
 
       - name: Build MSI (Windows)
         if: runner.os == 'Windows'
-        # Pass the cli package manifest positionally: cargo-wix resolves the wxs
-        # and its relative `wix\License.rtf` source RELATIVE TO THE MANIFEST, so
-        # the cli/wix/ assets are found. `--package` does not anchor those paths
-        # in a workspace and fails with WiX `light` error 103 (file not found).
-        run: cargo wix --no-build --target ${{ matrix.target }} --output ${{ github.workspace }}/sqlite4n6-${{ steps.version.outputs.version }}-${{ matrix.target }}.msi cli/Cargo.toml
+        # `--package` is mandatory in a workspace (cargo-wix rejects a positional
+        # manifest with "Workspace detected"). cargo-wix resolves the wxs's
+        # relative `Source=` paths against the process CWD (the repo root), NOT
+        # the member dir — so cli/wix/main.wxs references the License.rtf as
+        # `cli\wix\License.rtf`. Output to an absolute path so the upload finds it.
+        run: cargo wix --no-build --package sqlite4n6 --target ${{ matrix.target }} --output ${{ github.workspace }}/sqlite4n6-${{ steps.version.outputs.version }}-${{ matrix.target }}.msi
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

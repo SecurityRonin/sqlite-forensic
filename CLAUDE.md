@@ -20,9 +20,10 @@ Homebrew/winget steps are `continue-on-error`.
 
 Workspace-specific gotchas baked into the workflow (see `~/.claude/skills/release.md`):
 
-- **cargo-wix:** pass the package manifest positionally (`cargo wix … cli/Cargo.toml`),
-  not `--package sqlite4n6` — only the manifest form anchors the relative
-  `wix\License.rtf` source to `cli/`; `--package` fails with WiX `light` error 103.
+- **cargo-wix:** `--package sqlite4n6` is mandatory (a positional manifest is
+  rejected: "Workspace detected"). cargo-wix resolves the wxs's relative source
+  paths against the repo-root CWD, so `cli/wix/main.wxs` references the license as
+  `cli\wix\License.rtf` (not `wix\License.rtf`) — otherwise WiX `light` errors 103.
 - **cargo-deb:** the `sqlite4n6` package needs an `authors` field (cargo-deb derives
   the `.deb` copyright from it) or the `deb` job fails.
 

@@ -3,6 +3,8 @@ name = "sqlite4n6"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# `authors` is required by cargo-deb (it derives the .deb copyright from it).
+authors = ["Albert Hui <albert@securityronin.com>"]
 description = "sqlite4n6 — read-only SQLite forensic CLI: carve deleted records and grade anomalies into severity-ranked findings, single static binary."
 
 [lib]

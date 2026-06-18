@@ -69,7 +69,15 @@ $ sqlite4n6 carve chat.db --no-wal                     # on-disk image only, no 
 
 The `snapshot` column carries the salt-qualified LSN — `commit:(salt1,salt2,commit_frame_index)` for a committed snapshot, `wal-frame:(salt1,salt2,frame_index)` for raw frame residue, `on-disk` for the base image. A record identical across views is collapsed to its earliest committed coordinate. `--no-wal` carves the on-disk image alone (single view, no snapshot column). The evidence file and its sidecars are **never** written.
 
-Two recovery surfaces sit on top of this. A deleted row whose payload outgrew the page (`> usable − 35` bytes) spilled onto an **overflow-page chain**; `carve` reassembles such a row to a full record **when every chain page survives as a freelist leaf** (content-preserving) — a deliberately bounded capability, graded below the in-page tier, because a chain page reallocated as the freelist *trunk* destroys the record. And `carve` surfaces a **Tier-2 fragment section by default** (`--no-fragments` to suppress): when a row's full identity is destroyed but a distinctive cell survives contiguously (a `TEXT ≥ 4` bytes or a `REAL`), that fragment is salvaged and kept **strictly separate** from the high-precision full-row tier — partial evidence a single surviving cell can still anchor, never mixed into the full-row set.
+## Two recovery sets: full rows and fragments
+
+`carve` returns **two structurally separate result sets** — never merged, so a partial salvage can never be mistaken for a recovered row. The separation *is* the precision discipline.
+
+**Set 1 — full rows (high precision).** Complete records, every cell intact, carrying page / offset / rowid provenance and a confidence score. These are carved from freelist pages, in-page free blocks, and dropped-table pages; extended by **freeblock reconstruction**, which rebuilds a record from its surviving serial-type tail plus a same-page schema template when SQLite overwrote only the cell's first four bytes (surfacing the destroyed rowid as unknown). A bounded sub-tier reaches rows whose payload outgrew the page (`> usable − 35` bytes) and spilled onto an **overflow-page chain** — reassembled to a full record **only when every chain page survives as a freelist leaf** (content-preserving), and graded below the in-page tier because a chain page reallocated as the freelist *trunk* destroys the record.
+
+**Set 2 — fragments (Tier-2, shown by default).** When a row's full identity is destroyed but a single distinctive cell survives contiguously (a `TEXT` of `≥ 4` bytes, or a `REAL`), that lone value is salvaged as a **fragment**. A fragment has no rowid and is *not a row* — it is the partial evidence one surviving cell can still anchor ("this value was here"), never the stronger claim a full row makes ("this row was here").
+
+The two sets stay apart by construction: fragments render in their own section, suppressed with `--no-fragments`, and excluded from `--rowid-only` (a fragment carries no rowid). Set 1 is the precision-first surface; Set 2 is the recall safety net that refuses to overclaim.
 
 Or drive the library directly — point the analyzer at the file bytes and get graded findings plus carved deleted records:
 

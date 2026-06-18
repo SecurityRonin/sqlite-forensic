@@ -21,3 +21,20 @@ clap = { workspace = true }
 
 [lints]
 workspace = true
+
+# Debian package (.deb) built by `cargo deb --package sqlite4n6` in the release
+# workflow. The crate and the binary are both `sqlite4n6`; cargo-deb rewrites the
+# `target/release/` asset path for cross-target builds.
+[package.metadata.deb]
+maintainer = "SecurityRonin <security-ronin@users.noreply.github.com>"
+section = "utils"
+priority = "optional"
+extended-description = """\
+sqlite4n6 is a read-only SQLite forensic CLI. It carves deleted records out of \
+a database's free (unallocated) space — freelist pages, in-page free blocks, \
+dropped-table pages, and an uncheckpointed WAL overlay — and grades \
+forensically-notable anomalies into severity-ranked findings. It opens the \
+evidence file read-only and never writes the file or its sidecars."""
+assets = [
+    ["target/release/sqlite4n6", "usr/bin/", "755"],
+]

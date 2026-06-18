@@ -17,11 +17,11 @@ Every browser history, every chat app, every mobile artifact is a SQLite file �
 This is a Rust library workspace with a CLI (`sqlite4n6`). The fastest path — point it at a database and read the deleted rows straight out of free space. It opens the evidence **read-only** and never writes the file or its sidecars:
 
 ```console
-$ sqlite4n6 carve History.db                       # deleted rows, table view
-$ sqlite4n6 carve History.db --format jsonl         # one JSON object per record
-$ sqlite4n6 carve History.db --min-confidence medium # drop low-confidence carves
-$ sqlite4n6 carve History.db --no-fragments         # full rows only (fragments shown by default)
-$ sqlite4n6 audit  History.db                        # graded anomaly findings
+$ sqlite4n6 carve ChatStorage.sqlite                         # deleted rows, table view
+$ sqlite4n6 carve ChatStorage.sqlite --format jsonl          # one JSON object per record
+$ sqlite4n6 carve ChatStorage.sqlite --min-confidence medium # drop low-confidence carves
+$ sqlite4n6 carve ChatStorage.sqlite --no-fragments          # full rows only (fragments shown by default)
+$ sqlite4n6 audit ChatStorage.sqlite                         # graded anomaly findings
 ```
 
 When a `-wal` sidecar is present, `carve` auto-detects it and carves the **full per-commit WAL timeline** — every materializable state, each labelled with its log-sequence coordinate: the on-disk base image, **each commit snapshot** of the WAL, and the uncheckpointed WAL-frame residue. A row deleted late in a transaction history is still a live cell in an *earlier* commit's page image, so the snapshot column tells you the exact committed state a deleted row was last alive in. This is the real N-snapshot temporal model — not a two-point on-disk-vs-latest approximation.

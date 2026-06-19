@@ -15,15 +15,19 @@
 
 Every browser history, every chat app, every mobile artifact is a SQLite file — and the forensically interesting rows are usually the *deleted* ones. The standard `sqlite3`/rusqlite path cannot see them: it reads the live b-tree and stops. `sqlite-forensic` reads the raw file format itself — freelist pages, in-page free blocks, dropped-table pages, and an uncheckpointed WAL overlay — and recovers what the live query cannot, as severity-graded, confidence-scored observations.
 
-This is a Rust library workspace with a CLI (`sqlite4n6`). The fastest path — point it at a database and read the deleted rows straight out of free space. It opens the evidence **read-only** and never writes the file or its sidecars:
+This is a Rust library workspace with a CLI (`sqlite4n6`). The fastest path — point it at a database and recover the deleted rows straight out of free space. The evidence is opened **read-only**; the recovered rows are written to a **new** database alongside it (the evidence file and its sidecars are never touched):
 
 ```console
-$ sqlite4n6 carve ChatStorage.sqlite                         # deleted rows, table view
-$ sqlite4n6 carve ChatStorage.sqlite --format jsonl          # one JSON object per record
+$ sqlite4n6 carve ChatStorage.sqlite                         # rebuild recovered rows → ChatStorage.recovered.db
+$ sqlite4n6 carve ChatStorage.sqlite --out /tmp/recovered.db # choose the rebuilt-db path
+$ sqlite4n6 carve ChatStorage.sqlite --format table          # recovered rows to stdout (or: csv, jsonl)
+$ sqlite4n6 carve ChatStorage.sqlite --format jsonl          # one JSON object per record (BLOBs as base64)
 $ sqlite4n6 carve ChatStorage.sqlite --min-confidence medium # drop low-confidence carves
 $ sqlite4n6 carve ChatStorage.sqlite --no-fragments          # full rows only (fragments shown by default)
 $ sqlite4n6 audit ChatStorage.sqlite                         # graded anomaly findings
 ```
+
+By default `carve` **rebuilds a queryable SQLite database** of the recovered records — `<name>.recovered.db`, a `recovered_records` table with provenance columns (`_page`, `_offset`, `_rowid`, `_source`, `_confidence`) plus the carved cells in their **native types**, so a recovered `BLOB` is stored losslessly and you can `sqlite3 ChatStorage.recovered.db "SELECT …"` straight away. Pass `--format table|csv|jsonl` to stream rows to stdout instead (JSONL carries BLOBs as base64; table/CSV show a `<blob:N bytes>` placeholder, since raw binary is unsafe in those).
 
 ## Install
 
@@ -59,7 +63,7 @@ $ cargo install --git https://github.com/SecurityRonin/sqlite-forensic sqlite4n6
 When a `-wal` sidecar is present, `carve` auto-detects it and carves the **full per-commit WAL timeline** — every materializable state, each labelled with its log-sequence coordinate: the on-disk base image, **each commit snapshot** of the WAL, and the uncheckpointed WAL-frame residue. A row deleted late in a transaction history is still a live cell in an *earlier* commit's page image, so the snapshot column tells you the exact committed state a deleted row was last alive in. This is the real N-snapshot temporal model — not a two-point on-disk-vs-latest approximation.
 
 ```console
-$ sqlite4n6 carve chat.db                            # auto-detects chat.db-wal
+$ sqlite4n6 carve chat.db --format table             # auto-detects chat.db-wal
   page    offset     rowid  recovery_source   conf  snapshot                            values
      2      1581       130  commit-snapshot   0.90  commit:(3131615003,3836839008,0)    130 | bob | secret body 130
      2      1261         ?  commit-snapshot   0.40  commit:(3131615003,3836839008,1)    NULL | NULL | ...

@@ -14,9 +14,9 @@
 //! [`build_recovered_db_with_fragments`] additionally emits a **second** table,
 //! `recovered_fragments`, in the same file — the Tier-2 partial rows kept
 //! structurally separate from the full rows (a fragment is never mixed into
-//! `recovered_records`). Both tables are built from one generic [`TableSpec`], so
-//! the page allocation, bulk-load and overflow handling are shared; passing no
-//! fragment set reproduces the single-table bytes exactly.
+//! `recovered_records`). Both tables are built from one generic internal table
+//! spec, so the page allocation, bulk-load and overflow handling are shared;
+//! passing no fragment set reproduces the single-table bytes exactly.
 //!
 //! The output re-opens with [`crate::Database::open`] (the independent reader)
 //! and is read identically by the real `sqlite3` engine — the writer's two

@@ -383,4 +383,13 @@ mod tests {
     fn empty_column_list_is_none() {
         assert_eq!(column_names("CREATE TABLE t ()"), None);
     }
+
+    #[test]
+    fn single_quoted_identifiers_are_unquoted() {
+        // SQLite tolerates single-quoted column names in CREATE TABLE (seen in
+        // the real nemetz 0D-01 fixture). The real names are id/name, not 'id'.
+        let sql = "CREATE TABLE users (\n\t'id' INT NOT NULL,\n\t'name' TEXT NULL)";
+        let cols = column_names(sql).unwrap();
+        assert_eq!(cols, vec!["id", "name"]);
+    }
 }

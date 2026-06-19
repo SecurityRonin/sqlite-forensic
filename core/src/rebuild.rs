@@ -96,8 +96,16 @@ pub struct RecoveredTable {
 /// (the recovered rows have no meaningful rowid of their own — provenance lives
 /// in the `_rowid` column when present).
 #[must_use]
-pub fn build_recovered_db_tables(_tables: &[RecoveredTable]) -> Vec<u8> {
-    unimplemented!("RED")
+pub fn build_recovered_db_tables(tables: &[RecoveredTable]) -> Vec<u8> {
+    let specs: Vec<TableSpec> = tables
+        .iter()
+        .map(|t| TableSpec {
+            name: t.name.clone(),
+            create_sql: create_table_sql(&t.name, &t.columns),
+            rows: t.rows.clone(),
+        })
+        .collect();
+    build_from_specs(specs)
 }
 
 /// Logical page size of the rebuilt database. 4096 is `SQLite`'s modern default
@@ -123,7 +131,7 @@ const LEAD_COLS: usize = 5;
 /// `recovered_records` and `recovered_fragments` are built from this single spec,
 /// so the b-tree bulk-load and overflow handling are shared.
 struct TableSpec {
-    name: &'static str,
+    name: String,
     create_sql: String,
     rows: Vec<Vec<Value>>,
 }
@@ -162,13 +170,23 @@ pub fn build_recovered_db_with_fragments(
     // Page 1 is the schema (sqlite_master) leaf; each table's b-tree starts after
     // it. Build the table b-trees first (so we know each root page) while emitting
     // overflow pages after the b-trees.
+    build_from_specs(specs)
+}
+
+/// Shared back end: bulk-load each [`TableSpec`]'s b-tree, then write page 1's
+/// `sqlite_master` leaf with one schema row per table. Used by both the
+/// records/fragments path and the general [`build_recovered_db_tables`] path.
+fn build_from_specs(specs: Vec<TableSpec>) -> Vec<u8> {
+    // Page 1 is the schema (sqlite_master) leaf; each table's b-tree starts after
+    // it. Build the table b-trees first (so we know each root page) while emitting
+    // overflow pages after the b-trees.
     let mut builder = Builder::new();
     let _schema_page = builder.alloc_page(); // page 1
-    let placed: Vec<(&'static str, u32, &str)> = specs
+    let placed: Vec<(&str, u32, &str)> = specs
         .iter()
         .map(|spec| {
             let root = builder.build_table(&spec.rows);
-            (spec.name, root, spec.create_sql.as_str())
+            (spec.name.as_str(), root, spec.create_sql.as_str())
         })
         .collect();
 
@@ -179,12 +197,46 @@ pub fn build_recovered_db_with_fragments(
     builder.finish()
 }
 
+/// Quote a string as a SQL identifier: wrap in double quotes and double any
+/// embedded double quote (file-format / SQL standard delimited identifiers). So
+/// a column named `order` becomes `"order"` and `a"b` becomes `"a""b"`.
+fn quote_ident(ident: &str) -> String {
+    let mut out = String::with_capacity(ident.len() + 2);
+    out.push('"');
+    for ch in ident.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// A `CREATE TABLE "name" ("c0", "c1", …)` statement with every identifier
+/// quoted, so arbitrary table/column names (keywords, spaces, quotes) are legal.
+/// No declared types — recovered cells keep their native storage class
+/// regardless, and an untyped column has BLOB affinity (accepts anything).
+fn create_table_sql(name: &str, columns: &[String]) -> String {
+    let mut sql = String::from("CREATE TABLE ");
+    sql.push_str(&quote_ident(name));
+    sql.push_str(" (");
+    for (i, col) in columns.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&quote_ident(col));
+    }
+    sql.push(')');
+    sql
+}
+
 /// Project the full carved records into the `recovered_records` [`TableSpec`].
 fn records_spec(rows: &[RebuildRow]) -> TableSpec {
     let max_cells = rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
     let values = rows.iter().map(|r| record_values(r, max_cells)).collect();
     TableSpec {
-        name: "recovered_records",
+        name: "recovered_records".to_string(),
         create_sql: create_records_sql(max_cells),
         rows: values,
     }
@@ -205,7 +257,7 @@ fn fragments_spec(frags: &[FragmentRow]) -> TableSpec {
         .map(|f| fragment_values(f, cell_cols))
         .collect();
     TableSpec {
-        name: "recovered_fragments",
+        name: "recovered_fragments".to_string(),
         create_sql: create_fragments_sql(cell_cols),
         rows: values,
     }
@@ -621,7 +673,7 @@ fn rowid_as_usize(rowid: i64) -> usize {
 /// byte-identical to the historical single-cell layout (one cell, rowid 1, content
 /// packed from the page end). Schema records are small (well under a page) and
 /// never spill.
-fn build_schema_leaf(tables: &[(&'static str, u32, &str)], page_count: u32) -> Vec<u8> {
+fn build_schema_leaf(tables: &[(&str, u32, &str)], page_count: u32) -> Vec<u8> {
     let mut page = vec![0u8; PAGE_SIZE];
     write_file_header(&mut page, page_count);
 

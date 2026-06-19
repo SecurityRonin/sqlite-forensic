@@ -1305,7 +1305,7 @@ impl Database {
     /// from its rootpage (interior + leaf pages). A page carved as Tier-1
     /// in-page residue resolves to its owning table through this map.
     ///
-    /// Best-effort and bounded, mirroring [`Database::collect_rowids`]: a
+    /// Best-effort and bounded, mirroring `live_rowids`'s b-tree walk: a
     /// malformed b-tree contributes fewer entries rather than erroring.
     #[must_use]
     pub fn page_to_table_map(&self) -> std::collections::BTreeMap<u32, String> {
@@ -1323,7 +1323,7 @@ impl Database {
 
     /// Walk the table b-tree rooted at `page`, inserting every page it visits
     /// (interior + leaf) into `pages`. Best-effort and bounded, mirroring
-    /// [`Database::collect_rowids`].
+    /// `collect_rowids`.
     fn collect_pages(
         &self,
         page: u32,

@@ -1146,8 +1146,8 @@ pub fn attribute_records(db: &Database, records: &[CarvedRecord]) -> Vec<Attribu
 #[cfg(test)]
 mod attribution_tests {
     use super::{
-        attribute_record, matching_tables, shape_matches, value_fits_affinity, Attribution,
-        CarvedRecord, RecoverySource,
+        attribute_record, attribute_records, matching_tables, shape_matches, value_fits_affinity,
+        Attribution, CarvedRecord, RecoverySource,
     };
     use sqlite_core::attribution::{Affinity, LiveTable};
     use sqlite_core::Value;
@@ -1360,6 +1360,35 @@ mod attribution_tests {
             attribute_record(&r, &tables, &map),
             Attribution::Unattributed
         );
+    }
+
+    #[test]
+    fn attribute_records_reads_schema_from_a_real_database() {
+        // Mint a tiny valid db via the writer (no sqlite3 needed), open it, and
+        // drive the db-backed attribute_records wrapper end to end.
+        use sqlite_core::rebuild::{build_recovered_db_tables, RecoveredTable};
+        use sqlite_core::Database;
+        let seed = vec![RecoveredTable {
+            name: "people".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::Integer(1), Value::Text("a".into())]],
+        }];
+        let db = Database::open(build_recovered_db_tables(&seed)).expect("minted db opens");
+        let records = vec![super::CarvedRecord {
+            page: 99,
+            offset: 0,
+            rowid: 0,
+            values: vec![Value::Integer(2), Value::Text("b".into())],
+            confidence: 0.9,
+            allocated: false,
+            source: RecoverySource::FreelistPage,
+            wal: None,
+            overflow: None,
+        }];
+        let attrs = attribute_records(&db, &records);
+        assert_eq!(attrs.len(), 1);
+        // (INTEGER, TEXT) freelist row matches the people table's shape.
+        assert!(matches!(attrs[0], Attribution::Inferred { .. }));
     }
 }
 

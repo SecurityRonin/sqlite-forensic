@@ -159,12 +159,10 @@ fn outermost_paren_body(sql: &str) -> Option<&str> {
                     depth += 1;
                 }
             }
-            b')' => {
-                if start.is_some() {
-                    depth -= 1;
-                    if depth == 0 {
-                        return sql.get(start?..i);
-                    }
+            b')' if start.is_some() => {
+                depth -= 1;
+                if depth == 0 {
+                    return sql.get(start?..i);
                 }
             }
             _ => {}

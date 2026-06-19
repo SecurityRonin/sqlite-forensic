@@ -199,16 +199,18 @@ fn default_carve_writes_rebuilt_db() {
         stdout.contains("record(s)") && stdout.contains("deleted_places.recovered.db"),
         "summary line must report the count and the output path, got: {stdout:?}"
     );
-    // The produced file re-opens as a valid SQLite database holding our rows.
+    // The produced file re-opens as a valid SQLite database holding our rows,
+    // split into attribution-tiered recovered_* tables (here moz_places is the
+    // sole live table, so rows land in recovered_moz_places / recovered_inferred).
     let bytes = std::fs::read(&produced).unwrap();
     let rebuilt = sqlite_core::Database::open(bytes).expect("recovered db must be valid SQLite");
     let schema = rebuilt.read_table(1, 5).unwrap();
     assert!(
         schema.iter().any(|r| matches!(
             r.values.get(1),
-            Some(sqlite_core::Value::Text(n)) if n == "recovered_records"
+            Some(sqlite_core::Value::Text(n)) if n.starts_with("recovered_")
         )),
-        "the rebuilt db must contain the recovered_records table"
+        "the rebuilt db must contain at least one recovered_* attribution table"
     );
 }
 
@@ -366,19 +368,22 @@ fn carve_xlsx_writes_db_and_xlsx() {
         "summary must mention both files, got: {stdout:?}"
     );
 
-    // The produced xlsx opens in calamine and carries the records sheet.
+    // The produced xlsx opens in calamine and carries a per-tier sheet (here
+    // moz_places is the sole live table, so its rows attribute to
+    // recovered_moz_places / recovered_inferred).
     let mut wb: calamine::Xlsx<_> =
         calamine::open_workbook(&recovered_xlsx).expect("xlsx must open in calamine");
-    assert!(
-        wb.sheet_names().iter().any(|n| n == "recovered_records"),
-        "recovered_records sheet present: {:?}",
-        wb.sheet_names()
-    );
-    let _ = wb.worksheet_range("recovered_records");
+    let names = wb.sheet_names();
+    let sheet = names
+        .iter()
+        .find(|n| n.as_str() == "recovered_moz_places" || n.as_str() == "recovered_inferred")
+        .unwrap_or_else(|| panic!("an attribution sheet present: {names:?}"))
+        .clone();
+    let _ = wb.worksheet_range(&sheet);
 }
 
 /// `carve --xlsx` with a fixture that surfaces a fragment writes a workbook with
-/// BOTH the `recovered_records` and `recovered_fragments` sheets.
+/// BOTH the attributed Tier-1 sheet (`recovered_users`) and `recovered_fragments`.
 #[test]
 fn carve_xlsx_includes_fragment_sheet() {
     use calamine::Reader;
@@ -398,7 +403,10 @@ fn carve_xlsx_includes_fragment_sheet() {
     assert!(recovered_xlsx.exists(), "the .xlsx must be written");
     let wb: calamine::Xlsx<_> = calamine::open_workbook(&recovered_xlsx).expect("xlsx must open");
     let names = wb.sheet_names();
-    assert!(names.iter().any(|n| n == "recovered_records"));
+    assert!(
+        names.iter().any(|n| n == "recovered_users"),
+        "Tier-1 sheet present: {names:?}"
+    );
     assert!(
         names.iter().any(|n| n == "recovered_fragments"),
         "fragment sheet present (fragments on by default): {names:?}"
@@ -779,10 +787,10 @@ fn mint_db(sqlite3: &str, path: &Path, script: &str) {
     );
 }
 
-/// A secure_delete=OFF script that produces all three attribution tiers:
+/// A `secure_delete=OFF` script that produces all three attribution tiers:
 /// - `people`: a deleted in-page row → Tier-1 `recovered_people`;
 /// - `amounts`: most rows deleted, freeing whole pages → Tier-2 (its own shape);
-/// - `secret`: bulk-inserted then DROPped → freed pages whose 4-TEXT shape
+/// - `secret`: bulk-inserted then `DROP`ped → freed pages whose 4-TEXT shape
 ///   matches no surviving table → Tier-3 `recovered_unattributed`.
 const THREE_TIER_SCRIPT: &str = "\
 PRAGMA secure_delete=OFF;\n\
@@ -800,7 +808,7 @@ DELETE FROM people WHERE id=3;\n\
 DELETE FROM amounts WHERE rowid>5;\n\
 DROP TABLE secret;\n";
 
-/// The headline end-to-end: a secure_delete=OFF db with an in-page deletion
+/// The headline end-to-end: a `secure_delete=OFF` db with an in-page deletion
 /// (Tier-1), whole freed pages of a surviving table (Tier-2), and a dropped
 /// table whose shape matches nothing (Tier-3). The default `carve` rebuilds a db
 /// the REAL `sqlite3` engine reads back with `recovered_people` (real column
@@ -896,7 +904,7 @@ fn xlsx_has_one_sheet_per_recovered_table() {
 
     let xlsx = dir.join("tier.recovered.xlsx");
     assert!(xlsx.exists(), "xlsx companion must be written");
-    let mut wb: calamine::Xlsx<_> =
+    let wb: calamine::Xlsx<_> =
         calamine::open_workbook(&xlsx).expect("calamine must open the xlsx");
     let names = wb.sheet_names();
     for expected in [

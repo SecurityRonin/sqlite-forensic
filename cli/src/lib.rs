@@ -727,6 +727,16 @@ pub fn recovered_output_path(db: &Path, out: Option<&Path>) -> Result<PathBuf, S
     Ok(resolved)
 }
 
+/// Derive the `.xlsx` companion path from a resolved recovered-db path by
+/// swapping its final extension for `xlsx`. This keeps the xlsx beside the
+/// rebuilt db with the same stem, so `--out /p/foo.db` ⇒ `/p/foo.xlsx` and the
+/// default `History.recovered.db` ⇒ `History.recovered.xlsx`. A db path with no
+/// extension simply gains `.xlsx`.
+#[must_use]
+pub fn recovered_xlsx_path(recovered_db: &Path) -> PathBuf {
+    recovered_db.with_extension("xlsx")
+}
+
 /// The default recovered-db filename: the input's filename with its final
 /// extension replaced by `.recovered.db`. A filename with no extension keeps its
 /// whole stem (`wal_only` → `wal_only.recovered.db`).
@@ -2058,7 +2068,10 @@ mod tests {
         let mut media = false;
         for i in 0..zip.len() {
             let name = zip.by_index(i).unwrap().name().to_string();
-            if name.starts_with("xl/media/") && name.ends_with(".png") {
+            let is_png = std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+            if name.starts_with("xl/media/") && is_png {
                 media = true;
             }
         }

@@ -1,64 +1,104 @@
 [![Docs](https://img.shields.io/badge/docs-securityronin.github.io-blue.svg)](https://securityronin.github.io/sqlite-forensic/)
-[![Rust edition 2021](https://img.shields.io/badge/rust-edition%202021-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2021/index.html)
+[![CI](https://github.com/SecurityRonin/sqlite-forensic/actions/workflows/ci.yml/badge.svg)](https://github.com/SecurityRonin/sqlite-forensic/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/sponsor-h4x0r-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/h4x0r)
-
-[![CI](https://github.com/SecurityRonin/sqlite-forensic/actions/workflows/ci.yml/badge.svg)](https://github.com/SecurityRonin/sqlite-forensic/actions/workflows/ci.yml)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](#trust-but-verify)
 [![security: cargo-deny](https://img.shields.io/badge/security-cargo--deny-success.svg)](deny.toml)
 
 # sqlite-forensic
 
-**Carve deleted rows out of a SQLite database without trusting it, without writing to it, and without re-surfacing a single live row.**
+**The deleted rows are the evidence — and `sqlite3` can't see them.** `sqlite4n6` carves deleted records back out of any SQLite database — browser history, chat apps, mobile artifacts — into a **fresh database you can query in seconds**. It opens the evidence read-only, never writes it, and never re-surfaces a live row as "deleted".
 
-> Measured against **independent third-party ground truth** — the SQLite Forensic Corpus (Nemetz, Schmitt & Freiling, DFRWS-EU 2018, CC0), whose authors shipped a per-row deleted answer key — and reported as a reproducible per-database confusion matrix ([`docs/recovery-comparison.md`](docs/recovery-comparison.md)). The headline: **precision is the highest of any tool measured** (it never re-surfaces a live row as "deleted", and emits only a small low-confidence phantom class), and **freeblock-aware reconstruction leads in-page recall** — **0.833** on the cleanest category (`0C`: 70 of 84 recoverable rows), ahead of `fqlite`'s **0.798**, at roughly five times fewer false rows. Every number here is the harness-measured value against that independent corpus.
-
-Every browser history, every chat app, every mobile artifact is a SQLite file — and the forensically interesting rows are usually the *deleted* ones. The standard `sqlite3`/rusqlite path cannot see them: it reads the live b-tree and stops. `sqlite-forensic` reads the raw file format itself — freelist pages, in-page free blocks, dropped-table pages, and an uncheckpointed WAL overlay — and recovers what the live query cannot, as severity-graded, confidence-scored observations.
-
-This is a Rust library workspace with a CLI (`sqlite4n6`). The fastest path — point it at a database and recover the deleted rows straight out of free space. The evidence is opened **read-only**; the recovered rows are written to a **new** database alongside it (the evidence file and its sidecars are never touched):
-
-```console
-$ sqlite4n6 carve ChatStorage.sqlite                         # rebuild recovered rows → ChatStorage.recovered.db
-$ sqlite4n6 carve ChatStorage.sqlite --out /tmp/recovered.db # choose the rebuilt-db path
-$ sqlite4n6 carve ChatStorage.sqlite --format table          # recovered rows to stdout (or: csv, jsonl)
-$ sqlite4n6 carve ChatStorage.sqlite --format jsonl          # one JSON object per record (BLOBs as base64)
-$ sqlite4n6 carve ChatStorage.sqlite --min-confidence medium # drop low-confidence carves
-$ sqlite4n6 carve ChatStorage.sqlite --no-fragments          # full rows only (fragments shown by default)
-$ sqlite4n6 audit ChatStorage.sqlite                         # graded anomaly findings
+```bash
+brew install securityronin/tap/sqlite4n6
+sqlite4n6 carve History.db          # → History.recovered.db
 ```
 
-By default `carve` **rebuilds a queryable SQLite database** of the recovered records — `<name>.recovered.db`, a `recovered_records` table with provenance columns (`_page`, `_offset`, `_rowid`, `_source`, `_confidence`) plus the carved cells in their **native types**, so a recovered `BLOB` is stored losslessly and you can `sqlite3 ChatStorage.recovered.db "SELECT …"` straight away. Tier-2 partial rows land in a **separate `recovered_fragments` table** — provenance columns (`_page`, `_offset`, `_missing`, `_confidence`) and each surviving cell at its native column index (`c0`, `c1`, …) — kept distinct from the full rows so a fragment is never mistaken for a recovered record; `--no-fragments` omits this table for a single-table db. Pass `--format table|csv|jsonl` to stream rows to stdout instead (JSONL carries BLOBs as base64; table/CSV show a `<blob:N bytes>` placeholder, since raw binary is unsafe in those).
+**[Full documentation →](https://securityronin.github.io/sqlite-forensic/)**
+
+---
+
+## See it in 30 seconds
+
+```console
+$ sqlite4n6 carve History.db
+wrote 412 recovered record(s) and 9 fragment(s) to History.recovered.db
+
+$ sqlite3 History.recovered.db 'SELECT _rowid, c1 FROM recovered_records LIMIT 3'
+588|https://mail.example.com/inbox
+587|https://news.example.com/the-story-they-deleted
+586|https://example.com/account/settings
+```
+
+Deleted rows, in an ordinary SQLite file, queried with the tools already on your box. `carve` rebuilds the database for you — no schema to reconstruct by hand, no flags to learn. **BLOBs come back natively and losslessly.** The evidence database and its `-wal`/`-shm` sidecars are **never** touched.
+
+Precision-first, and **measured against independent ground truth** (the Nemetz *SQLite Forensic Corpus*, DFRWS-EU 2018): the **highest precision of any tool in the comparison**, **0 live-row re-reads**, and freeblock-aware recall of **0.833** on the cleanest category — ahead of `fqlite`'s 0.798. [How it's measured →](#trust-but-verify)
+
+---
 
 ## Install
 
-Pick the channel for your platform — each lands the `sqlite4n6` binary on your `PATH`.
+Every channel drops the `sqlite4n6` binary on your `PATH`.
 
-**macOS / Linux (Homebrew):**
-
-```console
-$ brew install securityronin/tap/sqlite4n6
+**macOS / Linux — Homebrew**
+```bash
+brew install securityronin/tap/sqlite4n6
 ```
 
-**Debian / Ubuntu (apt):**
-
-```console
-$ curl -1sLf 'https://dl.cloudsmith.io/public/securityronin/sqlite-forensic/setup.deb.sh' | sudo -E bash
-$ sudo apt install sqlite4n6
+**Debian / Ubuntu / Kali — apt**
+```bash
+curl -1sLf 'https://dl.cloudsmith.io/public/securityronin/sqlite-forensic/setup.deb.sh' | sudo -E bash
+sudo apt install sqlite4n6
 ```
 
-**Windows (winget):**
+**Windows** — download the signed `.msi` from the [latest release](https://github.com/SecurityRonin/sqlite-forensic/releases/latest) (every asset is listed in `checksums.txt`).
 
-```console
-> winget install SecurityRonin.sqlite4n6
+**From source** — needs a Rust toolchain
+```bash
+cargo install --git https://github.com/SecurityRonin/sqlite-forensic sqlite4n6
 ```
 
-**Prebuilt binaries** — grab a `.tar.gz` (macOS/Linux), `.msi` (Windows), or `.deb` (Debian/Ubuntu) for your architecture from the [latest release](https://github.com/SecurityRonin/sqlite-forensic/releases/latest); every asset is listed in `checksums.txt` for verification.
+---
 
-**From source (Rust toolchain):**
+## What you get
+
+By default `carve` **rebuilds a queryable SQLite database** — `<name>.recovered.db` — so there is nothing left to parse:
+
+- **`recovered_records`** — the full recovered rows, with provenance columns (`_page`, `_offset`, `_rowid`, `_source`, `_confidence`) and the carved cells in their **native types** (a recovered `BLOB` is stored byte-for-byte).
+- **`recovered_fragments`** — a **separate** table for Tier-2 partial salvage (a distinctive cell survived but the row's identity did not), kept distinct so a fragment is never mistaken for a full row. `--no-fragments` drops it.
+
+Want a stream instead of a file? Pick a format; want the file elsewhere? Pick a path:
 
 ```console
-$ cargo install --git https://github.com/SecurityRonin/sqlite-forensic sqlite4n6
+$ sqlite4n6 carve ChatStorage.sqlite --out /cases/2026-001/recovered.db  # choose the output path
+$ sqlite4n6 carve ChatStorage.sqlite --format table     # recovered rows to stdout (or: csv, jsonl)
+$ sqlite4n6 carve ChatStorage.sqlite --format jsonl     # one JSON object per record (BLOBs as base64)
+$ sqlite4n6 carve ChatStorage.sqlite --min-confidence medium  # drop low-confidence carves
+$ sqlite4n6 carve ChatStorage.sqlite --rowid-only       # just the recovered rowids
+$ sqlite4n6 audit ChatStorage.sqlite                    # severity-graded anomaly findings
 ```
+
+Under the hood `sqlite4n6` reads the raw file format itself — freelist pages, in-page free blocks, dropped-table pages, and an uncheckpointed WAL overlay — recovering what the live `sqlite3`/rusqlite path cannot, because that path reads the live b-tree and stops.
+
+| | sqlite-forensic | rusqlite / `sqlite3` |
+|---|:-:|:-:|
+| Read live rows | ✅ | ✅ |
+| Read-only on the evidence file | ✅ | ✅ (with care) |
+| Recover deleted rows from freelist pages | ✅ | — |
+| Recover deleted rows from in-page free blocks | ✅ | — |
+| Recover dropped-table rows (column count inferred) | ✅ | — |
+| Reassemble deleted rows whose payload spilled to overflow-page chains | ✅ partial | — |
+| Salvage partial rows as a separate Tier-2 fragment tier (a distinctive cell survives) | ✅ default | — |
+| Rebuild recovered rows into a queryable SQLite db (native types, lossless BLOBs) | ✅ default | — |
+| Read uncheckpointed WAL overlay as a separate view | ✅ | applied silently |
+| Carve every WAL commit snapshot, LSN-labelled (per-commit timeline) | ✅ | — |
+| Graded, confidence-scored anomaly findings | ✅ | — |
+| Refuses to ever re-surface a live row as "deleted" | ✅ | n/a |
+| `forbid(unsafe)`, panic-free on hostile input | ✅ | C / FFI |
+
+---
+
+## Time-travel: the full WAL timeline
 
 When a `-wal` sidecar is present, `carve` auto-detects it and carves the **full per-commit WAL timeline** — every materializable state, each labelled with its log-sequence coordinate: the on-disk base image, **each commit snapshot** of the WAL, and the uncheckpointed WAL-frame residue. A row deleted late in a transaction history is still a live cell in an *earlier* commit's page image, so the snapshot column tells you the exact committed state a deleted row was last alive in. This is the real N-snapshot temporal model — not a two-point on-disk-vs-latest approximation.
 
@@ -74,6 +114,8 @@ $ sqlite4n6 carve chat.db --no-wal                     # on-disk image only, no 
 
 The `snapshot` column carries the salt-qualified LSN — `commit:(salt1,salt2,commit_frame_index)` for a committed snapshot, `wal-frame:(salt1,salt2,frame_index)` for raw frame residue, `on-disk` for the base image. A record identical across views is collapsed to its earliest committed coordinate. `--no-wal` carves the on-disk image alone (single view, no snapshot column). The evidence file and its sidecars are **never** written.
 
+---
+
 ## Two recovery sets: full rows and fragments
 
 `carve` returns **two structurally separate result sets** — never merged, so a partial salvage can never be mistaken for a recovered row. The separation *is* the precision discipline.
@@ -82,9 +124,13 @@ The `snapshot` column carries the salt-qualified LSN — `commit:(salt1,salt2,co
 
 **Set 2 — fragments (Tier-2, shown by default).** When a row's full identity is destroyed but a single distinctive cell survives contiguously (a `TEXT` of `≥ 4` bytes, or a `REAL`), that lone value is salvaged as a **fragment**. A fragment has no rowid and is *not a row* — it is the partial evidence one surviving cell can still anchor ("this value was here"), never the stronger claim a full row makes ("this row was here").
 
-The two sets stay apart by construction: fragments render in their own section, suppressed with `--no-fragments`, and excluded from `--rowid-only` (a fragment carries no rowid). Set 1 is the precision-first surface; Set 2 is the recall safety net that refuses to overclaim.
+The two sets stay apart by construction: separate tables in the rebuilt db (and separate sections in the text output), suppressed together with `--no-fragments`, and excluded from `--rowid-only` (a fragment carries no rowid). Set 1 is the precision-first surface; Set 2 is the recall safety net that refuses to overclaim.
 
-Or drive the library directly — point the analyzer at the file bytes and get graded findings plus carved deleted records:
+---
+
+## Drive the library directly
+
+Point the analyzer at the file bytes and get graded findings plus carved deleted records:
 
 ```rust
 use sqlite_core::Database;
@@ -106,36 +152,12 @@ for rec in carve_all_deleted_records(&db) {
 
 The reader (`sqlite-core`) answers *"what does this file actually contain?"*; the analyzer (`sqlite-forensic`) grades the forensically notable parts and recovers the deleted ones.
 
----
-
-## What you get
-
-| | sqlite-forensic | rusqlite / `sqlite3` |
-|---|:-:|:-:|
-| Read live rows | ✅ | ✅ |
-| Read-only on the evidence file | ✅ | ✅ (with care) |
-| Recover deleted rows from freelist pages | ✅ | — |
-| Recover deleted rows from in-page free blocks | ✅ | — |
-| Recover dropped-table rows (column count inferred) | ✅ | — |
-| Reassemble deleted rows whose payload spilled to overflow-page chains | ✅ partial | — |
-| Salvage partial rows as a separate Tier-2 fragment tier (a distinctive cell survives) | ✅ default | — |
-| Rebuild recovered rows into a queryable SQLite db (native types, lossless BLOBs) | ✅ default | — |
-| Read uncheckpointed WAL overlay as a separate view | ✅ | applied silently |
-| Carve every WAL commit snapshot, LSN-labelled (per-commit timeline) | ✅ | — |
-| Graded, confidence-scored anomaly findings | ✅ | — |
-| Refuses to ever re-surface a live row as "deleted" | ✅ | n/a |
-| `forbid(unsafe)`, panic-free on hostile input | ✅ | C / FFI |
-
----
-
-## The two crates
-
-This is one workspace (`sqlite-forensic`): two library crates following the fleet reader/analyzer split, plus the `sqlite4n6` CLI that consumes them:
+This is one workspace (`sqlite-forensic`): two library crates following the fleet reader/analyzer split, plus the `sqlite4n6` CLI that consumes them.
 
 | Crate | Role | Entry points |
 |---|---|---|
-| [`sqlite-core`](core) | The raw, read-only, panic-free file-format reader: header parse, b-tree walk, freelist + overflow chains, and a read-only WAL overlay that maps onto the canonical `forensicnomicon::history` temporal cohort (each commit a salt-qualified `[H]` state). No findings. | `Database::open`, `Database::open_with_wal`, `freelist_pages`, `read_table`, `carve_free_regions`, `live_rowids`, `wal_timeline`, `WalTimeline::to_temporal_cohort` |
-| [`sqlite-forensic`](forensic) | The anomaly auditor + deleted-record carver: grades observations into `forensicnomicon::report::Finding`s and recovers deleted rows. Depends on `sqlite-core`. | `audit`, `audit_findings`, `carve_all_deleted_records`, `carve_deleted_records` |
+| [`sqlite-core`](core) | The raw, read-only, panic-free file-format reader: header parse, b-tree walk, freelist + overflow chains, a read-only WAL overlay that maps onto the canonical `forensicnomicon::history` temporal cohort, plus a small pure-Rust writer (`rebuild`) that materializes recovered rows into a fresh database. | `Database::open`, `Database::open_with_wal`, `freelist_pages`, `read_table`, `carve_free_regions`, `live_rowids`, `wal_timeline`, `rebuild::build_recovered_db` |
+| [`sqlite-forensic`](forensic) | The anomaly auditor + deleted-record carver: grades observations into `forensicnomicon::report::Finding`s and recovers deleted rows. Depends on `sqlite-core`. | `audit`, `audit_findings`, `carve_all_deleted_records`, `carve_with_fragments` |
 
 `sqlite-forensic` accepts an in-memory `Database` (built from `&[u8]`) — it is medium-agnostic and has no dependency on any image format or container layer. Findings flow into the shared `forensicnomicon::report` model, so a SQLite database's anomalies aggregate uniformly with the partition / container / filesystem layers in a triage report.
 
@@ -161,7 +183,7 @@ The `AnomalyKind` enum is `#[non_exhaustive]`: new codes can be added without a 
 
 A carver that *over*-reports is worse than useless on an evidence database — it manufactures rows that were never deleted. The design goal of this carver is therefore precision over recall, enforced structurally rather than by inspection:
 
-- **Read-only, panic-free, `forbid(unsafe)`** — `Database::open` owns a `Vec<u8>` and never writes back to the artifact; the whole workspace denies `unsafe` at compile time and reads every length/offset through bounds-checked helpers, so a malformed, attacker-controlled database cannot reach a raw-pointer path or panic.
+- **Read-only, panic-free, `forbid(unsafe)`** — `Database::open` owns a `Vec<u8>` and never writes back to the artifact; the whole workspace denies `unsafe` at compile time and reads every length/offset through bounds-checked helpers, so a malformed, attacker-controlled database cannot reach a raw-pointer path or panic. (The rebuilt `*.recovered.db` is a separate, new output file — the evidence is still never written.)
 - **Measured against independent third-party ground truth.** Recall and precision are computed per database against the **SQLite Forensic Corpus** (Nemetz, Schmitt & Freiling, DFRWS-EU 2018, CC0), whose authors shipped a per-row deleted-record answer key — so the truth set is theirs, not ours. The harness (`forensic/tests/nemetz_metrics.rs`) emits a reproducible confusion matrix; the full table is in [`docs/recovery-comparison.md`](docs/recovery-comparison.md).
 - **High precision, structurally — never a live-row re-read.** Our carver carves only the *complement* of the live cell extents on a page, then drops any carved record whose rowid is currently live. Across the Nemetz recall corpus it produces **0 live-re-reads** (verified against the answer key's live rows), with only a small, low-confidence **phantom** class (all-empty/NULL records the inferred carver matches on a run of zero bytes). The two over-reporting failure modes the reference oracles exhibit on no-deletion databases — re-reading live cells, and re-surfacing a stale byte-copy of a live row — our carver does not.
 - **Strong in-page recall via freeblock reconstruction — reported honestly.** On the cleanest category (`0C`: records deleted in place, `secure_delete=0`, no overwrite, so **every** deleted row's bytes survive) the carver recovers **70 of the 84** cross-tool-scored rows (recall **0.833**), ahead of `fqlite`'s 0.798. SQLite overwrites a freed cell's first four bytes (payload-length + rowid varints, `header_len`, leading serial) with the freeblock pointer; `reconstruct_freeblock_records` rebuilds each record from its surviving serial-type tail plus a schema template derived from a live cell on the same page, with the destroyed rowid surfaced as unknown. It does so at higher precision than `fqlite` and **0 live-re-reads**.

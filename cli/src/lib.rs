@@ -1393,4 +1393,32 @@ mod tests {
         let r = rec(0, 0.4, RecoverySource::FreeblockReconstructed, vec![]);
         assert_eq!(carved_to_rebuild_row(&r).rowid, None);
     }
+
+    // ---- fragment -> rebuilt fragment row ----------------------------------
+
+    #[test]
+    fn carved_fragment_maps_to_fragment_row_preserving_native_cells() {
+        // A fragment's provenance + each surviving (col_index, value) carries over
+        // verbatim and natively (a BLOB stays a BLOB); the writer owns where each
+        // value lands. No rowid and no source label exist on the fragment table.
+        let f = CarvedFragment {
+            page: 2,
+            offset: 3965,
+            surviving: vec![(0, Value::Integer(20004)), (2, Value::Blob(vec![1, 2, 3]))],
+            missing: 1,
+            confidence: 0.2,
+            source: RecoverySource::FreeblockReconstructed,
+            wal: None,
+        };
+        let row = fragment_to_rebuild_row(&f);
+        assert_eq!(row.page, 2);
+        assert_eq!(row.offset, 3965);
+        assert_eq!(row.missing, 1);
+        assert!((row.confidence - 0.2).abs() < 1e-6);
+        assert_eq!(
+            row.surviving,
+            vec![(0, Value::Integer(20004)), (2, Value::Blob(vec![1, 2, 3]))],
+            "surviving (index, value) pairs preserved natively"
+        );
+    }
 }

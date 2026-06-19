@@ -823,6 +823,28 @@ mod tests {
     }
 
     #[test]
+    fn carve_jsonl_emits_lossless_base64_for_blobs() {
+        // A BLOB column must be recoverable from JSONL, not reduced to a
+        // "<blob:N bytes>" placeholder: it renders as a self-describing
+        // {"blob_base64": "..."} object so a consumer can round-trip the bytes.
+        // table/CSV keep the placeholder (raw binary is unsafe in those).
+        let records = vec![rec(
+            5,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Blob(b"foobar".to_vec())],
+        )];
+        let lines = render_carve(&records, OutputFormat::Jsonl, false);
+        // RFC 4648 test vector: base64("foobar") == "Zm9vYmFy".
+        assert!(
+            lines[0].contains("\"values\":[{\"blob_base64\":\"Zm9vYmFy\"}]"),
+            "{}",
+            lines[0]
+        );
+        assert!(!lines[0].contains("<blob:"), "{}", lines[0]);
+    }
+
+    #[test]
     fn carve_table_has_header_and_renders_values() {
         let records = vec![rec(
             1,

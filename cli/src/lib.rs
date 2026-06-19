@@ -1593,4 +1593,54 @@ mod tests {
         assert_eq!(human_size(4_404_019), "4.2 MB");
         assert_eq!(human_size(1024 * 1024 * 1024), "1.0 GB");
     }
+
+    // ---- XLSX export: thumbnail / transcode --------------------------------
+
+    /// An 8x4 RGB PNG, used to verify the thumbnailer downscales the longest side
+    /// and always re-encodes to PNG (so WebP/TIFF sources transcode too).
+    fn rgb_png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(w, h, |x, _| image::Rgb([(x % 256) as u8, 0, 0]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn thumbnail_png_downscales_longest_side_and_emits_png() {
+        // A 400x200 source: longest side must shrink to THUMB_MAX_PX, aspect kept.
+        let src = rgb_png(400, 200);
+        let thumb = thumbnail_png(&src).expect("a valid PNG must thumbnail");
+        // The output is itself a PNG (transcoded), readable back by the decoder.
+        assert_eq!(
+            image::guess_format(&thumb).unwrap(),
+            image::ImageFormat::Png
+        );
+        let decoded = image::load_from_memory(&thumb).unwrap();
+        let (tw, th) = (decoded.width(), decoded.height());
+        assert!(
+            tw <= THUMB_MAX_PX && th <= THUMB_MAX_PX,
+            "both sides within the thumbnail bound, got {tw}x{th}"
+        );
+        assert_eq!(tw, THUMB_MAX_PX, "longest side scaled to the bound");
+        assert_eq!(th, THUMB_MAX_PX / 2, "aspect ratio (2:1) preserved");
+    }
+
+    #[test]
+    fn thumbnail_png_does_not_upscale_small_images() {
+        // A 1x1 PNG must not be enlarged; it stays within bounds and re-encodes.
+        let thumb = thumbnail_png(&tiny_png()).expect("tiny png thumbnails");
+        let decoded = image::load_from_memory(&thumb).unwrap();
+        assert!(decoded.width() <= THUMB_MAX_PX && decoded.height() <= THUMB_MAX_PX);
+    }
+
+    #[test]
+    fn thumbnail_png_fails_soft_on_non_image() {
+        // Hostile / non-image bytes must return None, never panic.
+        assert!(thumbnail_png(b"not an image at all").is_none());
+        assert!(thumbnail_png(&[]).is_none());
+        // A truncated PNG signature with no decodable body also fails soft.
+        assert!(thumbnail_png(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).is_none());
+    }
 }

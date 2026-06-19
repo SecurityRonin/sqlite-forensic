@@ -985,6 +985,318 @@ pub fn audit_carved_findings(db: &Database, column_count: usize, source: &Source
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Table attribution: reattach a carved deleted row to its source table in three
+// honest tiers (CERTAIN / INFERRED / UNATTRIBUTED).
+// ---------------------------------------------------------------------------
+
+/// How confidently a carved deleted row has been reattached to a live table.
+///
+/// The three tiers encode distinct epistemic strengths (observed fact / forensic
+/// inference / unattributed), and the renderer keeps them honest: a Tier-2 guess
+/// is "consistent with" a table, never asserted as the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Attribution {
+    /// **Tier 1 — CERTAIN.** The record was carved from a page still part of a
+    /// live table's b-tree, so the owning table is known for sure. Carries that
+    /// table's name.
+    Known(String),
+    /// **Tier 2 — INFERRED.** The whole page was freed (linkage cut); the
+    /// record's *shape* (column count + per-column affinity) matched one or more
+    /// surviving tables. A forensic inference, never asserted as fact.
+    Inferred {
+        /// The candidate table whose shape the record matches.
+        guess: String,
+        /// `true` when more than one surviving table matched the shape, so the
+        /// guess is one of several equally-consistent candidates.
+        ambiguous: bool,
+    },
+    /// **Tier 3 — UNATTRIBUTED.** Dropped-table residue, or a shape matching no
+    /// surviving table.
+    Unattributed,
+}
+
+/// Whether a carved value is **storage-compatible** with a column of the given
+/// declared affinity — the per-cell test the shape matcher applies.
+///
+/// Rules (permissive enough to survive `SQLite`'s numeric coercions, strict
+/// enough to discriminate tables of equal arity but different type layout):
+/// a NULL is compatible with anything; INTEGER/REAL are mutually compatible and
+/// also satisfy NUMERIC; TEXT requires a text-leaning affinity (TEXT) or the
+/// catch-all BLOB/NUMERIC; a BLOB requires BLOB. The BLOB affinity (or a column
+/// with no declared type) accepts any value, matching SQLite's "no datatype"
+/// semantics.
+#[must_use]
+pub fn value_fits_affinity(_value: &Value, _affinity: sqlite_core::attribution::Affinity) -> bool {
+    unimplemented!("RED")
+}
+
+/// Whether a carved record's values match a live table's shape: equal column
+/// count AND every value storage-compatible with the corresponding column
+/// affinity ([`value_fits_affinity`]).
+#[must_use]
+pub fn shape_matches(_values: &[Value], _table: &sqlite_core::attribution::LiveTable) -> bool {
+    unimplemented!("RED")
+}
+
+/// The names of every live table whose shape a record's values match, in the
+/// order the tables were listed. Zero matches → unattributable shape; one →
+/// a clean guess; more than one → ambiguous.
+#[must_use]
+pub fn matching_tables(
+    _values: &[Value],
+    _tables: &[sqlite_core::attribution::LiveTable],
+) -> Vec<String> {
+    unimplemented!("RED")
+}
+
+/// Attribute one carved record to a tier given the live tables and the
+/// page→table map. Pure (no DB access) so it is directly unit-testable.
+///
+/// - Tier 1 (CERTAIN): `source` is an in-page class ([`RecoverySource::InPageFreeBlock`]
+///   or [`RecoverySource::FreeblockReconstructed`]) AND the record's page is in
+///   `page_table_map` → [`Attribution::Known`].
+/// - Tier 2 (INFERRED): `source` is [`RecoverySource::FreelistPage`] → match the
+///   record's shape against `tables`; exactly one match → a guess, more than one
+///   → ambiguous, none → [`Attribution::Unattributed`].
+/// - Tier 3 (UNATTRIBUTED): [`RecoverySource::DroppedTable`], any other source,
+///   or a shape matching no surviving table.
+#[must_use]
+pub fn attribute_record(
+    _rec: &CarvedRecord,
+    _tables: &[sqlite_core::attribution::LiveTable],
+    _page_table_map: &std::collections::BTreeMap<u32, String>,
+) -> Attribution {
+    unimplemented!("RED")
+}
+
+/// Attribute every carved record, reading the live tables and page→table map
+/// from `db` once. The returned vector is parallel to `records`.
+#[must_use]
+pub fn attribute_records(_db: &Database, _records: &[CarvedRecord]) -> Vec<Attribution> {
+    unimplemented!("RED")
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::{
+        attribute_record, matching_tables, shape_matches, value_fits_affinity, Attribution,
+        CarvedRecord, RecoverySource,
+    };
+    use sqlite_core::attribution::{Affinity, LiveTable};
+    use sqlite_core::Value;
+
+    fn table(name: &str, root: u32, affinities: Vec<Affinity>) -> LiveTable {
+        LiveTable {
+            name: name.to_string(),
+            rootpage: root,
+            column_names: None,
+            affinities,
+        }
+    }
+
+    fn rec(page: u32, source: RecoverySource, values: Vec<Value>) -> CarvedRecord {
+        CarvedRecord {
+            page,
+            offset: 0,
+            rowid: 1,
+            values,
+            confidence: 0.9,
+            allocated: false,
+            source,
+            wal: None,
+            overflow: None,
+        }
+    }
+
+    #[test]
+    fn value_affinity_compatibility() {
+        assert!(value_fits_affinity(&Value::Null, Affinity::Integer));
+        assert!(value_fits_affinity(&Value::Integer(1), Affinity::Integer));
+        assert!(value_fits_affinity(&Value::Integer(1), Affinity::Real));
+        assert!(value_fits_affinity(&Value::Real(1.0), Affinity::Numeric));
+        assert!(value_fits_affinity(
+            &Value::Text("x".into()),
+            Affinity::Text
+        ));
+        assert!(value_fits_affinity(&Value::Blob(vec![1]), Affinity::Blob));
+        // A text value does NOT fit an integer column.
+        assert!(!value_fits_affinity(
+            &Value::Text("x".into()),
+            Affinity::Integer
+        ));
+        // A blob does not fit a text column.
+        assert!(!value_fits_affinity(&Value::Blob(vec![1]), Affinity::Text));
+        // BLOB (or no-type) affinity is the catch-all: any value fits.
+        assert!(value_fits_affinity(
+            &Value::Text("x".into()),
+            Affinity::Blob
+        ));
+        assert!(value_fits_affinity(&Value::Integer(1), Affinity::Blob));
+    }
+
+    #[test]
+    fn shape_match_requires_equal_arity_and_compatible_cells() {
+        let t = table("people", 2, vec![Affinity::Integer, Affinity::Text]);
+        assert!(shape_matches(
+            &[Value::Integer(1), Value::Text("a".into())],
+            &t
+        ));
+        // Wrong arity.
+        assert!(!shape_matches(&[Value::Integer(1)], &t));
+        // Incompatible cell (text in an integer column).
+        assert!(!shape_matches(
+            &[Value::Text("a".into()), Value::Text("b".into())],
+            &t
+        ));
+    }
+
+    #[test]
+    fn clean_single_match() {
+        let tables = vec![
+            table("people", 2, vec![Affinity::Integer, Affinity::Text]),
+            table("amounts", 3, vec![Affinity::Real, Affinity::Real]),
+        ];
+        let m = matching_tables(&[Value::Integer(1), Value::Text("a".into())], &tables);
+        assert_eq!(m, vec!["people"]);
+    }
+
+    #[test]
+    fn ambiguous_two_tables_same_shape() {
+        let tables = vec![
+            table("a", 2, vec![Affinity::Integer, Affinity::Text]),
+            table("b", 3, vec![Affinity::Integer, Affinity::Text]),
+        ];
+        let m = matching_tables(&[Value::Integer(1), Value::Text("x".into())], &tables);
+        assert_eq!(m, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn no_match_is_unattributed_shape() {
+        let tables = vec![table("a", 2, vec![Affinity::Integer, Affinity::Text])];
+        let m = matching_tables(&[Value::Blob(vec![1]), Value::Blob(vec![2])], &tables);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn tier1_inpage_page_in_map_is_known() {
+        let tables = vec![table("people", 2, vec![Affinity::Integer, Affinity::Text])];
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(5u32, "people".to_string());
+        let r = rec(
+            5,
+            RecoverySource::InPageFreeBlock,
+            vec![Value::Integer(1), Value::Text("a".into())],
+        );
+        assert_eq!(
+            attribute_record(&r, &tables, &map),
+            Attribution::Known("people".to_string())
+        );
+    }
+
+    #[test]
+    fn tier1_freeblock_reconstructed_in_map_is_known() {
+        let tables = vec![table("people", 2, vec![Affinity::Integer, Affinity::Text])];
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(7u32, "people".to_string());
+        let r = rec(7, RecoverySource::FreeblockReconstructed, vec![Value::Null]);
+        assert_eq!(
+            attribute_record(&r, &tables, &map),
+            Attribution::Known("people".to_string())
+        );
+    }
+
+    #[test]
+    fn tier2_freelist_single_match_is_inferred_unambiguous() {
+        let tables = vec![
+            table("people", 2, vec![Affinity::Integer, Affinity::Text]),
+            table("amounts", 3, vec![Affinity::Real, Affinity::Real]),
+        ];
+        let map = std::collections::BTreeMap::new();
+        let r = rec(
+            9,
+            RecoverySource::FreelistPage,
+            vec![Value::Integer(1), Value::Text("a".into())],
+        );
+        assert_eq!(
+            attribute_record(&r, &tables, &map),
+            Attribution::Inferred {
+                guess: "people".to_string(),
+                ambiguous: false
+            }
+        );
+    }
+
+    #[test]
+    fn tier2_freelist_multi_match_is_ambiguous() {
+        let tables = vec![
+            table("a", 2, vec![Affinity::Integer, Affinity::Text]),
+            table("b", 3, vec![Affinity::Integer, Affinity::Text]),
+        ];
+        let map = std::collections::BTreeMap::new();
+        let r = rec(
+            9,
+            RecoverySource::FreelistPage,
+            vec![Value::Integer(1), Value::Text("x".into())],
+        );
+        assert_eq!(
+            attribute_record(&r, &tables, &map),
+            Attribution::Inferred {
+                guess: "a".to_string(),
+                ambiguous: true
+            }
+        );
+    }
+
+    #[test]
+    fn tier2_freelist_no_match_is_unattributed() {
+        let tables = vec![table("a", 2, vec![Affinity::Integer, Affinity::Text])];
+        let map = std::collections::BTreeMap::new();
+        let r = rec(
+            9,
+            RecoverySource::FreelistPage,
+            vec![Value::Blob(vec![1]), Value::Blob(vec![2])],
+        );
+        assert_eq!(
+            attribute_record(&r, &tables, &map),
+            Attribution::Unattributed
+        );
+    }
+
+    #[test]
+    fn tier3_dropped_table_is_unattributed() {
+        let tables = vec![table("a", 2, vec![Affinity::Integer, Affinity::Text])];
+        let map = std::collections::BTreeMap::new();
+        let r = rec(
+            9,
+            RecoverySource::DroppedTable,
+            vec![Value::Integer(1), Value::Text("x".into())],
+        );
+        assert_eq!(
+            attribute_record(&r, &tables, &map),
+            Attribution::Unattributed
+        );
+    }
+
+    #[test]
+    fn tier1_inpage_page_not_in_map_falls_through_to_unattributed() {
+        // An in-page record on a page that is NOT a live-table page (e.g. its
+        // table was the one freed): no Tier-1 certainty, and in-page is not the
+        // freelist class, so it is unattributed rather than inferred.
+        let tables = vec![table("people", 2, vec![Affinity::Integer, Affinity::Text])];
+        let map = std::collections::BTreeMap::new();
+        let r = rec(
+            42,
+            RecoverySource::InPageFreeBlock,
+            vec![Value::Integer(1), Value::Text("a".into())],
+        );
+        assert_eq!(
+            attribute_record(&r, &tables, &map),
+            Attribution::Unattributed
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{dedup_fragments, CarvedFragment, RecoverySource};

@@ -235,14 +235,16 @@ impl<'a> ColumnTokens<'a> {
         Self { rest: part }
     }
 
-    /// Read and consume the leading identifier of the part, unescaping the four
-    /// quote styles. `None` when the part has no identifier start.
+    /// Read and consume the leading identifier of the part, unescaping the
+    /// quote styles. `SQLite` tolerates single-quoted identifiers in
+    /// `CREATE TABLE` (seen in real fixtures), so `'…'` is unquoted like `"…"` /
+    /// `` `…` ``. `None` when the part has no identifier start.
     fn next_identifier(&mut self) -> Option<String> {
         let s = self.rest.trim_start();
         let bytes = s.as_bytes();
         let first = *bytes.first()?;
         let (name, consumed) = match first {
-            b'"' | b'`' => read_quoted(s, char::from(first)),
+            b'"' | b'`' | b'\'' => read_quoted(s, char::from(first)),
             b'[' => read_quoted(s, ']'),
             _ => read_bare(s),
         }?;

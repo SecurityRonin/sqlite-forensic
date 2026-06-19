@@ -123,7 +123,7 @@ pub struct CarvedCell {
 /// at an anchor where full reconstruction failed but at least one *distinctive*
 /// cell (TEXT ≥ 4 bytes of valid UTF-8, or REAL) decoded cleanly, so a lone
 /// coincidental integer pattern never anchors a fragment. Graded
-/// [`FRAGMENT_CONFIDENCE`] — strictly below every full-row class.
+/// `FRAGMENT_CONFIDENCE` — strictly below every full-row class.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CellFragment {
     /// Byte offset of the failed cell's anchor within the scanned page slice.
@@ -137,13 +137,13 @@ pub struct CellFragment {
     /// Number of the template's columns that did NOT decode (`column_count` minus
     /// the number of surviving columns).
     pub missing: usize,
-    /// Always [`FRAGMENT_CONFIDENCE`] for now; the field is kept so future
+    /// Always `FRAGMENT_CONFIDENCE` for now; the field is kept so future
     /// per-fragment grading does not change the public type.
     pub confidence: f32,
 }
 
 /// A freed table-leaf cell whose declared payload **spills onto an overflow-page
-/// chain** (task #73). Recognized by [`try_carve_spilled_cell_at`] from the
+/// chain** (task #73). Recognized by `try_carve_spilled_cell_at` from the
 /// cell's intact local prefix; the chain itself is resolved separately
 /// ([`Database::read_freed_overflow_chain`]) because that needs whole-database
 /// access. A `SpilledCell` is deliberately NOT a [`CarvedCell`]: until its chain
@@ -196,10 +196,7 @@ impl TextEncoding {
 
     fn decode_utf16(bytes: &[u8], conv: fn([u8; 2]) -> u16) -> String {
         // A trailing odd byte (truncated UTF-16) is dropped by chunks_exact.
-        let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| conv([c[0], c[1]]))
-            .collect();
+        let units: Vec<u16> = bytes.chunks_exact(2).map(|c| conv([c[0], c[1]])).collect();
         String::from_utf16_lossy(&units)
     }
 }
@@ -396,7 +393,7 @@ impl Database {
     /// each addressable by [`CommitId`]; see [`WalTimeline`].
     ///
     /// This consults the original `-wal` bytes retained at open time, re-parsing
-    /// them into the richer temporal model (the on-open [`WalOverlay`] keeps only
+    /// them into the richer temporal model (the on-open `WalOverlay` keeps only
     /// the consistent-view pages; the timeline keeps every segment, snapshot, and
     /// residue tail). A page-size mismatch or malformed header surfaces as `None`
     /// here — use [`Database::wal_timeline_from`] when you need the typed
@@ -541,7 +538,7 @@ impl Database {
     /// Follow a **freed** overflow-page chain starting at `first`, reading raw
     /// main-file pages only (carving wants on-disk residue, not the WAL view),
     /// and assemble up to `remaining` content bytes (task #73). The carve-side
-    /// dual of [`Database::read_overflow_chain`], with one extra discipline that
+    /// dual of `Database::read_overflow_chain`, with one extra discipline that
     /// makes it the 0-FP-relevant guard: **every chain page must be a freelist
     /// leaf** (`freed_leaves`). A page that is not a leaf is live, a trunk, or
     /// unreachable — following its pointer would risk reading reused or clobbered
@@ -631,7 +628,12 @@ impl Database {
         }
         let mut off = 0usize;
         while off < page_bytes.len() {
-            if let Some(cell) = try_carve_cell_at(page_bytes, off, Some(column_count), self.header.text_encoding) {
+            if let Some(cell) = try_carve_cell_at(
+                page_bytes,
+                off,
+                Some(column_count),
+                self.header.text_encoding,
+            ) {
                 // Skip past this record to avoid re-reporting sub-slices of it.
                 off += cell.byte_len.max(1);
                 out.push(cell);
@@ -652,14 +654,15 @@ impl Database {
     /// self-consistency checks are kept strict to hold the false-positive rate
     /// down: `header_len + body_len == payload_len`, every serial type legal,
     /// `rowid > 0`, the payload fully in-bounds, and at least
-    /// [`MIN_INFERRED_COLUMNS`] columns. Records carved this way are graded a
+    /// `MIN_INFERRED_COLUMNS` columns. Records carved this way are graded a
     /// notch lower in confidence than fixed-count carving.
     #[must_use]
     pub fn carve_cells_inferred(&self, page_bytes: &[u8]) -> Vec<CarvedCell> {
         let mut out = Vec::new();
         let mut off = 0usize;
         while off < page_bytes.len() {
-            if let Some(cell) = try_carve_cell_at(page_bytes, off, None, self.header.text_encoding) {
+            if let Some(cell) = try_carve_cell_at(page_bytes, off, None, self.header.text_encoding)
+            {
                 off += cell.byte_len.max(1);
                 out.push(cell);
             } else {
@@ -707,7 +710,9 @@ impl Database {
             if cell_off == 0 || cell_off >= page_bytes.len() {
                 continue; // cov:unreachable: a valid leaf points cells within page
             }
-            if let Some(cell) = try_carve_cell_at(page_bytes, cell_off, None, self.header.text_encoding) {
+            if let Some(cell) =
+                try_carve_cell_at(page_bytes, cell_off, None, self.header.text_encoding)
+            {
                 out.push(cell);
             }
         }
@@ -869,7 +874,13 @@ impl Database {
             return None; // cov:unreachable: chain delivers exactly `remaining` bytes
         }
 
-        let values = decode_record(&payload, sc.serials.len(), sc.rowid, self.header.text_encoding).ok()?;
+        let values = decode_record(
+            &payload,
+            sc.serials.len(),
+            sc.rowid,
+            self.header.text_encoding,
+        )
+        .ok()?;
         if values.len() != sc.serials.len() {
             return None; // cov:unreachable: decode_record yields one value per serial
         }
@@ -934,7 +945,8 @@ impl Database {
         if page_bytes.get(hdr_off) != Some(&0x0d) {
             return Vec::new();
         }
-        let Some(template) = freeblock_template(page_bytes, hdr_off, self.header.text_encoding) else {
+        let Some(template) = freeblock_template(page_bytes, hdr_off, self.header.text_encoding)
+        else {
             return Vec::new();
         };
         let Ok((freed_leaves, _trunks)) = self.freelist_pages_split() else {
@@ -1016,7 +1028,9 @@ impl Database {
                     .read_freed_overflow_chain(sc.first_overflow, remaining, usable, &freed_leaves)
                     .is_ok();
                 if !chain_ok {
-                    if let Some(mut frag) = salvage_local_prefix(region, &sc, self.header.text_encoding) {
+                    if let Some(mut frag) =
+                        salvage_local_prefix(region, &sc, self.header.text_encoding)
+                    {
                         frag.offset += lo;
                         out.push(frag);
                     }
@@ -1054,7 +1068,7 @@ impl Database {
     ///
     /// Bounded and panic-free: every freeblock pointer, size, and serial length
     /// is range-checked against the page before use, and the chain walk is capped
-    /// at [`MAX_FREEBLOCKS_PER_PAGE`] to defeat a crafted cyclic `next` chain.
+    /// at `MAX_FREEBLOCKS_PER_PAGE` to defeat a crafted cyclic `next` chain.
     /// Non-leaf pages, pages with no freeblock chain, and pages with no usable
     /// schema template yield an empty result.
     #[must_use]
@@ -1258,7 +1272,9 @@ impl Database {
                     // parse hiccup (e.g. a table narrower than MIN_INFERRED_COLUMNS),
                     // fall back to the rowid alone (empty values) so the row is
                     // still known to be live.
-                    if let Some(cell) = try_carve_cell_at(slice, cell_off, None, self.header.text_encoding) {
+                    if let Some(cell) =
+                        try_carve_cell_at(slice, cell_off, None, self.header.text_encoding)
+                    {
                         rows.insert(cell.rowid, cell.values);
                     } else if let Some(rowid) = live_cell_rowid(slice, cell_off) {
                         rows.entry(rowid).or_default(); // cov:unreachable: a >=2-col live cell always decodes above
@@ -2405,7 +2421,11 @@ fn reconstruct_freeblock_inner(
     (cells, frags)
 }
 
-fn freeblock_template(page_bytes: &[u8], hdr_off: usize, enc: TextEncoding) -> Option<FreeblockTemplate> {
+fn freeblock_template(
+    page_bytes: &[u8],
+    hdr_off: usize,
+    enc: TextEncoding,
+) -> Option<FreeblockTemplate> {
     let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
     let cell_ptr_array = hdr_off + 8;
     for i in 0..cell_count {
@@ -3071,7 +3091,11 @@ fn try_carve_spilled_cell_at(
 /// surviving local columns become a [`CellFragment`]. Returns `None` unless the
 /// salvaged prefix carries ≥ 1 distinctive cell (the §3.1 emission gate). The
 /// returned fragment's `offset` is region-local; the caller translates it.
-fn salvage_local_prefix(region: &[u8], sc: &SpilledCell, enc: TextEncoding) -> Option<CellFragment> {
+fn salvage_local_prefix(
+    region: &[u8],
+    sc: &SpilledCell,
+    enc: TextEncoding,
+) -> Option<CellFragment> {
     // The body begins right after the local header; decode each column while its
     // body ends within the local payload bytes (`local_payload_off + local_len`).
     let local_end = sc.local_payload_off.checked_add(sc.local_len)?;
@@ -3350,9 +3374,32 @@ mod tests {
     }
 
     #[test]
+    fn decode_value_text_utf16_le_and_be() {
+        // The TEXT decode path honors the database encoding (file-format §1.3.1):
+        // the same code points must round-trip from both byte orders. This drives
+        // `decode_utf16` deterministically, without depending on an external
+        // `sqlite3`-minted fixture (the integration tests skip when absent).
+        // Serial 21 => text byte length (21-13)/2 = 4 = two UTF-16 code units.
+        let le = [b'h', 0x00, b'i', 0x00];
+        let (v, n) = decode_value(&le, 0, 21, TextEncoding::Utf16Le).unwrap();
+        assert_eq!(v, Value::Text("hi".into()));
+        assert_eq!(n, 4);
+        let be = [0x00, b'h', 0x00, b'i'];
+        let (v, n) = decode_value(&be, 0, 21, TextEncoding::Utf16Be).unwrap();
+        assert_eq!(v, Value::Text("hi".into()));
+        assert_eq!(n, 4);
+    }
+
+    #[test]
     fn decode_value_int_literals() {
-        assert_eq!(decode_value(&[], 0, 8, TextEncoding::Utf8).unwrap(), (Value::Integer(0), 0));
-        assert_eq!(decode_value(&[], 0, 9, TextEncoding::Utf8).unwrap(), (Value::Integer(1), 0));
+        assert_eq!(
+            decode_value(&[], 0, 8, TextEncoding::Utf8).unwrap(),
+            (Value::Integer(0), 0)
+        );
+        assert_eq!(
+            decode_value(&[], 0, 9, TextEncoding::Utf8).unwrap(),
+            (Value::Integer(1), 0)
+        );
     }
 
     #[test]
@@ -3727,7 +3774,14 @@ mod tests {
         assert_eq!(f.missing, 1, "c2 did not decode");
         assert!((f.confidence - 0.2).abs() < f32::EPSILON);
         let cells = db.reconstruct_freeblock_records(&page);
-        assert!(cells.iter().all(|c| c.offset != 64));
+        // The page's only freeblock anchor is the truncated one at offset 64, and
+        // full reconstruction recovers nothing from it — so the full-record set is
+        // empty. Asserting emptiness is the precise, deterministic intent.
+        assert!(
+            cells.is_empty(),
+            "the truncated anchor yields no full record, got {}",
+            cells.len()
+        );
     }
 
     /// (b) A surviving column whose body cannot fit ends the prefix early —
@@ -4262,9 +4316,13 @@ mod tests {
         let db = Database::open(synth_clobbered_spill_db(true)).unwrap();
         let page2 = db.raw_page(2).unwrap();
         let recovered = db.carve_overflow_template_records(page2);
-        assert!(recovered
-            .iter()
-            .all(|(c, _)| !matches!(c.values.get(1), Some(Value::Text(t)) if t == "Zoe")));
+        // A chain routed through the freelist trunk is rejected outright, so the
+        // template carve recovers no full row at all (not merely no "Zoe" row).
+        assert!(
+            recovered.is_empty(),
+            "a trunk-routed broken chain must yield no full row, got {} rows",
+            recovered.len()
+        );
     }
 
     #[test]
@@ -4356,11 +4414,13 @@ mod tests {
     fn carve_overflow_records_rejects_trunk_chain() {
         let db = Database::open(synth_gap_spill_db(true, 4200, "Nora")).unwrap();
         let page2 = db.raw_page(2).unwrap();
-        // Chain routed at the trunk -> no full row.
-        assert!(db
-            .carve_overflow_records(page2)
-            .iter()
-            .all(|(c, _)| !matches!(c.values.get(1), Some(Value::Text(t)) if t == "Nora")));
+        // Chain routed at the trunk -> no full row recovered at all.
+        let recovered = db.carve_overflow_records(page2);
+        assert!(
+            recovered.is_empty(),
+            "a trunk-routed chain must yield no full overflow row, got {} rows",
+            recovered.len()
+        );
     }
 
     #[test]
@@ -4437,13 +4497,15 @@ mod tests {
             .surviving
             .iter()
             .any(|(i, v)| *i == 0 && matches!(v, Value::Integer(9))));
-        // An intact chain produces NO fragment (it is a full row instead).
+        // An intact chain produces NO fragment (it is a full row instead), so the
+        // fragment set is empty — assert that directly rather than over a vacuous
+        // per-fragment predicate.
         let ok = Database::open(synth_gap_spill_db(false, 4200, "Nora")).unwrap();
         let ok_page = ok.raw_page(2).unwrap();
-        assert!(ok.carve_overflow_fragments(ok_page).iter().all(|f| !f
-            .surviving
-            .iter()
-            .any(|(_, v)| matches!(v, Value::Text(t) if t == "Nora"))));
+        assert!(
+            ok.carve_overflow_fragments(ok_page).is_empty(),
+            "an intact chain yields a full row, not a fragment"
+        );
         // Non-leaf / empty inputs yield nothing.
         assert!(db.carve_overflow_fragments(&[0x05u8; 4096]).is_empty());
         assert!(db.carve_overflow_fragments(&[]).is_empty());

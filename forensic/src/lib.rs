@@ -801,7 +801,7 @@ fn fragment_matches_columns(frag: &CarvedFragment, row: &[Value]) -> bool {
 fn dedup_fragments(mut frags: Vec<CarvedFragment>) -> Vec<CarvedFragment> {
     use std::collections::HashSet;
     // More surviving columns first, so the kept copy of each identity is richest.
-    frags.sort_by(|a, b| b.surviving.len().cmp(&a.surviving.len()));
+    frags.sort_by_key(|f| std::cmp::Reverse(f.surviving.len()));
     let mut seen_anchor: HashSet<(u32, usize)> = HashSet::new();
     let mut seen_values: HashSet<String> = HashSet::new();
     let mut kept = Vec::new();
@@ -983,4 +983,57 @@ pub fn audit_carved_findings(db: &Database, column_count: usize, source: &Source
             .to_finding(source.clone())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dedup_fragments, CarvedFragment, RecoverySource};
+    use sqlite_core::Value;
+
+    fn frag(page: u32, offset: usize, surviving: Vec<(usize, Value)>) -> CarvedFragment {
+        let missing = 3usize.saturating_sub(surviving.len());
+        CarvedFragment {
+            page,
+            offset,
+            surviving,
+            missing,
+            confidence: 0.2,
+            source: RecoverySource::InPageFreeBlock,
+            wal: None,
+        }
+    }
+
+    /// `dedup_fragments` orders by survivor count (richest kept), drops a repeated
+    /// `(page, offset)` anchor, and collapses a value-level duplicate at a fresh
+    /// anchor — exercising both dedup arms and the survivor-count sort over a
+    /// multi-element input (a single-element vector never invokes the comparator).
+    #[test]
+    fn dedup_keeps_richest_and_drops_duplicates() {
+        let rich = frag(
+            1,
+            10,
+            vec![(0, Value::Integer(1)), (1, Value::Text("a".into()))],
+        );
+        let poor_same_anchor = frag(1, 10, vec![(0, Value::Integer(1))]);
+        let value_dup_new_anchor = frag(
+            2,
+            20,
+            vec![(0, Value::Integer(1)), (1, Value::Text("a".into()))],
+        );
+
+        let out = dedup_fragments(vec![poor_same_anchor, rich, value_dup_new_anchor]);
+
+        // The richest copy of the shared identity survives; the poorer same-anchor
+        // copy and the value-identical fresh-anchor copy are both dropped.
+        assert_eq!(
+            out.len(),
+            1,
+            "duplicates collapse to the richest single copy"
+        );
+        assert_eq!(
+            out[0].surviving.len(),
+            2,
+            "the 2-column copy is the one kept"
+        );
+    }
 }

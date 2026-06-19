@@ -9,9 +9,11 @@
 //! gracefully when the fixtures are absent so a clean checkout still passes.
 //!
 //! Generator:
-//!   sqlite3 utf16le.sqlite "PRAGMA page_size=512; PRAGMA encoding='UTF-16le';
-//!     CREATE TABLE t(s TEXT); INSERT INTO t VALUES('héllo wörld');"
-//!   sqlite3 utf8.sqlite    "PRAGMA ...; PRAGMA encoding='UTF-8';    ... ;"
+//! ```text
+//! sqlite3 utf16le.sqlite "PRAGMA page_size=512; PRAGMA encoding='UTF-16le';
+//!   CREATE TABLE t(s TEXT); INSERT INTO t VALUES('héllo wörld');"
+//! sqlite3 utf8.sqlite    "PRAGMA ...; PRAGMA encoding='UTF-8';    ... ;"
+//! ```
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -27,7 +29,10 @@ fn fixture(name: &str) -> Option<PathBuf> {
     if p.exists() {
         Some(p)
     } else {
-        eprintln!("SKIP — real fixture not present: {} (see corpus-catalog.md)", p.display());
+        eprintln!(
+            "SKIP — real fixture not present: {} (see corpus-catalog.md)",
+            p.display()
+        );
         None
     }
 }
@@ -48,7 +53,9 @@ fn read_only_text(path: &Path) -> String {
 #[test]
 fn utf8_database_text_decodes_correctly() {
     // Control: the UTF-8 database already decodes correctly today.
-    let Some(p) = fixture("utf8.sqlite") else { return };
+    let Some(p) = fixture("utf8.sqlite") else {
+        return;
+    };
     assert_eq!(read_only_text(&p), "héllo wörld");
 }
 
@@ -56,7 +63,9 @@ fn utf8_database_text_decodes_correctly() {
 fn utf16le_database_text_decodes_correctly() {
     // A real UTF-16LE database: text must decode via the header's encoding, not
     // be lossy-UTF-8-decoded into U+FFFD mojibake.
-    let Some(p) = fixture("utf16le.sqlite") else { return };
+    let Some(p) = fixture("utf16le.sqlite") else {
+        return;
+    };
     assert_eq!(
         read_only_text(&p),
         "héllo wörld",
@@ -68,6 +77,12 @@ fn utf16le_database_text_decodes_correctly() {
 fn utf16be_database_text_decodes_correctly() {
     // The UTF-16BE branch is exercised by a real big-endian database — not left
     // synthetic-only (the validation-axis trap this whole audit exists to avoid).
-    let Some(p) = fixture("utf16be.sqlite") else { return };
-    assert_eq!(read_only_text(&p), "héllo wörld", "UTF-16BE must decode per header byte 56");
+    let Some(p) = fixture("utf16be.sqlite") else {
+        return;
+    };
+    assert_eq!(
+        read_only_text(&p),
+        "héllo wörld",
+        "UTF-16BE must decode per header byte 56"
+    );
 }

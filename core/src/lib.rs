@@ -1254,7 +1254,50 @@ impl Database {
     /// panic-free: an unreadable schema yields an empty vector.
     #[must_use]
     pub fn live_tables(&self) -> Vec<attribution::LiveTable> {
-        unimplemented!("RED")
+        let mut tables = Vec::new();
+        let Ok(schema) = self.read_table(1, 5) else {
+            return tables; // cov:unreachable: a validly-opened DB has a readable page-1 schema
+        };
+        for row in schema {
+            // sqlite_master row: (type, name, tbl_name, rootpage, sql).
+            let is_table = matches!(row.values.first(), Some(Value::Text(t)) if t == "table");
+            if !is_table {
+                continue;
+            }
+            let Some(Value::Text(name)) = row.values.get(1) else {
+                continue; // cov:unreachable: a 'table' schema row always has a TEXT name
+            };
+            if name.starts_with("sqlite_") {
+                continue;
+            }
+            let Some(Value::Integer(root)) = row.values.get(3) else {
+                continue; // cov:unreachable: a 'table' schema row always has an integer rootpage
+            };
+            let Ok(rootpage) = u32::try_from(*root) else {
+                continue; // cov:unreachable: a real rootpage is a small positive page number
+            };
+            // The CREATE TABLE statement (column 5). A non-TEXT/absent sql is
+            // possible on a damaged schema — degrade to no parsed columns.
+            let sql = match row.values.get(4) {
+                Some(Value::Text(s)) => s.as_str(),
+                _ => "", // cov:unreachable: a 'table' schema row carries its CREATE TABLE sql
+            };
+            let defs = attribution::column_defs(sql);
+            let affinities = defs.as_ref().map_or_else(Vec::new, |d| {
+                d.iter()
+                    .map(|(_, ty)| attribution::column_affinity(ty))
+                    .collect()
+            });
+            // Only trust parsed names; if parsing failed, the caller uses c0..cN.
+            let column_names = defs.map(|d| d.into_iter().map(|(n, _)| n).collect());
+            tables.push(attribution::LiveTable {
+                name: name.clone(),
+                rootpage,
+                column_names,
+                affinities,
+            });
+        }
+        tables
     }
 
     /// A map from each **allocated** page that belongs to a live table's b-tree
@@ -1266,7 +1309,53 @@ impl Database {
     /// malformed b-tree contributes fewer entries rather than erroring.
     #[must_use]
     pub fn page_to_table_map(&self) -> std::collections::BTreeMap<u32, String> {
-        unimplemented!("RED")
+        let mut map = std::collections::BTreeMap::new();
+        for table in self.live_tables() {
+            let mut pages = std::collections::BTreeSet::new();
+            let mut visited = 0usize;
+            self.collect_pages(table.rootpage, &mut pages, &mut visited);
+            for page in pages {
+                map.insert(page, table.name.clone());
+            }
+        }
+        map
+    }
+
+    /// Walk the table b-tree rooted at `page`, inserting every page it visits
+    /// (interior + leaf) into `pages`. Best-effort and bounded, mirroring
+    /// [`Database::collect_rowids`].
+    fn collect_pages(
+        &self,
+        page: u32,
+        pages: &mut std::collections::BTreeSet<u32>,
+        visited: &mut usize,
+    ) {
+        *visited += 1;
+        if *visited > MAX_PAGES_PER_WALK {
+            return; // cov:unreachable: test b-trees are far below the 1M-page cap
+        }
+        if page == 0 || !pages.insert(page) {
+            return; // page 0 sentinel, or already visited (cycle guard)
+        }
+        let Ok(slice) = self.page_slice(page) else {
+            return; // cov:unreachable: schema rootpages and their children are in range
+        };
+        let hdr_off = if page == 1 { SQLITE_HEADER_SIZE } else { 0 };
+        let Some(&page_type) = slice.get(hdr_off) else {
+            return; // cov:unreachable: a full page slice always has its header byte
+        };
+        if page_type != 0x05 {
+            return; // leaf (0x0d) or non-interior: no children to descend
+        }
+        let cell_count = be_u16(slice, hdr_off + 3) as usize;
+        let cell_ptr_array = hdr_off + 12;
+        for i in 0..cell_count {
+            let cell_off = be_u16(slice, cell_ptr_array + i * 2) as usize;
+            let child = be_u32(slice, cell_off);
+            self.collect_pages(child, pages, visited);
+        }
+        let right = be_u32(slice, hdr_off + 8);
+        self.collect_pages(right, pages, visited);
     }
 
     /// Walk the table b-tree rooted at `page`, decoding every live leaf cell's

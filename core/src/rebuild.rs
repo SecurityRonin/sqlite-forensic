@@ -105,7 +105,7 @@ pub fn build_recovered_db_tables(tables: &[RecoveredTable]) -> Vec<u8> {
             rows: t.rows.clone(),
         })
         .collect();
-    build_from_specs(specs)
+    build_from_specs(&specs)
 }
 
 /// Logical page size of the rebuilt database. 4096 is `SQLite`'s modern default
@@ -170,13 +170,13 @@ pub fn build_recovered_db_with_fragments(
     // Page 1 is the schema (sqlite_master) leaf; each table's b-tree starts after
     // it. Build the table b-trees first (so we know each root page) while emitting
     // overflow pages after the b-trees.
-    build_from_specs(specs)
+    build_from_specs(&specs)
 }
 
 /// Shared back end: bulk-load each [`TableSpec`]'s b-tree, then write page 1's
 /// `sqlite_master` leaf with one schema row per table. Used by both the
 /// records/fragments path and the general [`build_recovered_db_tables`] path.
-fn build_from_specs(specs: Vec<TableSpec>) -> Vec<u8> {
+fn build_from_specs(specs: &[TableSpec]) -> Vec<u8> {
     // Page 1 is the schema (sqlite_master) leaf; each table's b-tree starts after
     // it. Build the table b-trees first (so we know each root page) while emitting
     // overflow pages after the b-trees.

@@ -281,18 +281,21 @@ fn run_carve_rebuild(args: &CarveArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// Collect the rebuilt db's two record sets from the evidence: the full (Tier-1)
-/// rows always, and the Tier-2 fragments when `args.wants_fragments()` (else
-/// `None`, which omits the fragment table).
+/// The evidence handle plus the carved record/fragment sets a rebuild needs:
+/// the open [`Database`] (so attribution can read its live schema), the full
+/// Tier-1 records, and the optional Tier-2 fragments.
+type RebuildInputs = (Database, Vec<CarvedRecord>, Option<Vec<CarvedFragment>>);
+
+/// Collect the rebuilt db's record sets from the evidence: the open database, the
+/// full (Tier-1) rows always, and the Tier-2 fragments when
+/// `args.wants_fragments()` (else `None`, which omits the fragment table).
 ///
 /// The evidence bytes are read once. Fragments are sourced from the **on-disk
 /// image only** (v1 has no WAL fragment pass), matching the stdout carve; so under
 /// a WAL the records use the WAL-applied view while the fragments come from the
 /// same bytes opened without the WAL. The confidence filter is a full-row policy
 /// and is not applied to fragments.
-fn collect_for_rebuild(
-    args: &CarveArgs,
-) -> Result<(Database, Vec<CarvedRecord>, Option<Vec<CarvedFragment>>), String> {
+fn collect_for_rebuild(args: &CarveArgs) -> Result<RebuildInputs, String> {
     let db_bytes = std::fs::read(&args.db)
         .map_err(|e| format!("cannot read database {}: {e}", args.db.display()))?;
 

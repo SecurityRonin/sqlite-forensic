@@ -1,6 +1,8 @@
 # cargo-deny configuration — supply-chain and licence gate.
 [graph]
 all-features = false
+# The fuzz crate is a standalone workspace; only check the main workspace.
+exclude = ["sqlite-forensic-fuzz"]
 
 [advisories]
 version = 2

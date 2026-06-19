@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sqlite_core::rebuild::RebuildRow;
+use sqlite_core::rebuild::{FragmentRow, RebuildRow};
 use sqlite_core::{Database, Value, WalTimeline};
 use sqlite_forensic::{
     carve_all_deleted_records, carve_at_commit, Anomaly, CarvedFragment, CarvedRecord,
@@ -784,6 +784,24 @@ pub fn carved_to_rebuild_row(rec: &CarvedRecord) -> RebuildRow {
         source: recovery_source_token(rec.source).to_string(),
         confidence: rec.confidence,
         cells: rec.values.clone(),
+    }
+}
+
+/// Project a carved [`CarvedFragment`] onto the writer's [`FragmentRow`] for the
+/// **separate** `recovered_fragments` table. A fragment carries no rowid (it was
+/// clobbered) and only a subset of its columns survived; each surviving
+/// `(col_index, value)` carries over verbatim — natively, so a recovered BLOB
+/// stays a BLOB — and the writer places it at `c{col_index}`. The two recovery
+/// sets stay structurally separate: a fragment is never mapped onto a
+/// [`RebuildRow`] / `recovered_records`.
+#[must_use]
+pub fn fragment_to_rebuild_row(frag: &CarvedFragment) -> FragmentRow {
+    FragmentRow {
+        page: frag.page,
+        offset: frag.offset,
+        missing: frag.missing,
+        confidence: frag.confidence,
+        surviving: frag.surviving.clone(),
     }
 }
 

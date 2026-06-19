@@ -196,7 +196,7 @@ fn default_carve_writes_rebuilt_db() {
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("recovered record") && stdout.contains("deleted_places.recovered.db"),
+        stdout.contains("record(s)") && stdout.contains("deleted_places.recovered.db"),
         "summary line must report the count and the output path, got: {stdout:?}"
     );
     // The produced file re-opens as a valid SQLite database holding our rows.

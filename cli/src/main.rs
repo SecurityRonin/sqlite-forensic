@@ -16,9 +16,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlite4n6::{
-    carve_wal_snapshots, carved_to_rebuild_row, filter_by_confidence, fragment_to_rebuild_row,
-    recovered_output_path, render_audit, render_carve, render_carve_tiered,
-    render_carve_with_snapshot, render_fragments, MinConfidence, OutputFormat,
+    build_recovered_xlsx, carve_wal_snapshots, carved_to_rebuild_row, filter_by_confidence,
+    fragment_to_rebuild_row, recovered_output_path, recovered_xlsx_path, render_audit,
+    render_carve, render_carve_tiered, render_carve_with_snapshot, render_fragments, MinConfidence,
+    OutputFormat,
 };
 use sqlite_core::rebuild::build_recovered_db_with_fragments;
 use sqlite_core::Database;
@@ -82,6 +83,10 @@ enum Commands {
     Audit(AuditArgs),
 }
 
+// Each bool is an independent CLI toggle (`--rowid-only`, `--no-wal`,
+// `--no-fragments`, `--xlsx`); a bitflags struct would only obscure the clap
+// surface, so the >3-bools lint does not apply to an args struct.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 struct CarveArgs {
     /// Path to the SQLite database file (opened read-only).
@@ -125,6 +130,14 @@ struct CarveArgs {
     /// (a fragment has no rowid). Fragments are sourced from the on-disk image only.
     #[arg(long)]
     no_fragments: bool,
+
+    /// Also write a spreadsheet `<stem>.recovered.xlsx` beside the rebuilt
+    /// `<stem>.recovered.db` (honoring `--out`'s stem). Its two sheets mirror the
+    /// rebuilt tables; image blobs are shown as in-cell thumbnails, video blobs as
+    /// a typed `video/<ext> · <size>` placeholder. A rebuild-mode-only option:
+    /// conflicts with the stdout text modes (`--format`, `--rowid-only`).
+    #[arg(long, conflicts_with = "format", conflicts_with = "rowid_only")]
+    xlsx: bool,
 }
 
 impl CarveArgs {
@@ -234,15 +247,34 @@ fn run_carve_rebuild(args: &CarveArgs) -> Result<(), String> {
     let bytes = build_recovered_db_with_fragments(&rows, frag_rows.as_deref());
     std::fs::write(&out_path, &bytes)
         .map_err(|e| format!("cannot write recovered db {}: {e}", out_path.display()))?;
+
+    // `--xlsx`: additionally write the spreadsheet companion beside the db,
+    // honoring the db's stem. Built to an in-memory buffer by the library; this
+    // shell only writes the bytes.
+    let xlsx_path = if args.xlsx {
+        let path = recovered_xlsx_path(&out_path);
+        let xlsx_bytes = build_recovered_xlsx(&rows, frag_rows.as_deref())
+            .map_err(|e| format!("cannot build recovered xlsx {}: {e}", path.display()))?;
+        std::fs::write(&path, &xlsx_bytes)
+            .map_err(|e| format!("cannot write recovered xlsx {}: {e}", path.display()))?;
+        Some(path)
+    } else {
+        None
+    };
+
+    let xlsx_suffix = xlsx_path
+        .as_ref()
+        .map(|p| format!(" (+ {})", p.display()))
+        .unwrap_or_default();
     match &fragments {
         Some(frags) => println!(
-            "wrote {} record(s) and {} fragment(s) to {}",
+            "wrote {} record(s) and {} fragment(s) to {}{xlsx_suffix}",
             records.len(),
             frags.len(),
             out_path.display()
         ),
         None => println!(
-            "wrote {} record(s) to {}",
+            "wrote {} record(s) to {}{xlsx_suffix}",
             records.len(),
             out_path.display()
         ),

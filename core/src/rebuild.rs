@@ -83,7 +83,8 @@ fn create_table_sql(max_cells: usize) -> String {
          _rowid INTEGER, _source TEXT, _confidence REAL",
     );
     for i in 0..max_cells {
-        sql.push_str(&format!(", c{i}"));
+        use std::fmt::Write as _;
+        let _ = write!(sql, ", c{i}");
     }
     sql.push(')');
     sql
@@ -287,7 +288,10 @@ impl Builder {
         page[0] = 0x05; // table-interior b-tree page
         write_u16(&mut page, 1, 0); // first freeblock = 0
                                     // The last child is the rightmost pointer; the rest are keyed cells.
-        let (rightmost, keyed) = children.split_last().expect("non-empty group");
+        let Some((rightmost, keyed)) = children.split_last() else {
+            // cov:unreachable: build_interiors only flushes non-empty groups.
+            return (self.push_page(page), 0);
+        };
         write_u32(&mut page, 8, rightmost.0); // rightmost child pointer
         write_u16(&mut page, 3, keyed.len() as u16); // cell count
 
@@ -409,12 +413,12 @@ fn encode_int(i: i64) -> (i64, Vec<u8>) {
     match i {
         0 => (8, Vec::new()),
         1 => (9, Vec::new()),
-        _ if (i8::MIN as i64..=i8::MAX as i64).contains(&i) => (1, vec![i as u8]),
-        _ if (i16::MIN as i64..=i16::MAX as i64).contains(&i) => {
+        _ if (i64::from(i8::MIN)..=i64::from(i8::MAX)).contains(&i) => (1, vec![i as u8]),
+        _ if (i64::from(i16::MIN)..=i64::from(i16::MAX)).contains(&i) => {
             (2, (i as i16).to_be_bytes().to_vec())
         }
         _ if (-(1 << 23)..(1 << 23)).contains(&i) => (3, i.to_be_bytes()[5..].to_vec()),
-        _ if (i32::MIN as i64..=i32::MAX as i64).contains(&i) => {
+        _ if (i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&i) => {
             (4, (i as i32).to_be_bytes().to_vec())
         }
         _ if (-(1 << 47)..(1 << 47)).contains(&i) => (5, i.to_be_bytes()[2..].to_vec()),

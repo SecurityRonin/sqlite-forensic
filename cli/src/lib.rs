@@ -919,6 +919,224 @@ pub fn thumbnail_png(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out.into_inner())
 }
 
+// ---- XLSX export: workbook builder ----------------------------------------
+
+use rust_xlsxwriter::{Format, Image, Workbook, Worksheet, XlsxError};
+
+/// Column width (in characters) for a cell that embeds an image thumbnail, and
+/// the matching row height (in points), so the ~160 px thumbnail is visible.
+const IMAGE_COL_WIDTH: f64 = 24.0;
+const IMAGE_ROW_HEIGHT: f64 = 120.0;
+
+/// Build an `.xlsx` workbook (as in-memory bytes) mirroring the rebuilt database:
+/// a `recovered_records` sheet always, and a `recovered_fragments` sheet when
+/// `fragments` is `Some`. Returns the bytes so `main` is a humble shell that only
+/// writes them to a file.
+///
+/// Every data row is a recovered/deleted row, so it is **marked as recovered**
+/// with a distinct light fill; the header row is bold. Cell values follow their
+/// storage class: `Null`→empty, `Integer`/`Real`→numeric, `Text`→string. A
+/// `Blob` is classified by [`classify_blob`] — an image is thumbnailed and
+/// **embedded in-cell**, a video shows a typed `video/<ext> · <size>`
+/// placeholder, and anything else (or an image that fails to decode) shows the
+/// `<blob:N bytes>` placeholder. Image decoding never panics; it falls back to
+/// the placeholder.
+pub fn build_recovered_xlsx(
+    records: &[RebuildRow],
+    fragments: Option<&[FragmentRow]>,
+) -> Result<Vec<u8>, XlsxError> {
+    let header_fmt = Format::new().set_bold();
+    // A light fill marks every data row as recovered — unmistakable that these
+    // are carved/deleted rows, not live data.
+    let recovered_fmt = Format::new().set_background_color(0x00FF_F2CC);
+
+    let mut workbook = Workbook::new();
+
+    let max_cells = records.iter().map(|r| r.cells.len()).max().unwrap_or(0);
+    let rec_sheet = workbook.add_worksheet().set_name("recovered_records")?;
+    write_records_sheet(rec_sheet, records, max_cells, &header_fmt, &recovered_fmt)?;
+
+    if let Some(frags) = fragments {
+        let cell_cols = frags
+            .iter()
+            .flat_map(|f| f.surviving.iter().map(|(idx, _)| *idx))
+            .max()
+            .map_or(0, |m| m + 1);
+        let frag_sheet = workbook.add_worksheet().set_name("recovered_fragments")?;
+        write_fragments_sheet(frag_sheet, frags, cell_cols, &header_fmt, &recovered_fmt)?;
+    }
+
+    workbook.save_to_buffer()
+}
+
+/// Write the `recovered_records` sheet: bold header
+/// `_page,_offset,_rowid,_source,_confidence,c0..c{max_cells-1}`, then one
+/// recovered-marked row per record.
+fn write_records_sheet(
+    sheet: &mut Worksheet,
+    records: &[RebuildRow],
+    max_cells: usize,
+    header_fmt: &Format,
+    recovered_fmt: &Format,
+) -> Result<(), XlsxError> {
+    let mut header = vec![
+        "_page".to_string(),
+        "_offset".to_string(),
+        "_rowid".to_string(),
+        "_source".to_string(),
+        "_confidence".to_string(),
+    ];
+    for i in 0..max_cells {
+        header.push(format!("c{i}"));
+    }
+    write_header(sheet, &header, header_fmt)?;
+
+    for (r, rec) in records.iter().enumerate() {
+        let row = r as u32 + 1;
+        write_number(sheet, row, 0, f64::from(rec.page), recovered_fmt)?;
+        write_number(sheet, row, 1, rec.offset as f64, recovered_fmt)?;
+        match rec.rowid {
+            Some(id) => write_number(sheet, row, 2, id as f64, recovered_fmt)?,
+            None => {
+                sheet.write_blank(row, 2, recovered_fmt)?;
+            }
+        }
+        sheet.write_string_with_format(row, 3, &rec.source, recovered_fmt)?;
+        write_number(sheet, row, 4, f64::from(rec.confidence), recovered_fmt)?;
+        for (c, value) in rec.cells.iter().enumerate() {
+            write_value_cell(sheet, row, 5 + c as u16, value, recovered_fmt)?;
+        }
+    }
+    Ok(())
+}
+
+/// Write the `recovered_fragments` sheet: bold header
+/// `_page,_offset,_missing,_confidence,c0..c{cell_cols-1}`, then one
+/// recovered-marked row per fragment (each surviving cell placed at `c{idx}`).
+fn write_fragments_sheet(
+    sheet: &mut Worksheet,
+    frags: &[FragmentRow],
+    cell_cols: usize,
+    header_fmt: &Format,
+    recovered_fmt: &Format,
+) -> Result<(), XlsxError> {
+    let mut header = vec![
+        "_page".to_string(),
+        "_offset".to_string(),
+        "_missing".to_string(),
+        "_confidence".to_string(),
+    ];
+    for i in 0..cell_cols {
+        header.push(format!("c{i}"));
+    }
+    write_header(sheet, &header, header_fmt)?;
+
+    for (r, frag) in frags.iter().enumerate() {
+        let row = r as u32 + 1;
+        write_number(sheet, row, 0, f64::from(frag.page), recovered_fmt)?;
+        write_number(sheet, row, 1, frag.offset as f64, recovered_fmt)?;
+        write_number(sheet, row, 2, frag.missing as f64, recovered_fmt)?;
+        write_number(sheet, row, 3, f64::from(frag.confidence), recovered_fmt)?;
+        // Columns not in `surviving` stay blank (NULL) but still recovered-marked.
+        for c in 0..cell_cols {
+            sheet.write_blank(row, 4 + c as u16, recovered_fmt)?;
+        }
+        for (idx, value) in &frag.surviving {
+            write_value_cell(sheet, row, 4 + *idx as u16, value, recovered_fmt)?;
+        }
+    }
+    Ok(())
+}
+
+/// Write a bold header row at row 0.
+fn write_header(sheet: &mut Worksheet, header: &[String], fmt: &Format) -> Result<(), XlsxError> {
+    for (c, title) in header.iter().enumerate() {
+        sheet.write_string_with_format(0, c as u16, title, fmt)?;
+    }
+    Ok(())
+}
+
+/// Write a numeric cell carrying the recovered-row fill.
+fn write_number(
+    sheet: &mut Worksheet,
+    row: u32,
+    col: u16,
+    value: f64,
+    fmt: &Format,
+) -> Result<(), XlsxError> {
+    sheet.write_number_with_format(row, col, value, fmt)?;
+    Ok(())
+}
+
+/// Render one decoded [`Value`] into a worksheet cell, all recovered-marked.
+///
+/// `Null`→blank, `Integer`/`Real`→numeric, `Text`→string. A `Blob` is presented
+/// by [`classify_blob`]: an image thumbnail embedded in-cell (with the column
+/// widened / row heightened), a typed `video/<ext> · <size>` placeholder, or the
+/// `<blob:N bytes>` placeholder for anything else / a failed decode.
+fn write_value_cell(
+    sheet: &mut Worksheet,
+    row: u32,
+    col: u16,
+    value: &Value,
+    fmt: &Format,
+) -> Result<(), XlsxError> {
+    match value {
+        Value::Null => {
+            sheet.write_blank(row, col, fmt)?;
+        }
+        Value::Integer(i) => {
+            sheet.write_number_with_format(row, col, *i as f64, fmt)?;
+        }
+        Value::Real(r) => {
+            sheet.write_number_with_format(row, col, *r, fmt)?;
+        }
+        Value::Text(t) => {
+            sheet.write_string_with_format(row, col, t, fmt)?;
+        }
+        Value::Blob(b) => write_blob_cell(sheet, row, col, b, fmt)?,
+    }
+    Ok(())
+}
+
+/// Present a recovered BLOB cell by its classified kind (see [`write_value_cell`]).
+fn write_blob_cell(
+    sheet: &mut Worksheet,
+    row: u32,
+    col: u16,
+    bytes: &[u8],
+    fmt: &Format,
+) -> Result<(), XlsxError> {
+    match classify_blob(bytes) {
+        BlobKind::Image => {
+            // Thumbnail + transcode to PNG, then embed in-cell. A decode failure
+            // (hostile carved bytes) falls back to the byte placeholder.
+            if let Some(png) = thumbnail_png(bytes) {
+                let image = Image::new_from_buffer(&png)?;
+                sheet.set_column_width(col, IMAGE_COL_WIDTH)?;
+                sheet.set_row_height(row, IMAGE_ROW_HEIGHT)?;
+                sheet.embed_image_with_format(row, col, &image, fmt)?;
+            } else {
+                sheet.write_string_with_format(row, col, blob_placeholder(bytes), fmt)?;
+            }
+        }
+        BlobKind::Video { ext } => {
+            let label = format!("video/{ext} · {}", human_size(bytes.len() as u64));
+            sheet.write_string_with_format(row, col, &label, fmt)?;
+        }
+        BlobKind::Other => {
+            sheet.write_string_with_format(row, col, blob_placeholder(bytes), fmt)?;
+        }
+    }
+    Ok(())
+}
+
+/// The `<blob:N bytes>` placeholder string (shared with the stdout `value_to_cell`
+/// contract).
+fn blob_placeholder(bytes: &[u8]) -> String {
+    format!("<blob:{} bytes>", bytes.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

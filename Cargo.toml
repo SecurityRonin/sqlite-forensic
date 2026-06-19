@@ -5,17 +5,17 @@ members = ["core", "forensic", "cli"]
 # Single source of truth for fields shared by every member (DRY): bump version /
 # edition / license here once; members inherit via `field.workspace = true`.
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
 # KNOWLEDGE-layer format constants + the shared report model (Severity/Observation).
-forensicnomicon = "0.4"
+forensicnomicon = "0.5"
 # The native reader, consumed by the forensic analyzer.
-sqlite-core = { version = "0.1.2", path = "core" }
+sqlite-core = { version = "0.2.0", path = "core" }
 # The anomaly auditor, consumed by the sqlite4n6 CLI.
-sqlite-forensic = { version = "0.1.2", path = "forensic" }
+sqlite-forensic = { version = "0.2.0", path = "forensic" }
 # CLI argument parsing.
 clap = { version = "4", features = ["derive"] }
 

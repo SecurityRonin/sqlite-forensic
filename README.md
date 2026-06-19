@@ -24,7 +24,7 @@ sqlite4n6 carve History.db          # → History.recovered.db
 $ sqlite4n6 carve History.db
 wrote 412 record(s) and 9 fragment(s) to History.recovered.db
 
-$ sqlite3 History.recovered.db 'SELECT _rowid, url FROM recovered_moz_places LIMIT 3'
+$ sqlite3 History.recovered.db 'SELECT _rowid, url FROM recovered_urls LIMIT 3'
 588|https://mail.example.com/inbox
 587|https://news.example.com/the-story-they-deleted
 586|https://example.com/account/settings

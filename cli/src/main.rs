@@ -1,23 +1,28 @@
 //! `sqlite4n6` — read-only SQLite forensic CLI.
 //!
 //! The binary is the irreducible Humble-Object shell: it parses arguments,
-//! reads the evidence file into owned bytes, opens
-//! a read-only [`Database`], drives the `sqlite4n6` library's pure decision
-//! helpers, and writes the rendered lines to stdout. **The evidence file is
-//! never written** — bytes are owned by the [`Database`] and never flushed back,
-//! and no sidecar is created. Every decision (projection, filtering, rendering)
-//! lives in the unit-tested library; this file owns only I/O.
+//! reads the evidence file into owned bytes, opens a read-only [`Database`],
+//! drives the `sqlite4n6` library's pure decision helpers, and either writes a
+//! **rebuilt recovered database** (the default) or renders the records to stdout
+//! (`--format` / `--rowid-only`). **The evidence file and its sidecars are never
+//! written** — the evidence bytes are owned by the [`Database`] and never flushed
+//! back, and the rebuilt db is a *separate* output file (guarded so it can never
+//! resolve to the evidence db or a `-wal`/`-shm`/`-journal` sidecar). Every
+//! decision (path derivation, projection, filtering, rendering) lives in the
+//! unit-tested library; this file owns only I/O.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlite4n6::{
-    carve_wal_snapshots, filter_by_confidence, render_audit, render_carve, render_carve_tiered,
-    render_carve_with_snapshot, render_fragments, MinConfidence, OutputFormat,
+    carve_wal_snapshots, carved_to_rebuild_row, filter_by_confidence, recovered_output_path,
+    render_audit, render_carve, render_carve_tiered, render_carve_with_snapshot, render_fragments,
+    MinConfidence, OutputFormat,
 };
+use sqlite_core::rebuild::build_recovered_db;
 use sqlite_core::Database;
-use sqlite_forensic::{audit, carve_all_deleted_records, carve_with_fragments};
+use sqlite_forensic::{audit, carve_all_deleted_records, carve_with_fragments, CarvedRecord};
 
 /// sqlite4n6 — read-only SQLite forensic analysis CLI.
 #[derive(Parser, Debug)]
@@ -81,9 +86,17 @@ struct CarveArgs {
     #[arg(value_name = "DB")]
     db: PathBuf,
 
-    /// Output format.
-    #[arg(long, value_enum, default_value = "table")]
-    format: FormatArg,
+    /// Render the recovered records to stdout in this format instead of writing a
+    /// rebuilt database. Omit to write a rebuilt `<stem>.recovered.db` (the
+    /// default).
+    #[arg(long, value_enum)]
+    format: Option<FormatArg>,
+
+    /// Output path for the rebuilt recovered database (default-write mode only).
+    /// Defaults to `<stem>.recovered.db` in the current directory; refused if it
+    /// resolves to the evidence db or a `-wal`/`-shm`/`-journal` sidecar.
+    #[arg(long, value_name = "PATH")]
+    out: Option<PathBuf>,
 
     /// Print only recovered rowids, one per line.
     #[arg(long)]
@@ -118,6 +131,19 @@ impl CarveArgs {
     /// rowid listing coherently excludes them rather than erroring).
     fn wants_fragments(&self) -> bool {
         !self.no_fragments && !self.rowid_only
+    }
+
+    /// Whether to write a rebuilt recovered database (the default). True only when
+    /// neither a stdout `--format` nor `--rowid-only` was given — both of those
+    /// keep the historical stdout behavior exactly.
+    fn writes_rebuilt_db(&self) -> bool {
+        self.format.is_none() && !self.rowid_only
+    }
+
+    /// The stdout format to use when NOT writing a rebuilt db: the explicit
+    /// `--format`, or `table` for the bare `--rowid-only` case.
+    fn stdout_format(&self) -> OutputFormat {
+        self.format.unwrap_or(FormatArg::Table).into()
     }
 }
 
@@ -177,6 +203,62 @@ fn resolve_wal_path(args: &CarveArgs) -> Option<PathBuf> {
 }
 
 fn run_carve(args: &CarveArgs) -> Result<(), String> {
+    if args.writes_rebuilt_db() {
+        return run_carve_rebuild(args);
+    }
+    run_carve_stdout(args)
+}
+
+/// Default mode: carve the full recovered records and write them as a rebuilt
+/// `SQLite` database (never the evidence file). The output path is derived (and
+/// guarded against the evidence set) by the pure [`recovered_output_path`]; this
+/// shell only performs the I/O.
+fn run_carve_rebuild(args: &CarveArgs) -> Result<(), String> {
+    // Resolve + guard the destination BEFORE carving, so an evidence-clobbering
+    // path fails fast and nothing is read or written under it.
+    let out_path = recovered_output_path(&args.db, args.out.as_deref())?;
+
+    let records = collect_full_records(args)?;
+    let rows: Vec<_> = records.iter().map(carved_to_rebuild_row).collect();
+    let bytes = build_recovered_db(&rows);
+    std::fs::write(&out_path, &bytes)
+        .map_err(|e| format!("cannot write recovered db {}: {e}", out_path.display()))?;
+    println!(
+        "wrote {} recovered record(s) to {}",
+        records.len(),
+        out_path.display()
+    );
+    Ok(())
+}
+
+/// Collect the full (Tier-1) recovered records, honoring the WAL resolution and
+/// the confidence filter — the record set the rebuilt db materializes. Fragments
+/// (partial, no-rowid) are intentionally excluded from the rebuilt rows.
+fn collect_full_records(args: &CarveArgs) -> Result<Vec<CarvedRecord>, String> {
+    let db_bytes = std::fs::read(&args.db)
+        .map_err(|e| format!("cannot read database {}: {e}", args.db.display()))?;
+    let records = if let Some(wal_path) = resolve_wal_path(args) {
+        let wal_bytes = std::fs::read(&wal_path)
+            .map_err(|e| format!("cannot read WAL {}: {e}", wal_path.display()))?;
+        let db = Database::open_with_wal(db_bytes, &wal_bytes)
+            .map_err(|e| format!("cannot parse database {}: {e:?}", args.db.display()))?;
+        if let Some(timeline) = db.wal_timeline() {
+            carve_wal_snapshots(&db, &timeline)
+        } else {
+            carve_all_deleted_records(&db)
+        }
+    } else {
+        let db = Database::open(db_bytes)
+            .map_err(|e| format!("cannot parse database {}: {e:?}", args.db.display()))?;
+        carve_all_deleted_records(&db)
+    };
+    Ok(filter_by_confidence(records, args.min_confidence.into()))
+}
+
+/// Stdout mode (`--format` / `--rowid-only`): the historical rendering behavior,
+/// byte-for-byte unchanged.
+fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
+    let fmt = args.stdout_format();
     // Open the main file's owned bytes (never written back, no sidecar created).
     let db_bytes = std::fs::read(&args.db)
         .map_err(|e| format!("cannot read database {}: {e}", args.db.display()))?;
@@ -197,14 +279,14 @@ fn run_carve(args: &CarveArgs) -> Result<(), String> {
             carve_all_deleted_records(&db)
         };
         let records = filter_by_confidence(records, args.min_confidence.into());
-        for line in render_carve_with_snapshot(&records, args.format.into(), args.rowid_only) {
+        for line in render_carve_with_snapshot(&records, fmt, args.rowid_only) {
             println!("{line}");
         }
         // v1 fragments are sourced from the on-disk image only (no WAL fragment
         // pass yet); print the default section under the WAL-applied view's `db`.
         if args.wants_fragments() {
             let fragments = carve_with_fragments(&db).fragments;
-            for line in render_fragments(&fragments, args.format.into()) {
+            for line in render_fragments(&fragments, fmt) {
                 println!("{line}");
             }
         }
@@ -216,15 +298,13 @@ fn run_carve(args: &CarveArgs) -> Result<(), String> {
             // Tier-1 + Tier-2 in one pass; both sections rendered together.
             let tiers = carve_with_fragments(&db);
             let full = filter_by_confidence(tiers.full, args.min_confidence.into());
-            for line in
-                render_carve_tiered(&full, &tiers.fragments, args.format.into(), args.rowid_only)
-            {
+            for line in render_carve_tiered(&full, &tiers.fragments, fmt, args.rowid_only) {
                 println!("{line}");
             }
         } else {
             let records = carve_all_deleted_records(&db);
             let records = filter_by_confidence(records, args.min_confidence.into());
-            for line in render_carve(&records, args.format.into(), args.rowid_only) {
+            for line in render_carve(&records, fmt, args.rowid_only) {
                 println!("{line}");
             }
         }

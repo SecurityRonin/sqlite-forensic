@@ -1245,6 +1245,30 @@ impl Database {
         }
     }
 
+    /// Every live (schema-present) **user** table, as [`attribution::LiveTable`]:
+    /// name, rootpage, parsed column names (or `None` when low-confidence), and
+    /// declared column affinities. Internal `sqlite_*` tables are excluded.
+    ///
+    /// The forensic attribution step uses this to know each table's real column
+    /// names (Tier-1) and its shape signature (Tier-2). Best-effort, bounded,
+    /// panic-free: an unreadable schema yields an empty vector.
+    #[must_use]
+    pub fn live_tables(&self) -> Vec<attribution::LiveTable> {
+        unimplemented!("RED")
+    }
+
+    /// A map from each **allocated** page that belongs to a live table's b-tree
+    /// to that table's name. Built by walking every live table's b-tree page set
+    /// from its rootpage (interior + leaf pages). A page carved as Tier-1
+    /// in-page residue resolves to its owning table through this map.
+    ///
+    /// Best-effort and bounded, mirroring [`Database::collect_rowids`]: a
+    /// malformed b-tree contributes fewer entries rather than erroring.
+    #[must_use]
+    pub fn page_to_table_map(&self) -> std::collections::BTreeMap<u32, String> {
+        unimplemented!("RED")
+    }
+
     /// Walk the table b-tree rooted at `page`, decoding every live leaf cell's
     /// values (column count inferred per cell) into `rows` keyed by rowid.
     /// Best-effort and bounded, mirroring [`Database::collect_rowids`].

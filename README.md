@@ -22,9 +22,9 @@ sqlite4n6 carve History.db          # → History.recovered.db
 
 ```console
 $ sqlite4n6 carve History.db
-wrote 412 recovered record(s) and 9 fragment(s) to History.recovered.db
+wrote 412 record(s) and 9 fragment(s) to History.recovered.db
 
-$ sqlite3 History.recovered.db 'SELECT _rowid, c1 FROM recovered_records LIMIT 3'
+$ sqlite3 History.recovered.db 'SELECT _rowid, url FROM recovered_moz_places LIMIT 3'
 588|https://mail.example.com/inbox
 587|https://news.example.com/the-story-they-deleted
 586|https://example.com/account/settings
@@ -62,12 +62,14 @@ cargo install --git https://github.com/SecurityRonin/sqlite-forensic sqlite4n6
 
 ## What you get
 
-By default `carve` **rebuilds a queryable SQLite database** — `<name>.recovered.db` — so there is nothing left to parse:
+By default `carve` **rebuilds a queryable SQLite database** — `<name>.recovered.db` — so there is nothing left to parse. Recovered rows are **attributed back to their source table in three honest tiers** — observed fact, forensic inference, and unknown — each in its own table, all carrying the provenance columns (`_page`, `_offset`, `_rowid`, `_source`, `_confidence`) and the carved cells in their **native types** (a recovered `BLOB` is stored byte-for-byte):
 
-- **`recovered_records`** — the full recovered rows, with provenance columns (`_page`, `_offset`, `_rowid`, `_source`, `_confidence`) and the carved cells in their **native types** (a recovered `BLOB` is stored byte-for-byte).
-- **`recovered_fragments`** — a **separate** table for Tier-2 partial salvage (a distinctive cell survived but the row's identity did not), kept distinct so a fragment is never mistaken for a full row. `--no-fragments` drops it.
+- **`recovered_<table>` — CERTAIN (observed fact).** The row was carved from a page still part of a live table's b-tree, so the owning table is known for sure; the columns are that table's **real names** (parsed from its `CREATE TABLE`). If the names cannot be parsed with confidence, the table keeps its real name but falls back to generic `c0..cN` columns — never wrong names.
+- **`recovered_inferred` — INFERRED (consistent with).** The whole page was freed, so the hard table linkage is cut. The row's **shape** (column count + per-column affinity) is matched against every surviving table; a `_table_guess` column names the candidate and `_table_match_ambiguous` (0/1) flags when more than one table is equally consistent. This is a forensic inference, never asserted as fact.
+- **`recovered_unattributed` — UNKNOWN.** Dropped-table residue, or a shape matching no surviving table — recovered in full, attributed to nothing.
+- **`recovered_fragments`** — the **separate** Tier-2 partial-salvage table (a distinctive cell survived but the row's identity did not), kept distinct so a fragment is never mistaken for a full row. `--no-fragments` drops it.
 
-Need a spreadsheet for review? Add `--xlsx` to also write `<name>.recovered.xlsx` (same stem as the rebuilt db, `--out`'s stem honored). Its two sheets mirror the rebuilt tables, every recovered row is visibly marked, and **recovered image BLOBs are shown as in-cell thumbnails** (PNG/JPEG/GIF/BMP/WebP/TIFF); a video BLOB shows a typed `video/<ext> · <size>` placeholder (first-frame extraction is deferred).
+Need a spreadsheet for review? Add `--xlsx` to also write `<name>.recovered.xlsx` (same stem as the rebuilt db, `--out`'s stem honored). It carries **one sheet per recovered table** (sheet names sanitized to Excel's rules), every recovered row is visibly marked, and **recovered image BLOBs are shown as in-cell thumbnails** (PNG/JPEG/GIF/BMP/WebP/TIFF); a video BLOB shows a typed `video/<ext> · <size>` placeholder (first-frame extraction is deferred).
 
 Want a stream instead of a file? Pick a format; want the file elsewhere? Pick a path:
 

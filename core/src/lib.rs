@@ -18,6 +18,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod attribution;
 pub mod rebuild;
 
 use forensicnomicon::sqlite::{

@@ -731,12 +731,12 @@ pub fn recovered_output_path(db: &Path, out: Option<&Path>) -> Result<PathBuf, S
 /// extension replaced by `.recovered.db`. A filename with no extension keeps its
 /// whole stem (`wal_only` → `wal_only.recovered.db`).
 fn default_recovered_filename(db: &Path) -> String {
-    let stem = db
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        // A path with no filename component (e.g. `/`) degrades to a fixed name
-        // rather than panicking — the rebuilt db is still written somewhere safe.
-        .unwrap_or_else(|| "recovered".to_string());
+    // A path with no filename component (e.g. `/`) degrades to a fixed name
+    // rather than panicking — the rebuilt db is still written somewhere safe.
+    let stem = db.file_stem().map_or_else(
+        || "recovered".to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    );
     format!("{stem}.recovered.db")
 }
 
@@ -1328,6 +1328,12 @@ mod tests {
         assert_eq!(
             recovered_output_path(Path::new("/data/wal_only"), None).unwrap(),
             PathBuf::from("wal_only.recovered.db")
+        );
+        // A path with no filename component degrades to a fixed safe name rather
+        // than panicking (exercises the no-stem fallback arm).
+        assert_eq!(
+            recovered_output_path(Path::new("/"), None).unwrap(),
+            PathBuf::from("recovered.recovered.db")
         );
     }
 

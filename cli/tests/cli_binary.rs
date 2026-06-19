@@ -380,3 +380,118 @@ fn carve_malformed_db_with_wal_exits_nonzero() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("error"), "must report the parse error");
 }
+
+// ---- stdout-mode (`--format`) error paths -----------------------------------
+// These mirror the default-mode error tests but force the `--format` (stdout)
+// branch, so the stdout carve's own read/parse error arms are exercised — the
+// default-mode carve and the stdout carve are now separate functions.
+
+/// Stdout-mode carve on a missing file is a read error: nonzero exit, diagnostic.
+#[test]
+fn carve_format_missing_file_exits_nonzero() {
+    let out = bin()
+        .args(["carve", "/no/such/database.db", "--format", "jsonl"])
+        .output()
+        .expect("run carve");
+    assert!(
+        !out.status.success(),
+        "a missing db must fail the stdout carve"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("error"), "must report the read error");
+}
+
+/// Stdout-mode carve with a malformed db and no WAL is a parse error on the
+/// on-disk path: nonzero exit.
+#[test]
+fn carve_format_malformed_db_exits_nonzero() {
+    let dir = Scratch::new("fmt_malformed");
+    let db = dir.join("evidence.db");
+    std::fs::write(&db, b"definitely not a sqlite database").unwrap();
+    let out = bin()
+        .args(["carve"])
+        .arg(&db)
+        .args(["--format", "table"])
+        .output()
+        .expect("run carve");
+    assert!(
+        !out.status.success(),
+        "malformed db must fail the stdout carve"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("error"), "must report the parse error");
+}
+
+/// Stdout-mode carve when the auto-detected `-wal` cannot be read (it is a
+/// directory) is a WAL read error on the stdout path: nonzero exit.
+#[test]
+fn carve_format_unreadable_wal_exits_nonzero() {
+    let dir = Scratch::new("fmt_walread");
+    let db = dir.join("evidence.db");
+    std::fs::write(&db, b"not a real sqlite database").unwrap();
+    std::fs::create_dir(dir.join("evidence.db-wal")).unwrap();
+
+    let out = bin()
+        .args(["carve"])
+        .arg(&db)
+        .args(["--format", "csv"])
+        .output()
+        .expect("run carve");
+    assert!(
+        !out.status.success(),
+        "unreadable WAL must fail the stdout carve"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("WAL"), "must report the WAL read error");
+}
+
+/// Stdout-mode carve with a readable `-wal` but a malformed main db is a parse
+/// error on the WAL-applied stdout path (`open_with_wal`): nonzero exit.
+#[test]
+fn carve_format_malformed_db_with_wal_exits_nonzero() {
+    let dir = Scratch::new("fmt_walparse");
+    let db = dir.join("evidence.db");
+    std::fs::write(&db, b"this is not a valid sqlite database header").unwrap();
+    std::fs::write(dir.join("evidence.db-wal"), b"bogus wal bytes").unwrap();
+
+    let out = bin()
+        .args(["carve"])
+        .arg(&db)
+        .args(["--format", "jsonl"])
+        .output()
+        .expect("run carve");
+    assert!(
+        !out.status.success(),
+        "malformed db under a WAL must fail the stdout carve"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("error"), "must report the parse error");
+}
+
+/// Default (rebuild) mode when the rebuilt db cannot be written (the `--out`
+/// directory does not exist) is a write error: nonzero exit with a diagnostic.
+#[test]
+fn carve_rebuild_write_failure_exits_nonzero() {
+    let dir = Scratch::new("rebuild_writefail");
+    let db = dir.join("evidence.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+    // A target inside a directory that does not exist → std::fs::write fails.
+    let target = dir.join("nonexistent_subdir").join("recovered.db");
+
+    let out = bin()
+        .args(["carve"])
+        .arg(&db)
+        .arg("--out")
+        .arg(&target)
+        .output()
+        .expect("run carve");
+    assert!(
+        !out.status.success(),
+        "an unwritable output path must fail the rebuild carve"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("cannot write recovered db"),
+        "must report the write error, got: {stderr}"
+    );
+}

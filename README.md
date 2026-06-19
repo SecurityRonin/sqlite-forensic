@@ -67,10 +67,13 @@ By default `carve` **rebuilds a queryable SQLite database** — `<name>.recovere
 - **`recovered_records`** — the full recovered rows, with provenance columns (`_page`, `_offset`, `_rowid`, `_source`, `_confidence`) and the carved cells in their **native types** (a recovered `BLOB` is stored byte-for-byte).
 - **`recovered_fragments`** — a **separate** table for Tier-2 partial salvage (a distinctive cell survived but the row's identity did not), kept distinct so a fragment is never mistaken for a full row. `--no-fragments` drops it.
 
+Need a spreadsheet for review? Add `--xlsx` to also write `<name>.recovered.xlsx` (same stem as the rebuilt db, `--out`'s stem honored). Its two sheets mirror the rebuilt tables, every recovered row is visibly marked, and **recovered image BLOBs are shown as in-cell thumbnails** (PNG/JPEG/GIF/BMP/WebP/TIFF); a video BLOB shows a typed `video/<ext> · <size>` placeholder (first-frame extraction is deferred).
+
 Want a stream instead of a file? Pick a format; want the file elsewhere? Pick a path:
 
 ```console
 $ sqlite4n6 carve ChatStorage.sqlite --out /cases/2026-001/recovered.db  # choose the output path
+$ sqlite4n6 carve ChatStorage.sqlite --xlsx             # also write ChatStorage.recovered.xlsx (image thumbnails in-cell)
 $ sqlite4n6 carve ChatStorage.sqlite --format table     # recovered rows to stdout (or: csv, jsonl)
 $ sqlite4n6 carve ChatStorage.sqlite --format jsonl     # one JSON object per record (BLOBs as base64)
 $ sqlite4n6 carve ChatStorage.sqlite --min-confidence medium  # drop low-confidence carves

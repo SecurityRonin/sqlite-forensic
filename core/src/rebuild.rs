@@ -64,6 +64,42 @@ pub struct FragmentRow {
     pub surviving: Vec<(usize, Value)>,
 }
 
+/// One table to materialize in a **multi-table** rebuilt database
+/// ([`build_recovered_db_tables`]): an arbitrary (SQL-identifier-quoted) table
+/// name, its full ordered column names, and its rows already projected to
+/// exactly `columns.len()` values each.
+///
+/// This is the general surface the CLI's table-attribution feature targets: it
+/// emits one `recovered_<table>` per attributed live table (with that table's
+/// real column names), plus `recovered_inferred`, `recovered_unattributed`, and
+/// `recovered_fragments`. The caller owns the column layout and row projection;
+/// the writer owns the `SQLite`-format encoding and identifier quoting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveredTable {
+    /// Table name (quoted as a SQL identifier in the emitted `CREATE TABLE`).
+    pub name: String,
+    /// Full ordered column names (quoted as SQL identifiers). Each row carries
+    /// exactly this many values.
+    pub columns: Vec<String>,
+    /// Rows, each already projected to `columns.len()` values in column order.
+    pub rows: Vec<Vec<Value>>,
+}
+
+/// Build the bytes of a valid `SQLite` database holding **N arbitrary tables**,
+/// each with its own name and column set, every identifier safely quoted.
+///
+/// The general multi-table writer behind the table-attribution feature. Each
+/// [`RecoveredTable`] becomes one b-tree (bulk-loaded, overflow-spilling exactly
+/// like the records/fragments path) with a `sqlite_master` schema row. Table and
+/// column names are emitted as quoted SQL identifiers, so a column named `order`
+/// or `first name` is legal. Rows are written with a synthetic rowid `1..=N`
+/// (the recovered rows have no meaningful rowid of their own — provenance lives
+/// in the `_rowid` column when present).
+#[must_use]
+pub fn build_recovered_db_tables(_tables: &[RecoveredTable]) -> Vec<u8> {
+    unimplemented!("RED")
+}
+
 /// Logical page size of the rebuilt database. 4096 is `SQLite`'s modern default
 /// and a power of two in the legal range; the reader/oracle accept any valid
 /// size, so this is an internal constant, never a knob.

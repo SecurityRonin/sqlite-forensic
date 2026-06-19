@@ -16,7 +16,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use sqlite_core::rebuild::{build_recovered_db, RebuildRow};
+use sqlite_core::rebuild::{
+    build_recovered_db, build_recovered_db_with_fragments, FragmentRow, RebuildRow,
+};
 use sqlite_core::Value;
 
 /// Resolve a usable `sqlite3` binary, or `None` (test then skips).
@@ -154,6 +156,106 @@ fn sqlite3_reads_rebuilt_empty_db() {
     assert_eq!(run_sql(&bin, &db, "PRAGMA integrity_check;"), "ok");
     assert_eq!(
         run_sql(&bin, &db, "SELECT count(*) FROM recovered_records;"),
+        "0"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn sqlite3_reads_two_table_db_with_fragments() {
+    let Some(bin) = sqlite3_bin() else {
+        eprintln!("SKIP sqlite3_reads_two_table_db_with_fragments: no sqlite3 (set SQLITE3_BIN)");
+        return;
+    };
+
+    let records = vec![RebuildRow {
+        page: 7,
+        offset: 128,
+        rowid: Some(42),
+        source: "freelist-page".into(),
+        confidence: 0.9,
+        cells: vec![Value::Integer(7), Value::Text("alice".into())],
+    }];
+    let fragments = vec![
+        FragmentRow {
+            page: 2,
+            offset: 3965,
+            missing: 1,
+            confidence: 0.2,
+            surviving: vec![
+                (0, Value::Integer(20004)),
+                (1, Value::Text("Anja".into())),
+                (2, Value::Text("Frank".into())),
+            ],
+        },
+        // Sparse fragment: only column 2 present, a BLOB (native storage class).
+        FragmentRow {
+            page: 5,
+            offset: 64,
+            missing: 2,
+            confidence: 0.2,
+            surviving: vec![(2, Value::Blob(vec![0xCA, 0xFE, 0xBA]))],
+        },
+    ];
+    let bytes = build_recovered_db_with_fragments(&records, Some(&fragments));
+    let db = temp_db(&bytes, "two_table");
+
+    // An external engine vouches for the whole two-b-tree file's integrity.
+    assert_eq!(run_sql(&bin, &db, "PRAGMA integrity_check;"), "ok");
+    assert_eq!(
+        run_sql(&bin, &db, "SELECT count(*) FROM recovered_records;"),
+        "1"
+    );
+    assert_eq!(
+        run_sql(&bin, &db, "SELECT count(*) FROM recovered_fragments;"),
+        "2"
+    );
+
+    // A surviving cell keeps its native storage class at its native column index.
+    assert_eq!(
+        run_sql(
+            &bin,
+            &db,
+            "SELECT typeof(c1), quote(c1) FROM recovered_fragments WHERE c0 = 20004;"
+        ),
+        "text|'Anja'"
+    );
+    // The sparse fragment: c2 is a BLOB, c0/c1 are NULL.
+    assert_eq!(
+        run_sql(
+            &bin,
+            &db,
+            "SELECT typeof(c2), quote(c2), c0 IS NULL, c1 IS NULL \
+             FROM recovered_fragments WHERE _offset = 64;"
+        ),
+        "blob|X'CAFEBA'|1|1"
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn sqlite3_reads_two_table_db_with_empty_fragment_set() {
+    let Some(bin) = sqlite3_bin() else {
+        eprintln!(
+            "SKIP sqlite3_reads_two_table_db_with_empty_fragment_set: no sqlite3 (set SQLITE3_BIN)"
+        );
+        return;
+    };
+    let records = vec![RebuildRow {
+        page: 1,
+        offset: 0,
+        rowid: Some(1),
+        source: "freelist-page".into(),
+        confidence: 0.9,
+        cells: vec![Value::Integer(1)],
+    }];
+    let bytes = build_recovered_db_with_fragments(&records, Some(&[]));
+    let db = temp_db(&bytes, "two_table_empty");
+    assert_eq!(run_sql(&bin, &db, "PRAGMA integrity_check;"), "ok");
+    // An empty-but-present fragment table is queryable and returns 0.
+    assert_eq!(
+        run_sql(&bin, &db, "SELECT count(*) FROM recovered_fragments;"),
         "0"
     );
     let _ = std::fs::remove_file(&db);

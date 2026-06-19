@@ -1188,8 +1188,30 @@ const FORBIDDEN_SHEET_CHARS: [char; 7] = [':', '\\', '/', '?', '*', '[', ']'];
 /// - de-duplicate against `taken` by appending `_<n>` (n ≥ 1), re-truncating the
 ///   base so the suffixed name still fits 31 characters.
 #[must_use]
-pub fn sanitize_sheet_name(_name: &str, _taken: &[String]) -> String {
-    unimplemented!("RED")
+pub fn sanitize_sheet_name(name: &str, taken: &[String]) -> String {
+    let mut base: String = name
+        .chars()
+        .filter(|c| !FORBIDDEN_SHEET_CHARS.contains(c))
+        .collect();
+    if base.trim().is_empty() {
+        base = "sheet".to_string();
+    }
+    let truncate_to = |s: &str, max: usize| -> String { s.chars().take(max).collect() };
+    let candidate = truncate_to(&base, MAX_SHEET_NAME);
+    if !taken.iter().any(|t| t == &candidate) {
+        return candidate;
+    }
+    // Collision: append `_<n>`, shrinking the base so the whole fits 31 chars.
+    let mut n = 1usize;
+    loop {
+        let suffix = format!("_{n}");
+        let room = MAX_SHEET_NAME.saturating_sub(suffix.chars().count());
+        let candidate = format!("{}{suffix}", truncate_to(&base, room));
+        if !taken.iter().any(|t| t == &candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Build an `.xlsx` workbook (as in-memory bytes) with **one sheet per recovered
@@ -2480,6 +2502,74 @@ mod tests {
     fn open_xlsx(buf: &[u8]) -> calamine::Xlsx<std::io::Cursor<Vec<u8>>> {
         calamine::open_workbook_from_rs(std::io::Cursor::new(buf.to_vec()))
             .expect("produced bytes must be a valid xlsx calamine can open")
+    }
+
+    #[test]
+    fn per_table_xlsx_has_one_sheet_per_recovered_table_with_sanitized_names() {
+        let tables = vec![
+            RecoveredTable {
+                name: "recovered_people".to_string(),
+                columns: ["_page", "_rowid", "name"].map(String::from).to_vec(),
+                rows: vec![vec![
+                    Value::Integer(3),
+                    Value::Integer(5),
+                    Value::Text("alice".into()),
+                ]],
+            },
+            // A name with a forbidden char + over 31 chars → sanitized + truncated.
+            RecoveredTable {
+                name: "recovered_a/very_long_table_name_that_overflows".to_string(),
+                columns: ["_page", "c0"].map(String::from).to_vec(),
+                rows: vec![vec![Value::Integer(1), Value::Integer(9)]],
+            },
+        ];
+        let buf = build_recovered_tables_xlsx(&tables).unwrap();
+        let mut wb = open_xlsx(&buf);
+        let names = wb.sheet_names();
+        assert!(names.iter().any(|n| n == "recovered_people"), "{names:?}");
+        // Sanitized: no '/', ≤ 31 chars.
+        let sanitized = names
+            .iter()
+            .find(|n| n.starts_with("recovered_avery") || n.contains("very_long"))
+            .or_else(|| names.iter().find(|n| *n != "recovered_people"))
+            .unwrap();
+        assert!(!sanitized.contains('/'));
+        assert!(sanitized.chars().count() <= 31);
+
+        // The real column name survived on the first sheet.
+        let people = wb.worksheet_range("recovered_people").unwrap();
+        let header: Vec<String> = people
+            .rows()
+            .next()
+            .unwrap()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        assert_eq!(header, vec!["_page", "_rowid", "name"]);
+    }
+
+    #[test]
+    fn per_table_xlsx_deduplicates_colliding_sheet_names() {
+        // Two tables sanitizing to the same 31-char prefix must get unique sheets.
+        let long_a = "recovered_collide_aaaaaaaaaaaaaaaaaaa_x"; // > 31
+        let long_b = "recovered_collide_aaaaaaaaaaaaaaaaaaa_y"; // same 31-char prefix
+        let tables = vec![
+            RecoveredTable {
+                name: long_a.to_string(),
+                columns: vec!["c0".to_string()],
+                rows: vec![vec![Value::Integer(1)]],
+            },
+            RecoveredTable {
+                name: long_b.to_string(),
+                columns: vec!["c0".to_string()],
+                rows: vec![vec![Value::Integer(2)]],
+            },
+        ];
+        let buf = build_recovered_tables_xlsx(&tables).unwrap();
+        let wb = open_xlsx(&buf);
+        let names = wb.sheet_names();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1], "sheet names must be unique: {names:?}");
     }
 
     #[test]

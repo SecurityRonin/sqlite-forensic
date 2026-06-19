@@ -91,6 +91,42 @@ pub fn value_to_cell(value: &Value) -> String {
     }
 }
 
+/// A single carved value as a JSON array element. A `BLOB` is emitted losslessly
+/// as a self-describing `{"blob_base64": "..."}` object — raw binary cannot be a
+/// JSON string, and base64 round-trips it exactly; every other type renders as
+/// its JSON-escaped string form (matching [`value_to_cell`]). table/CSV keep the
+/// `<blob:N bytes>` placeholder, since neither can carry raw binary safely.
+fn value_to_json(value: &Value) -> String {
+    match value {
+        Value::Blob(b) => format!("{{\"blob_base64\":\"{}\"}}", base64_encode(b)),
+        other => format!("\"{}\"", json_escape(&value_to_cell(other))),
+    }
+}
+
+/// Base64-encode bytes (RFC 4648 standard alphabet, with `=` padding).
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        out.push(ALPHABET[b0 >> 2] as char);
+        out.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[b2 & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// The rowid cell for a carved record: the decimal rowid, or `?` when the rowid
 /// is unknown/destroyed (`0`, e.g. a freeblock reconstruction).
 #[must_use]
@@ -164,10 +200,7 @@ pub fn json_escape(s: &str) -> String {
 /// is the published contract shared with the table/CSV surfaces).
 #[must_use]
 fn values_json_array(values: &[Value]) -> String {
-    let parts: Vec<String> = values
-        .iter()
-        .map(|v| format!("\"{}\"", json_escape(&value_to_cell(v))))
-        .collect();
+    let parts: Vec<String> = values.iter().map(value_to_json).collect();
     format!("[{}]", parts.join(","))
 }
 
@@ -868,6 +901,18 @@ mod tests {
         assert_eq!(json_escape("a\rb"), "a\\rb");
         assert_eq!(json_escape("a\tb"), "a\\tb");
         assert_eq!(json_escape("\u{0001}"), "\\u0001");
+    }
+
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        // RFC 4648 §10 test vectors — the canonical external reference.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
     fn anomaly() -> Anomaly {

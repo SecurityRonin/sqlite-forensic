@@ -3,6 +3,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/sponsor-h4x0r-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/h4x0r)
 
+[![CI](https://github.com/SecurityRonin/sqlite-forensic/actions/workflows/ci.yml/badge.svg)](https://github.com/SecurityRonin/sqlite-forensic/actions/workflows/ci.yml)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](#trust-but-verify)
 [![security: cargo-deny](https://img.shields.io/badge/security-cargo--deny-success.svg)](deny.toml)
 
@@ -164,7 +165,7 @@ A carver that *over*-reports is worse than useless on an evidence database — i
 
 Carved records remain **confidence-graded observations** ("consistent with a deleted row"), never a verdict. The honest summary: a strict precision discipline confirmed against independent ground truth, and a documented in-page recall gap — not a claim of perfect recall or proof of correctness.
 
-**Honest gaps (tracked, not hidden):** there is **no CI workflow** and **no line-coverage gate** in this repo yet, and the carver is **not yet fuzzed** — all three are planned to bring it level with the Paranoid-Gatekeeper bar the rest of the fleet enforces. The safety lints (`unsafe_code = forbid`, `unwrap_used`/`expect_used = deny`) and the `cargo-deny` supply-chain gate *are* enforced today.
+**Enforced in CI (the fleet's Paranoid-Gatekeeper bar):** every push and PR runs `rustfmt`, Clippy (`-D warnings`), the full test suite on Linux/macOS/Windows, a **100%-function-coverage** gate (`cargo llvm-cov --fail-under-functions 100`), `cargo-deny` (licenses + advisories + sources), an MSRV build (1.96), a `gitleaks` secret scan, and docs-as-error. The safety lints (`unsafe_code = forbid`, `unwrap_used`/`expect_used = deny`) hold at compile time. Three **libFuzzer harnesses** — over `Database::open`, the carver, and the auditor — are built and checked in CI; run a campaign with `cargo +nightly fuzz run <target>`. The one substantive limitation remains the **documented in-page recall gap** above — not a coverage or tooling gap.
 
 ---
 

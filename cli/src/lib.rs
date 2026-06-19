@@ -850,12 +850,204 @@ pub fn group_attributed_tables(
 /// directly unit-testable.
 #[must_use]
 pub fn group_into_tables(
-    _records: &[CarvedRecord],
-    _attributions: &[Attribution],
-    _live_tables: &[sqlite_core::attribution::LiveTable],
-    _fragments: Option<&[CarvedFragment]>,
+    records: &[CarvedRecord],
+    attributions: &[Attribution],
+    live_tables: &[sqlite_core::attribution::LiveTable],
+    fragments: Option<&[CarvedFragment]>,
 ) -> Vec<RecoveredTable> {
-    unimplemented!("RED")
+    // Tier-1: one bucket per attributed live table, first-seen order preserved.
+    let mut known_order: Vec<String> = Vec::new();
+    let mut known: std::collections::HashMap<String, Vec<&CarvedRecord>> =
+        std::collections::HashMap::new();
+    // Tier-2: parallel records + their (guess, ambiguous); Tier-3: records only.
+    let mut inferred: Vec<(&CarvedRecord, &str, bool)> = Vec::new();
+    let mut unattributed: Vec<&CarvedRecord> = Vec::new();
+
+    for (rec, attr) in records.iter().zip(attributions) {
+        match attr {
+            Attribution::Known(name) => {
+                known.entry(name.clone()).or_insert_with(|| {
+                    known_order.push(name.clone());
+                    Vec::new()
+                });
+                if let Some(bucket) = known.get_mut(name) {
+                    bucket.push(rec);
+                }
+            }
+            Attribution::Inferred { guess, ambiguous } => {
+                inferred.push((rec, guess.as_str(), *ambiguous));
+            }
+            Attribution::Unattributed => unattributed.push(rec),
+        }
+    }
+
+    let mut out: Vec<RecoveredTable> = Vec::new();
+
+    // Tier-1 — CERTAIN: recovered_<table> with real names when confident.
+    for table_name in &known_order {
+        let Some(recs) = known.get(table_name) else {
+            continue; // cov:unreachable: known_order mirrors known's keys
+        };
+        let max_cells = recs.iter().map(|r| r.values.len()).max().unwrap_or(0);
+        let real_names = live_tables
+            .iter()
+            .find(|t| &t.name == table_name)
+            .and_then(|t| t.column_names.as_ref())
+            .filter(|names| names.len() == max_cells)
+            .cloned();
+        let cell_cols = match &real_names {
+            Some(names) => names.clone(),
+            None => generic_cell_columns(max_cells),
+        };
+        let columns = provenance_columns_then(&cell_cols);
+        let rows = recs
+            .iter()
+            .map(|r| record_row_values(r, max_cells))
+            .collect();
+        out.push(RecoveredTable {
+            name: format!("recovered_{table_name}"),
+            columns,
+            rows,
+        });
+    }
+
+    // Tier-2 — INFERRED: a single recovered_inferred with guess + ambiguity.
+    if !inferred.is_empty() {
+        let max_cells = inferred
+            .iter()
+            .map(|(r, _, _)| r.values.len())
+            .max()
+            .unwrap_or(0);
+        let mut columns: Vec<String> = PROVENANCE_COLS.iter().map(|s| (*s).to_string()).collect();
+        columns.push("_table_guess".to_string());
+        columns.push("_table_match_ambiguous".to_string());
+        columns.extend(generic_cell_columns(max_cells));
+        let rows = inferred
+            .iter()
+            .map(|(r, guess, ambiguous)| {
+                let mut v = provenance_values(r);
+                v.push(Value::Text((*guess).to_string()));
+                v.push(Value::Integer(i64::from(*ambiguous)));
+                v.extend(cell_values(r, max_cells));
+                v
+            })
+            .collect();
+        out.push(RecoveredTable {
+            name: "recovered_inferred".to_string(),
+            columns,
+            rows,
+        });
+    }
+
+    // Tier-3 — UNATTRIBUTED: generic recovered_unattributed.
+    if !unattributed.is_empty() {
+        let max_cells = unattributed
+            .iter()
+            .map(|r| r.values.len())
+            .max()
+            .unwrap_or(0);
+        let columns = provenance_columns_then(&generic_cell_columns(max_cells));
+        let rows = unattributed
+            .iter()
+            .map(|r| record_row_values(r, max_cells))
+            .collect();
+        out.push(RecoveredTable {
+            name: "recovered_unattributed".to_string(),
+            columns,
+            rows,
+        });
+    }
+
+    // Fragments: the existing recovered_fragments table, schema unchanged.
+    if let Some(frags) = fragments {
+        out.push(fragments_table(frags));
+    }
+
+    out
+}
+
+/// `c0..c{n-1}` generic cell column names.
+fn generic_cell_columns(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("c{i}")).collect()
+}
+
+/// The five provenance columns followed by `cell_cols`.
+fn provenance_columns_then(cell_cols: &[String]) -> Vec<String> {
+    let mut columns: Vec<String> = PROVENANCE_COLS.iter().map(|s| (*s).to_string()).collect();
+    columns.extend_from_slice(cell_cols);
+    columns
+}
+
+/// The five provenance values for a record: page, offset, rowid (NULL when 0),
+/// source token, confidence.
+fn provenance_values(rec: &CarvedRecord) -> Vec<Value> {
+    vec![
+        Value::Integer(i64::from(rec.page)),
+        Value::Integer(rec.offset as i64),
+        if rec.rowid == 0 {
+            Value::Null
+        } else {
+            Value::Integer(rec.rowid)
+        },
+        Value::Text(recovery_source_token(rec.source).to_string()),
+        Value::Real(f64::from(rec.confidence)),
+    ]
+}
+
+/// A record's `max_cells` cells, padding missing trailing cells with NULL.
+fn cell_values(rec: &CarvedRecord, max_cells: usize) -> Vec<Value> {
+    (0..max_cells)
+        .map(|i| rec.values.get(i).cloned().unwrap_or(Value::Null))
+        .collect()
+}
+
+/// Full row for a provenance-only table (Tier-1 / Tier-3): provenance + cells.
+fn record_row_values(rec: &CarvedRecord, max_cells: usize) -> Vec<Value> {
+    let mut v = provenance_values(rec);
+    v.extend(cell_values(rec, max_cells));
+    v
+}
+
+/// Build the `recovered_fragments` [`RecoveredTable`], schema unchanged:
+/// `_page,_offset,_missing,_confidence,c0..c{M}` where each surviving
+/// `(idx, value)` lands at `c{idx}` and other cells are NULL.
+fn fragments_table(frags: &[CarvedFragment]) -> RecoveredTable {
+    let cell_cols = frags
+        .iter()
+        .flat_map(|f| f.surviving.iter().map(|(idx, _)| *idx))
+        .max()
+        .map_or(0, |m| m + 1);
+    let mut columns = vec![
+        "_page".to_string(),
+        "_offset".to_string(),
+        "_missing".to_string(),
+        "_confidence".to_string(),
+    ];
+    columns.extend(generic_cell_columns(cell_cols));
+    let rows = frags
+        .iter()
+        .map(|f| {
+            let mut v = vec![
+                Value::Integer(i64::from(f.page)),
+                Value::Integer(f.offset as i64),
+                Value::Integer(f.missing as i64),
+                Value::Real(f64::from(f.confidence)),
+            ];
+            let mut cells = vec![Value::Null; cell_cols];
+            for (idx, value) in &f.surviving {
+                if let Some(slot) = cells.get_mut(*idx) {
+                    *slot = value.clone();
+                }
+            }
+            v.extend(cells);
+            v
+        })
+        .collect();
+    RecoveredTable {
+        name: "recovered_fragments".to_string(),
+        columns,
+        rows,
+    }
 }
 
 // ---- XLSX export: blob classification + human size ------------------------
@@ -980,6 +1172,73 @@ use rust_xlsxwriter::{Format, Image, Workbook, Worksheet, XlsxError};
 /// the matching row height (in points), so the ~160 px thumbnail is visible.
 const IMAGE_COL_WIDTH: f64 = 24.0;
 const IMAGE_ROW_HEIGHT: f64 = 120.0;
+
+/// Excel's hard limit on worksheet-name length (characters).
+const MAX_SHEET_NAME: usize = 31;
+
+/// The characters Excel forbids in a worksheet name.
+const FORBIDDEN_SHEET_CHARS: [char; 7] = [':', '\\', '/', '?', '*', '[', ']'];
+
+/// Sanitize a recovered-table name into a **valid, unique** Excel worksheet
+/// name given the names already `taken` (in assignment order):
+///
+/// - strip the characters Excel forbids (`: \ / ? * [ ]`);
+/// - a blank result becomes `sheet`;
+/// - truncate to 31 characters;
+/// - de-duplicate against `taken` by appending `_<n>` (n ≥ 1), re-truncating the
+///   base so the suffixed name still fits 31 characters.
+#[must_use]
+pub fn sanitize_sheet_name(_name: &str, _taken: &[String]) -> String {
+    unimplemented!("RED")
+}
+
+/// Build an `.xlsx` workbook (as in-memory bytes) with **one sheet per recovered
+/// table**, mirroring the rebuilt multi-table database. Each sheet's name is the
+/// table name run through [`sanitize_sheet_name`] (≤ 31 chars, forbidden
+/// characters stripped, de-duplicated). The header row is bold and every data
+/// row carries the recovered-row fill; cell values follow their storage class
+/// (a `Blob` image is thumbnailed and embedded in-cell, exactly as before).
+pub fn build_recovered_tables_xlsx(tables: &[RecoveredTable]) -> Result<Vec<u8>, XlsxError> {
+    let header_fmt = Format::new().set_bold();
+    let recovered_fmt = Format::new().set_background_color(0x00FF_F2CC);
+    let mut workbook = Workbook::new();
+    let mut taken: Vec<String> = Vec::new();
+    for table in tables {
+        let sheet_name = sanitize_sheet_name(&table.name, &taken);
+        taken.push(sheet_name.clone());
+        let sheet = workbook.add_worksheet().set_name(&sheet_name)?;
+        write_table_sheet(sheet, table, &header_fmt, &recovered_fmt)?;
+    }
+    workbook.save_to_buffer()
+}
+
+/// Build the per-table recovered `.xlsx` bytes, mapping any [`XlsxError`] to an
+/// actionable string keyed by `path`.
+pub fn recovered_tables_xlsx_bytes(
+    tables: &[RecoveredTable],
+    path: &Path,
+) -> Result<Vec<u8>, String> {
+    build_recovered_tables_xlsx(tables)
+        .map_err(|e| format!("cannot build recovered xlsx {}: {e}", path.display()))
+}
+
+/// Write one [`RecoveredTable`] to a worksheet: bold header from `columns`, then
+/// one recovered-marked row per row, each cell by storage class.
+fn write_table_sheet(
+    sheet: &mut Worksheet,
+    table: &RecoveredTable,
+    header_fmt: &Format,
+    recovered_fmt: &Format,
+) -> Result<(), XlsxError> {
+    write_header(sheet, &table.columns, header_fmt)?;
+    for (r, values) in table.rows.iter().enumerate() {
+        let row = r as u32 + 1;
+        for (c, value) in values.iter().enumerate() {
+            write_value_cell(sheet, row, c as u16, value, recovered_fmt)?;
+        }
+    }
+    Ok(())
+}
 
 /// Build an `.xlsx` workbook (as in-memory bytes) mirroring the rebuilt database:
 /// a `recovered_records` sheet always, and a `recovered_fragments` sheet when
@@ -1423,6 +1682,46 @@ mod tests {
             cols_of(&tables, "recovered_fragments"),
             ["_page", "_offset", "_missing", "_confidence", "c0"].map(String::from)
         );
+    }
+
+    #[test]
+    fn sheet_name_strips_forbidden_chars() {
+        assert_eq!(
+            sanitize_sheet_name(r"recovered_a:b/c\d?e*f[g]h", &[]),
+            "recovered_abcdefgh"
+        );
+    }
+
+    #[test]
+    fn sheet_name_truncates_to_31_chars() {
+        let long = "recovered_a_very_long_table_name_exceeding_limit";
+        let s = sanitize_sheet_name(long, &[]);
+        assert!(s.chars().count() <= 31, "got {} chars", s.chars().count());
+        assert_eq!(s, &long[..31]);
+    }
+
+    #[test]
+    fn sheet_name_blank_becomes_sheet() {
+        assert_eq!(sanitize_sheet_name("[]:", &[]), "sheet");
+    }
+
+    #[test]
+    fn sheet_name_deduplicates() {
+        let taken = vec!["recovered_t".to_string()];
+        assert_eq!(sanitize_sheet_name("recovered_t", &taken), "recovered_t_1");
+        let taken2 = vec!["recovered_t".to_string(), "recovered_t_1".to_string()];
+        assert_eq!(sanitize_sheet_name("recovered_t", &taken2), "recovered_t_2");
+    }
+
+    #[test]
+    fn sheet_name_dedup_retruncates_to_fit_suffix() {
+        // A 31-char name that collides must shrink to fit "_1" within 31.
+        let base = "recovered_xxxxxxxxxxxxxxxxxxxxx"; // 31 chars
+        assert_eq!(base.chars().count(), 31);
+        let taken = vec![base.to_string()];
+        let s = sanitize_sheet_name(base, &taken);
+        assert!(s.chars().count() <= 31);
+        assert!(s.ends_with("_1"));
     }
 
     #[test]

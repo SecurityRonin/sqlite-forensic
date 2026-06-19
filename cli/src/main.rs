@@ -16,11 +16,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlite4n6::{
-    carve_wal_snapshots, carved_to_rebuild_row, filter_by_confidence, fragment_to_rebuild_row,
-    recovered_output_path, recovered_xlsx_bytes, recovered_xlsx_path, render_audit, render_carve,
+    carve_wal_snapshots, filter_by_confidence, group_attributed_tables, recovered_output_path,
+    recovered_tables_xlsx_bytes, recovered_xlsx_path, render_audit, render_carve,
     render_carve_tiered, render_carve_with_snapshot, render_fragments, MinConfidence, OutputFormat,
 };
-use sqlite_core::rebuild::build_recovered_db_with_fragments;
+use sqlite_core::rebuild::build_recovered_db_tables;
 use sqlite_core::Database;
 use sqlite_forensic::{
     audit, carve_all_deleted_records, carve_with_fragments, CarvedFragment, CarvedRecord,
@@ -237,22 +237,23 @@ fn run_carve_rebuild(args: &CarveArgs) -> Result<(), String> {
     // `--no-fragments` the fragment set is `None`, omitting the table (single-table
     // db, as before); when enabled but none are found, an empty table is still
     // created (predictable).
-    let (records, fragments) = collect_for_rebuild(args)?;
-    let rows: Vec<_> = records.iter().map(carved_to_rebuild_row).collect();
-    let frag_rows: Option<Vec<_>> = fragments
-        .as_ref()
-        .map(|frags| frags.iter().map(fragment_to_rebuild_row).collect());
+    let (db, records, fragments) = collect_for_rebuild(args)?;
+    // Group every carved record into its attribution tier: recovered_<table>
+    // (CERTAIN, real column names), recovered_inferred (consistent-with + an
+    // ambiguity flag), recovered_unattributed (unknown), plus recovered_fragments
+    // (unchanged). The db and the xlsx are built from this same table set.
+    let tables = group_attributed_tables(&db, &records, fragments.as_deref());
 
-    let bytes = build_recovered_db_with_fragments(&rows, frag_rows.as_deref());
+    let bytes = build_recovered_db_tables(&tables);
     std::fs::write(&out_path, &bytes)
         .map_err(|e| format!("cannot write recovered db {}: {e}", out_path.display()))?;
 
     // `--xlsx`: additionally write the spreadsheet companion beside the db,
-    // honoring the db's stem. Built to an in-memory buffer by the library; this
-    // shell only writes the bytes.
+    // honoring the db's stem. One sheet per recovered table (sanitized name),
+    // built to an in-memory buffer by the library; this shell only writes bytes.
     let xlsx_path = if args.xlsx {
         let path = recovered_xlsx_path(&out_path);
-        let xlsx_bytes = recovered_xlsx_bytes(&rows, frag_rows.as_deref(), &path)?;
+        let xlsx_bytes = recovered_tables_xlsx_bytes(&tables, &path)?;
         std::fs::write(&path, &xlsx_bytes)
             .map_err(|e| format!("cannot write recovered xlsx {}: {e}", path.display()))?;
         Some(path)
@@ -291,7 +292,7 @@ fn run_carve_rebuild(args: &CarveArgs) -> Result<(), String> {
 /// and is not applied to fragments.
 fn collect_for_rebuild(
     args: &CarveArgs,
-) -> Result<(Vec<CarvedRecord>, Option<Vec<CarvedFragment>>), String> {
+) -> Result<(Database, Vec<CarvedRecord>, Option<Vec<CarvedFragment>>), String> {
     let db_bytes = std::fs::read(&args.db)
         .map_err(|e| format!("cannot read database {}: {e}", args.db.display()))?;
 
@@ -326,7 +327,7 @@ fn collect_for_rebuild(
     let fragments = args
         .wants_fragments()
         .then(|| carve_with_fragments(&db).fragments);
-    Ok((records, fragments))
+    Ok((db, records, fragments))
 }
 
 /// Stdout mode (`--format` / `--rowid-only`): the historical rendering behavior,

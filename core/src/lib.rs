@@ -18,6 +18,8 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod rebuild;
+
 use forensicnomicon::sqlite::{
     SQLITE_FREELIST_TRUNK_OFFSET, SQLITE_HEADER_SIZE, SQLITE_MAGIC, SQLITE_PAGE_SIZE_OFFSET,
 };
@@ -1521,7 +1523,7 @@ impl Database {
 /// Number of payload bytes stored locally on a table-leaf page for a record of
 /// `total` bytes, given the page's `usable` size (file-format §1.6 overflow
 /// rule). When the return value equals `total`, the record does not spill.
-fn local_payload_len(total: usize, usable: usize) -> usize {
+pub(crate) fn local_payload_len(total: usize, usable: usize) -> usize {
     let max_local = usable - 35; // X: largest payload kept entirely local
     if total <= max_local {
         return total;
@@ -3308,7 +3310,7 @@ fn varint_len(value: i64) -> usize {
 
 /// Minimal `SQLite` varint encoding of a non-negative `value` (task #73). 7-bit
 /// big-endian groups, high bit set on every group but the last (file-format §2).
-fn enc_varint_into(value: usize) -> Vec<u8> {
+pub(crate) fn enc_varint_into(value: usize) -> Vec<u8> {
     if value == 0 {
         return vec![0];
     }

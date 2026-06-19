@@ -19,14 +19,15 @@ fn data_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/data")
 }
 
-/// `carve` with the default (table) format recovers deleted records from a real
-/// database with deletions and exits 0. Default output keeps the Tier-2 fragment
-/// section, so this also drives the fragment render + dedup path.
+/// `carve --format table` renders deleted records from a real database with
+/// deletions to stdout and exits 0. The table stdout mode keeps the Tier-2
+/// fragment section, so this also drives the fragment render + dedup path.
 #[test]
 fn carve_table_happy_path() {
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("deleted_places.db"))
+        .args(["--format", "table"])
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve must exit 0");
@@ -72,27 +73,32 @@ fn carve_rowid_only_prints_integers() {
     }
 }
 
-/// `--no-fragments` opts into the high-precision full-row-only output and still
-/// exits 0.
+/// `--no-fragments` opts into the high-precision full-row-only stdout output and
+/// still exits 0 (a stdout-mode flag, paired here with `--format table`).
 #[test]
 fn carve_no_fragments() {
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("deleted_places.db"))
-        .args(["--no-fragments"])
+        .args(["--format", "table", "--no-fragments"])
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve --no-fragments must exit 0");
 }
 
 /// A `-wal` sidecar co-located with the database is auto-detected (the
-/// `resolve_wal_path` auto-detect branch), so the WAL-applied N-snapshot carve
-/// runs and exits 0.
+/// `resolve_wal_path` auto-detect branch), so the WAL-applied carve runs and
+/// exits 0. Driven in default write-mode with `--out` to a scratch path so the
+/// rebuilt db lands in isolation (and the WAL branch of `collect_full_records`
+/// is exercised).
 #[test]
 fn carve_auto_detects_wal_sidecar() {
+    let dir = Scratch::new("wal_auto");
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("wal_places.db"))
+        .arg("--out")
+        .arg(dir.join("recovered.db"))
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve over a WAL db must exit 0");
@@ -102,10 +108,13 @@ fn carve_auto_detects_wal_sidecar() {
 /// `resolve_wal_path` opt-out branch) and still exits 0.
 #[test]
 fn carve_no_wal_uses_on_disk_only() {
+    let dir = Scratch::new("wal_off");
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("wal_places.db"))
         .args(["--no-wal"])
+        .arg("--out")
+        .arg(dir.join("recovered.db"))
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve --no-wal must exit 0");
@@ -115,11 +124,14 @@ fn carve_no_wal_uses_on_disk_only() {
 /// explicit branch).
 #[test]
 fn carve_explicit_wal_path() {
+    let dir = Scratch::new("wal_explicit");
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("wal_places.db"))
         .arg("--wal")
         .arg(data_dir().join("wal_places.db-wal"))
+        .arg("--out")
+        .arg(dir.join("recovered.db"))
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve --wal <path> must exit 0");

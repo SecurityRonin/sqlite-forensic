@@ -7,6 +7,9 @@
 //! unit-testable. `main()` is the thin shell that only reads the evidence file
 //! and writes the rendered lines to stdout.
 
+use std::path::{Path, PathBuf};
+
+use sqlite_core::rebuild::RebuildRow;
 use sqlite_core::{Database, Value, WalTimeline};
 use sqlite_forensic::{
     carve_all_deleted_records, carve_at_commit, Anomaly, CarvedFragment, CarvedRecord,
@@ -697,6 +700,93 @@ fn render_audit_jsonl(anomalies: &[Anomaly]) -> Vec<String> {
         .collect()
 }
 
+// ---- rebuilt-db output (default carve behavior) ----------------------------
+
+/// Resolve the output path for the rebuilt recovered database, enforcing the
+/// forensic-soundness guard.
+///
+/// With no `--out`, the path is `<stem>.recovered.db` in the **current working
+/// directory** (`History.db` → `History.recovered.db`), never beside the
+/// evidence. An explicit `out` overrides it. Either way the resolved path is
+/// **refused** (an `Err`) when it equals the evidence database or any of its
+/// `-wal` / `-shm` / `-journal` sidecars, so a rebuilt db can never overwrite the
+/// evidence set. This is the pure decision the binary shell delegates to.
+pub fn recovered_output_path(db: &Path, out: Option<&Path>) -> Result<PathBuf, String> {
+    let resolved = match out {
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from(default_recovered_filename(db)),
+    };
+    if let Some(clash) = evidence_path_clash(db, &resolved) {
+        return Err(format!(
+            "refusing to write recovered db to {} — it is the evidence {}; \
+             choose a different --out",
+            resolved.display(),
+            clash
+        ));
+    }
+    Ok(resolved)
+}
+
+/// The default recovered-db filename: the input's filename with its final
+/// extension replaced by `.recovered.db`. A filename with no extension keeps its
+/// whole stem (`wal_only` → `wal_only.recovered.db`).
+fn default_recovered_filename(db: &Path) -> String {
+    let stem = db
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        // A path with no filename component (e.g. `/`) degrades to a fixed name
+        // rather than panicking — the rebuilt db is still written somewhere safe.
+        .unwrap_or_else(|| "recovered".to_string());
+    format!("{stem}.recovered.db")
+}
+
+/// If `out` names the evidence db or one of its sidecars, return a label for the
+/// clashing file; otherwise `None`. Comparison uses canonicalized paths when both
+/// exist (so `./a` and `a` match), falling back to a lexical compare.
+fn evidence_path_clash(db: &Path, out: &Path) -> Option<&'static str> {
+    if same_path(db, out) {
+        return Some("database");
+    }
+    for (suffix, label) in [
+        ("-wal", "-wal sidecar"),
+        ("-shm", "-shm sidecar"),
+        ("-journal", "-journal sidecar"),
+    ] {
+        let mut name = db.as_os_str().to_owned();
+        name.push(suffix);
+        if same_path(&PathBuf::from(name), out) {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// Whether two paths denote the same file. Prefers `canonicalize` (resolves
+/// `.`/`..`/symlinks for existing files); when neither resolves, compares the
+/// lexical paths so a guard still fires before any file exists.
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
+}
+
+/// Project a carved record onto the writer's [`RebuildRow`], preserving native
+/// cell types (a recovered BLOB stays a BLOB). A rowid of `0` — unknown/destroyed
+/// (e.g. freeblock reconstruction) — maps to `None` so the rebuilt `_rowid` is
+/// NULL rather than a fabricated 0.
+#[must_use]
+pub fn carved_to_rebuild_row(rec: &CarvedRecord) -> RebuildRow {
+    RebuildRow {
+        page: rec.page,
+        offset: rec.offset,
+        rowid: (rec.rowid != 0).then_some(rec.rowid),
+        source: recovery_source_token(rec.source).to_string(),
+        confidence: rec.confidence,
+        cells: rec.values.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,8 +1311,6 @@ mod tests {
     }
 
     // ---- rebuilt-db output: path derivation + safety guard -----------------
-
-    use std::path::{Path, PathBuf};
 
     #[test]
     fn default_output_path_is_stem_recovered_db_in_cwd() {

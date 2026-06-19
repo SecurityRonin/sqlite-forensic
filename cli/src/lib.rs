@@ -2079,6 +2079,26 @@ mod tests {
     }
 
     #[test]
+    fn xlsx_path_replaces_db_extension_with_xlsx() {
+        // The xlsx path is the recovered-db path with its extension swapped, so
+        // it honors --out's stem: /p/foo.db -> /p/foo.xlsx.
+        assert_eq!(
+            recovered_xlsx_path(Path::new("/p/foo.db")),
+            PathBuf::from("/p/foo.xlsx")
+        );
+        // Default derived db name -> matching xlsx name.
+        assert_eq!(
+            recovered_xlsx_path(Path::new("History.recovered.db")),
+            PathBuf::from("History.recovered.xlsx")
+        );
+        // A path with no extension gains `.xlsx`.
+        assert_eq!(
+            recovered_xlsx_path(Path::new("/p/recovered")),
+            PathBuf::from("/p/recovered.xlsx")
+        );
+    }
+
+    #[test]
     fn xlsx_empty_records_still_builds_with_header() {
         // No records: the sheet still exists with the lead-column header.
         let buf = build_recovered_xlsx(&[], None).unwrap();

@@ -407,4 +407,38 @@ mod tests {
             "--rowid-only implies the fragment section is omitted"
         );
     }
+
+    /// `--xlsx` is an addition to the default rebuild mode: it parses, sets the
+    /// flag, and leaves the rebuilt-db write path active.
+    #[test]
+    fn xlsx_flag_parses_in_rebuild_mode() {
+        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "--xlsx"]);
+        assert!(args.xlsx, "--xlsx must set the flag");
+        assert!(
+            args.writes_rebuilt_db(),
+            "--xlsx stays in the rebuilt-db (default) write mode"
+        );
+    }
+
+    /// `--xlsx` is a rebuild-mode-only concern; it conflicts with the stdout text
+    /// modes so clap rejects the combination rather than silently ignoring it.
+    #[test]
+    fn xlsx_conflicts_with_stdout_modes() {
+        for argv in [
+            &[
+                "sqlite4n6",
+                "carve",
+                "db.sqlite",
+                "--xlsx",
+                "--format",
+                "csv",
+            ][..],
+            &["sqlite4n6", "carve", "db.sqlite", "--xlsx", "--rowid-only"][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "--xlsx must conflict with {argv:?}"
+            );
+        }
+    }
 }

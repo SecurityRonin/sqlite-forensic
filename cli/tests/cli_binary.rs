@@ -19,6 +19,39 @@ fn data_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/data")
 }
 
+/// Resolve a usable `sqlite3` binary, or `None` (the test then skips). Mirrors the
+/// skip-if-absent pattern in `core/tests/rebuild_sqlite3_oracle.rs`.
+fn sqlite3_bin() -> Option<String> {
+    let bin = std::env::var("SQLITE3_BIN").unwrap_or_else(|_| "sqlite3".to_string());
+    Command::new(&bin)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|_| bin)
+}
+
+/// Run `sqlite3 <db> "<sql>"` and return trimmed stdout.
+fn sqlite3_query(bin: &str, db: &Path, sql: &str) -> String {
+    let out = Command::new(bin)
+        .arg(db)
+        .arg(sql)
+        .output()
+        .expect("sqlite3 must execute");
+    assert!(
+        out.status.success(),
+        "sqlite3 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// The on-disk fixture that surfaces a Tier-2 fragment by default (id 20004
+/// "Anja"/"Frank" — the same case the forensic crate's fragment tests assert).
+fn fragment_fixture() -> PathBuf {
+    data_dir().join("nemetz/0D/0D-01.db")
+}
+
 /// `carve --format table` renders deleted records from a real database with
 /// deletions to stdout and exits 0. The table stdout mode keeps the Tier-2
 /// fragment section, so this also drives the fragment render + dedup path.
@@ -493,5 +526,105 @@ fn carve_rebuild_write_failure_exits_nonzero() {
     assert!(
         stderr.contains("cannot write recovered db"),
         "must report the write error, got: {stderr}"
+    );
+}
+
+// ---- two-table rebuilt db: recovered_fragments alongside recovered_records ---
+
+/// Default `carve` on a fixture that surfaces a fragment must write a rebuilt db
+/// in which the real `sqlite3` engine sees BOTH `recovered_records` AND
+/// `recovered_fragments`, the fragment table holding the surviving evidence (the
+/// id-20004 "Anja" fragment). The summary line reports both counts. Skips cleanly
+/// when `sqlite3` is unavailable.
+#[test]
+fn default_carve_writes_both_tables_with_fragments() {
+    let Some(sqlite3) = sqlite3_bin() else {
+        eprintln!("SKIP default_carve_writes_both_tables_with_fragments: no sqlite3");
+        return;
+    };
+    let dir = Scratch::new("rebuild_frags");
+    let db = dir.join("0D-01.db");
+    std::fs::copy(fragment_fixture(), &db).unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "0D-01.db"])
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "default carve must exit 0");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("record(s)") && stdout.contains("fragment(s)"),
+        "summary must report both records and fragments, got: {stdout:?}"
+    );
+
+    let produced = dir.join("0D-01.recovered.db");
+    assert!(produced.exists(), "rebuilt db must be written");
+
+    // The external engine lists both user tables.
+    let tables = sqlite3_query(
+        &sqlite3,
+        &produced,
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
+    );
+    assert!(
+        tables.contains("recovered_records"),
+        "recovered_records present: {tables}"
+    );
+    assert!(
+        tables.contains("recovered_fragments"),
+        "recovered_fragments present: {tables}"
+    );
+
+    // The fragment table carries the surviving distinctive cell.
+    let count = sqlite3_query(
+        &sqlite3,
+        &produced,
+        "SELECT count(*) FROM recovered_fragments WHERE c0 = 20004;",
+    );
+    assert_eq!(
+        count, "1",
+        "the id-20004 fragment landed in the fragment table"
+    );
+}
+
+/// `--no-fragments` writes a single-table rebuilt db: `sqlite3` sees ONLY
+/// `recovered_records`, never `recovered_fragments`, and the summary reports just
+/// the record count. Skips cleanly when `sqlite3` is unavailable.
+#[test]
+fn no_fragments_writes_only_recovered_records() {
+    let Some(sqlite3) = sqlite3_bin() else {
+        eprintln!("SKIP no_fragments_writes_only_recovered_records: no sqlite3");
+        return;
+    };
+    let dir = Scratch::new("rebuild_nofrags");
+    let db = dir.join("0D-01.db");
+    std::fs::copy(fragment_fixture(), &db).unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "0D-01.db", "--no-fragments"])
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "carve --no-fragments must exit 0");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("record(s)") && !stdout.contains("fragment(s)"),
+        "summary must report records only, got: {stdout:?}"
+    );
+
+    let produced = dir.join("0D-01.recovered.db");
+    let tables = sqlite3_query(
+        &sqlite3,
+        &produced,
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
+    );
+    assert!(
+        tables.contains("recovered_records"),
+        "recovered_records present: {tables}"
+    );
+    assert!(
+        !tables.contains("recovered_fragments"),
+        "--no-fragments must omit the fragment table: {tables}"
     );
 }

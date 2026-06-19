@@ -1,0 +1,43 @@
+[package]
+name = "sqlite-forensic-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Standalone workspace: cargo-fuzz builds this crate in isolation, not as a
+# member of the main workspace it fuzzes.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1"
+
+[dependencies.sqlite-core]
+path = "../core"
+
+[dependencies.sqlite-forensic]
+path = "../forensic"
+
+[[bin]]
+name = "database_open"
+path = "fuzz_targets/database_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "carve"
+path = "fuzz_targets/carve.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit"
+path = "fuzz_targets/audit.rs"
+test = false
+doc = false
+bench = false

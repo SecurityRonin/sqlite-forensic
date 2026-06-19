@@ -979,6 +979,19 @@ pub fn build_recovered_xlsx(
     workbook.save_to_buffer()
 }
 
+/// Build the recovered `.xlsx` bytes, mapping any [`XlsxError`] to an actionable
+/// string keyed by `path` (the file the bytes are destined for). This is the
+/// String-returning façade the binary shell calls, so `main` carries no inline
+/// xlsx error-formatting closure.
+pub fn recovered_xlsx_bytes(
+    records: &[RebuildRow],
+    fragments: Option<&[FragmentRow]>,
+    path: &Path,
+) -> Result<Vec<u8>, String> {
+    build_recovered_xlsx(records, fragments)
+        .map_err(|e| format!("cannot build recovered xlsx {}: {e}", path.display()))
+}
+
 /// Write the `recovered_records` sheet: bold header
 /// `_page,_offset,_rowid,_source,_confidence,c0..c{max_cells-1}`, then one
 /// recovered-marked row per record.
@@ -2089,6 +2102,33 @@ mod tests {
         let recs = wb.worksheet_range("recovered_records").unwrap();
         let cell = recs.rows().nth(1).unwrap()[5].to_string();
         assert_eq!(cell, format!("<blob:{} bytes>", bad.len()));
+    }
+
+    #[test]
+    fn recovered_xlsx_bytes_returns_buffer_for_valid_rows() {
+        // The String-returning façade yields the same valid xlsx buffer for valid
+        // input (the error mapping is keyed by the destination path).
+        let records = vec![rebuild_row(Some(1), vec![Value::Integer(7)])];
+        let buf =
+            recovered_xlsx_bytes(&records, None, Path::new("/out/foo.recovered.xlsx")).unwrap();
+        let wb = open_xlsx(&buf);
+        assert!(wb.sheet_names().iter().any(|n| n == "recovered_records"));
+    }
+
+    #[test]
+    fn recovered_xlsx_bytes_maps_build_error_to_string() {
+        // A record wider than Excel's 16,384-column limit makes the builder emit
+        // an XlsxError; the façade maps it to an actionable, path-keyed string
+        // (exercising the error arm — a real in-domain limit, not a contrived
+        // failure). The lead columns push the cell columns past the limit.
+        let huge = vec![Value::Integer(0); 17_000];
+        let records = vec![rebuild_row(Some(1), huge)];
+        let err = recovered_xlsx_bytes(&records, None, Path::new("/out/wide.xlsx"))
+            .expect_err("an over-wide record must fail the build");
+        assert!(
+            err.contains("recovered xlsx") && err.contains("wide.xlsx"),
+            "the error is path-keyed and actionable: {err}"
+        );
     }
 
     #[test]

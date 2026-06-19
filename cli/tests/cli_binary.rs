@@ -405,6 +405,38 @@ fn carve_xlsx_includes_fragment_sheet() {
     );
 }
 
+/// `--xlsx` when the xlsx companion cannot be written (its path is occupied by a
+/// directory, while the rebuilt `.db` writes fine) is a write error: nonzero exit
+/// with the xlsx diagnostic. Exercises the xlsx-write error arm specifically (the
+/// `.db` write succeeds first, so this is the xlsx path failing on its own).
+#[test]
+fn carve_xlsx_write_failure_exits_nonzero() {
+    let dir = Scratch::new("xlsx_writefail");
+    let db = dir.join("evidence.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+    // Occupy the derived xlsx path with a directory so writing the file there
+    // fails, while the sibling `.db` path remains writable.
+    std::fs::create_dir(dir.join("recovered.xlsx")).unwrap();
+
+    let out = bin()
+        .args(["carve"])
+        .arg(&db)
+        .arg("--xlsx")
+        .arg("--out")
+        .arg(dir.join("recovered.db"))
+        .output()
+        .expect("run carve --xlsx");
+    assert!(
+        !out.status.success(),
+        "an unwritable xlsx path must fail the carve"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("recovered xlsx"),
+        "must report the xlsx write error, got: {stderr}"
+    );
+}
+
 /// `--xlsx` is refused in the stdout text modes (`--format`): clap rejects the
 /// combination with a nonzero exit rather than silently ignoring the flag.
 #[test]

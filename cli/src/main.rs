@@ -16,10 +16,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlite4n6::{
-    build_recovered_xlsx, carve_wal_snapshots, carved_to_rebuild_row, filter_by_confidence,
-    fragment_to_rebuild_row, recovered_output_path, recovered_xlsx_path, render_audit,
-    render_carve, render_carve_tiered, render_carve_with_snapshot, render_fragments, MinConfidence,
-    OutputFormat,
+    carve_wal_snapshots, carved_to_rebuild_row, filter_by_confidence, fragment_to_rebuild_row,
+    recovered_output_path, recovered_xlsx_bytes, recovered_xlsx_path, render_audit, render_carve,
+    render_carve_tiered, render_carve_with_snapshot, render_fragments, MinConfidence, OutputFormat,
 };
 use sqlite_core::rebuild::build_recovered_db_with_fragments;
 use sqlite_core::Database;
@@ -253,8 +252,7 @@ fn run_carve_rebuild(args: &CarveArgs) -> Result<(), String> {
     // shell only writes the bytes.
     let xlsx_path = if args.xlsx {
         let path = recovered_xlsx_path(&out_path);
-        let xlsx_bytes = build_recovered_xlsx(&rows, frag_rows.as_deref())
-            .map_err(|e| format!("cannot build recovered xlsx {}: {e}", path.display()))?;
+        let xlsx_bytes = recovered_xlsx_bytes(&rows, frag_rows.as_deref(), &path)?;
         std::fs::write(&path, &xlsx_bytes)
             .map_err(|e| format!("cannot write recovered xlsx {}: {e}", path.display()))?;
         Some(path)

@@ -9,11 +9,11 @@
 
 use std::path::{Path, PathBuf};
 
-use sqlite_core::rebuild::{FragmentRow, RebuildRow};
+use sqlite_core::rebuild::{FragmentRow, RebuildRow, RecoveredTable};
 use sqlite_core::{Database, Value, WalTimeline};
 use sqlite_forensic::{
-    carve_all_deleted_records, carve_at_commit, Anomaly, CarvedFragment, CarvedRecord,
-    RecoverySource,
+    attribute_records, carve_all_deleted_records, carve_at_commit, Anomaly, Attribution,
+    CarvedFragment, CarvedRecord, RecoverySource,
 };
 
 /// Output rendering format, shared by `carve` and `audit`.
@@ -815,6 +815,49 @@ pub fn fragment_to_rebuild_row(frag: &CarvedFragment) -> FragmentRow {
     }
 }
 
+// ---- table attribution → recovered tables ---------------------------------
+
+/// The fixed provenance columns every recovered table carries before its cells.
+const PROVENANCE_COLS: [&str; 5] = ["_page", "_offset", "_rowid", "_source", "_confidence"];
+
+/// Group carved records into the attribution-tiered [`RecoveredTable`] set that
+/// both the rebuilt db and the xlsx are built from:
+///
+/// - **Tier 1 (CERTAIN):** one `recovered_<table>` per attributed live table,
+///   with that table's **real** column names when the parse is confident AND its
+///   column count equals the record's cell count — otherwise generic `c0..cN`
+///   (never wrong names). Always prefixed by the provenance columns.
+/// - **Tier 2 (INFERRED):** a single `recovered_inferred` with generic `c0..cN`,
+///   plus `_table_guess` (TEXT) and `_table_match_ambiguous` (INTEGER 0/1).
+/// - **Tier 3 (UNATTRIBUTED):** `recovered_unattributed` with generic `c0..cN`.
+///
+/// `fragments`, when `Some`, is appended as the existing `recovered_fragments`
+/// table (schema unchanged: `_page,_offset,_missing,_confidence,c0..cM`). Empty
+/// tiers are omitted; the row order within each table follows `records`.
+#[must_use]
+pub fn group_attributed_tables(
+    db: &Database,
+    records: &[CarvedRecord],
+    fragments: Option<&[CarvedFragment]>,
+) -> Vec<RecoveredTable> {
+    let attributions = attribute_records(db, records);
+    group_into_tables(records, &attributions, &db.live_tables(), fragments)
+}
+
+/// Pure core of [`group_attributed_tables`]: given the records, their parallel
+/// attributions, the live-table schema (for real Tier-1 column names), and the
+/// fragments, produce the ordered [`RecoveredTable`] set. No DB access, so it is
+/// directly unit-testable.
+#[must_use]
+pub fn group_into_tables(
+    _records: &[CarvedRecord],
+    _attributions: &[Attribution],
+    _live_tables: &[sqlite_core::attribution::LiveTable],
+    _fragments: Option<&[CarvedFragment]>,
+) -> Vec<RecoveredTable> {
+    unimplemented!("RED")
+}
+
 // ---- XLSX export: blob classification + human size ------------------------
 
 /// How a recovered BLOB should be presented in the XLSX export.
@@ -1182,6 +1225,204 @@ mod tests {
             wal: None,
             overflow: None,
         }
+    }
+
+    use sqlite_core::attribution::{Affinity, LiveTable};
+
+    fn live(name: &str, cols: &[&str], affs: Vec<Affinity>) -> LiveTable {
+        LiveTable {
+            name: name.to_string(),
+            rootpage: 2,
+            column_names: Some(cols.iter().map(|s| (*s).to_string()).collect()),
+            affinities: affs,
+        }
+    }
+
+    fn cols_of<'a>(tables: &'a [RecoveredTable], name: &str) -> &'a [String] {
+        &tables
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("missing table {name}"))
+            .columns
+    }
+
+    #[test]
+    fn tier1_known_uses_real_column_names_when_arity_matches() {
+        let people = live(
+            "people",
+            &["id", "name"],
+            vec![Affinity::Integer, Affinity::Text],
+        );
+        let records = vec![rec(
+            5,
+            0.7,
+            RecoverySource::InPageFreeBlock,
+            vec![Value::Integer(1), Value::Text("a".into())],
+        )];
+        let attrs = vec![Attribution::Known("people".to_string())];
+        let tables = group_into_tables(&records, &attrs, std::slice::from_ref(&people), None);
+        assert_eq!(
+            cols_of(&tables, "recovered_people"),
+            [
+                "_page",
+                "_offset",
+                "_rowid",
+                "_source",
+                "_confidence",
+                "id",
+                "name"
+            ]
+            .map(String::from)
+        );
+    }
+
+    #[test]
+    fn tier1_known_falls_back_to_generic_when_arity_mismatches() {
+        // The record has 3 cells but the table declares 2 columns → never emit
+        // wrong names; fall back to c0..c2 while keeping the real table name.
+        let people = live(
+            "people",
+            &["id", "name"],
+            vec![Affinity::Integer, Affinity::Text],
+        );
+        let records = vec![rec(
+            5,
+            0.7,
+            RecoverySource::InPageFreeBlock,
+            vec![
+                Value::Integer(1),
+                Value::Text("a".into()),
+                Value::Integer(9),
+            ],
+        )];
+        let attrs = vec![Attribution::Known("people".to_string())];
+        let tables = group_into_tables(&records, &attrs, std::slice::from_ref(&people), None);
+        assert_eq!(
+            cols_of(&tables, "recovered_people"),
+            [
+                "_page",
+                "_offset",
+                "_rowid",
+                "_source",
+                "_confidence",
+                "c0",
+                "c1",
+                "c2"
+            ]
+            .map(String::from)
+        );
+    }
+
+    #[test]
+    fn tier2_inferred_has_guess_and_ambiguity_columns() {
+        let records = vec![
+            rec(
+                0,
+                0.9,
+                RecoverySource::FreelistPage,
+                vec![Value::Integer(1)],
+            ),
+            rec(
+                0,
+                0.9,
+                RecoverySource::FreelistPage,
+                vec![Value::Integer(2)],
+            ),
+        ];
+        let attrs = vec![
+            Attribution::Inferred {
+                guess: "people".to_string(),
+                ambiguous: false,
+            },
+            Attribution::Inferred {
+                guess: "notes".to_string(),
+                ambiguous: true,
+            },
+        ];
+        let tables = group_into_tables(&records, &attrs, &[], None);
+        assert_eq!(
+            cols_of(&tables, "recovered_inferred"),
+            [
+                "_page",
+                "_offset",
+                "_rowid",
+                "_source",
+                "_confidence",
+                "_table_guess",
+                "_table_match_ambiguous",
+                "c0"
+            ]
+            .map(String::from)
+        );
+        let inferred = tables
+            .iter()
+            .find(|t| t.name == "recovered_inferred")
+            .unwrap();
+        assert_eq!(inferred.rows.len(), 2);
+        // Row 0: guess "people", ambiguous 0.
+        assert_eq!(inferred.rows[0][5], Value::Text("people".into()));
+        assert_eq!(inferred.rows[0][6], Value::Integer(0));
+        // Row 1: guess "notes", ambiguous 1.
+        assert_eq!(inferred.rows[1][5], Value::Text("notes".into()));
+        assert_eq!(inferred.rows[1][6], Value::Integer(1));
+    }
+
+    #[test]
+    fn tier3_unattributed_is_generic() {
+        let records = vec![rec(
+            7,
+            0.5,
+            RecoverySource::DroppedTable,
+            vec![Value::Integer(1), Value::Integer(2)],
+        )];
+        let attrs = vec![Attribution::Unattributed];
+        let tables = group_into_tables(&records, &attrs, &[], None);
+        assert_eq!(
+            cols_of(&tables, "recovered_unattributed"),
+            [
+                "_page",
+                "_offset",
+                "_rowid",
+                "_source",
+                "_confidence",
+                "c0",
+                "c1"
+            ]
+            .map(String::from)
+        );
+    }
+
+    #[test]
+    fn empty_tiers_are_omitted_and_fragments_appended() {
+        let records = vec![rec(
+            0,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Integer(1)],
+        )];
+        let attrs = vec![Attribution::Inferred {
+            guess: "people".to_string(),
+            ambiguous: false,
+        }];
+        let frags = vec![CarvedFragment {
+            page: 2,
+            offset: 3965,
+            surviving: vec![(0, Value::Integer(20004))],
+            missing: 1,
+            confidence: 0.2,
+            source: RecoverySource::FreeblockReconstructed,
+            wal: None,
+        }];
+        let tables = group_into_tables(&records, &attrs, &[], Some(&frags));
+        let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        // Only the inferred tier + fragments — no empty recovered_unattributed.
+        assert!(names.contains(&"recovered_inferred"));
+        assert!(names.contains(&"recovered_fragments"));
+        assert!(!names.contains(&"recovered_unattributed"));
+        assert_eq!(
+            cols_of(&tables, "recovered_fragments"),
+            ["_page", "_offset", "_missing", "_confidence", "c0"].map(String::from)
+        );
     }
 
     #[test]

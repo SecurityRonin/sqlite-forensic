@@ -805,6 +805,88 @@ pub fn fragment_to_rebuild_row(frag: &CarvedFragment) -> FragmentRow {
     }
 }
 
+// ---- XLSX export: blob classification + human size ------------------------
+
+/// How a recovered BLOB should be presented in the XLSX export.
+///
+/// Carved bytes are hostile and untyped, so the kind is derived purely from
+/// magic bytes — never from a column name or a fixture-specific assumption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobKind {
+    /// A still image (PNG/JPEG/GIF/BMP/WebP/TIFF): embed a thumbnail in-cell.
+    Image,
+    /// A recognized video container: render a typed `video/<ext> · <size>`
+    /// placeholder (first-frame extraction is deferred — no pure-Rust decoder).
+    Video {
+        /// Lowercase container extension (`mp4`, `mov`, `mkv`, `webm`, `avi`).
+        ext: &'static str,
+    },
+    /// Anything else: the existing `<blob:N bytes>` placeholder.
+    Other,
+}
+
+/// Classify a recovered BLOB by its leading magic bytes (file signatures), so a
+/// binary cell is presented by what it *is*, not by where it came from.
+///
+/// Images are recognized by [`image::guess_format`] (the same decoder the
+/// thumbnailer will use, so a "classified Image" is always one the embedder can
+/// at least attempt). Video containers are recognized by their well-known box /
+/// header signatures: an ISO-BMFF `ftyp` box (MP4/MOV, sub-typed by its major
+/// brand), the Matroska/WebM EBML header, and the RIFF `AVI ` form. Everything
+/// else — including too-short blobs — is [`BlobKind::Other`].
+#[must_use]
+pub fn classify_blob(bytes: &[u8]) -> BlobKind {
+    if image::guess_format(bytes).is_ok() {
+        return BlobKind::Image;
+    }
+    if let Some(ext) = video_container_ext(bytes) {
+        return BlobKind::Video { ext };
+    }
+    BlobKind::Other
+}
+
+/// Recognize a video container from its magic bytes, returning a lowercase
+/// extension, or `None`. Covers the containers the feature names: ISO-BMFF
+/// (`ftyp` box at offset 4 → MP4/MOV by major brand), Matroska/WebM (EBML
+/// header), and AVI (RIFF `AVI ` form).
+fn video_container_ext(bytes: &[u8]) -> Option<&'static str> {
+    // Matroska / WebM: EBML header 1A 45 DF A3. WebM is a Matroska profile and
+    // shares the header; both map to `mkv` (the generic container extension).
+    if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return Some("mkv");
+    }
+    // RIFF container: `RIFF` ... `AVI ` (the form type at offset 8).
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"AVI " {
+        return Some("avi");
+    }
+    // ISO Base Media File Format: a `ftyp` box whose body starts at offset 8 with
+    // a 4-char major brand. MOV uses `qt  `; everything else (isom/mp4*/M4V/3gp…)
+    // is reported as `mp4`, the dominant ISO-BMFF extension.
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        return Some(if brand == b"qt  " { "mov" } else { "mp4" });
+    }
+    None
+}
+
+/// Format a byte count as a short human-readable size (`512 B`, `1.5 KB`,
+/// `4.2 MB`) using 1024-based units. Bytes render without a decimal; KB and up
+/// render with one decimal place. Used for the video placeholder string.
+#[must_use]
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

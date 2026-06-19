@@ -334,6 +334,93 @@ fn malformed_db_audit_exits_nonzero() {
     assert!(stderr.contains("error"), "must report the parse error");
 }
 
+// ---- xlsx export (`carve --xlsx`) -------------------------------------------
+
+/// `carve --xlsx` on a real fixture writes BOTH `<stem>.recovered.db` and
+/// `<stem>.recovered.xlsx`, and the xlsx opens in calamine with the
+/// `recovered_records` sheet. The summary mentions both files.
+#[test]
+fn carve_xlsx_writes_db_and_xlsx() {
+    use calamine::Reader;
+
+    let dir = Scratch::new("xlsx_export");
+    let db = dir.join("deleted_places.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "deleted_places.db", "--xlsx"])
+        .output()
+        .expect("run carve --xlsx");
+    assert!(out.status.success(), "carve --xlsx must exit 0");
+
+    let recovered_db = dir.join("deleted_places.recovered.db");
+    let recovered_xlsx = dir.join("deleted_places.recovered.xlsx");
+    assert!(recovered_db.exists(), "the rebuilt .db must be written");
+    assert!(recovered_xlsx.exists(), "the .xlsx must be written too");
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("deleted_places.recovered.db")
+            && stdout.contains("deleted_places.recovered.xlsx"),
+        "summary must mention both files, got: {stdout:?}"
+    );
+
+    // The produced xlsx opens in calamine and carries the records sheet.
+    let mut wb: calamine::Xlsx<_> =
+        calamine::open_workbook(&recovered_xlsx).expect("xlsx must open in calamine");
+    assert!(
+        wb.sheet_names().iter().any(|n| n == "recovered_records"),
+        "recovered_records sheet present: {:?}",
+        wb.sheet_names()
+    );
+    let _ = wb.worksheet_range("recovered_records");
+}
+
+/// `carve --xlsx` with a fixture that surfaces a fragment writes a workbook with
+/// BOTH the `recovered_records` and `recovered_fragments` sheets.
+#[test]
+fn carve_xlsx_includes_fragment_sheet() {
+    use calamine::Reader;
+
+    let dir = Scratch::new("xlsx_frags");
+    let db = dir.join("0D-01.db");
+    std::fs::copy(fragment_fixture(), &db).unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "0D-01.db", "--xlsx"])
+        .output()
+        .expect("run carve --xlsx");
+    assert!(out.status.success(), "carve --xlsx must exit 0");
+
+    let recovered_xlsx = dir.join("0D-01.recovered.xlsx");
+    assert!(recovered_xlsx.exists(), "the .xlsx must be written");
+    let wb: calamine::Xlsx<_> = calamine::open_workbook(&recovered_xlsx).expect("xlsx must open");
+    let names = wb.sheet_names();
+    assert!(names.iter().any(|n| n == "recovered_records"));
+    assert!(
+        names.iter().any(|n| n == "recovered_fragments"),
+        "fragment sheet present (fragments on by default): {names:?}"
+    );
+}
+
+/// `--xlsx` is refused in the stdout text modes (`--format`): clap rejects the
+/// combination with a nonzero exit rather than silently ignoring the flag.
+#[test]
+fn carve_xlsx_conflicts_with_format() {
+    let out = bin()
+        .args(["carve"])
+        .arg(data_dir().join("deleted_places.db"))
+        .args(["--xlsx", "--format", "csv"])
+        .output()
+        .expect("run carve");
+    assert!(
+        !out.status.success(),
+        "--xlsx with --format must be refused by clap"
+    );
+}
+
 /// A unique scratch directory under the system temp dir, removed on drop, so each
 /// WAL-error test controls the `<db>` / `<db>-wal` sidecar pair in isolation.
 struct Scratch(PathBuf);

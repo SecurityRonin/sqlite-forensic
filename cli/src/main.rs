@@ -16,13 +16,15 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlite4n6::{
-    carve_wal_snapshots, carved_to_rebuild_row, filter_by_confidence, recovered_output_path,
-    render_audit, render_carve, render_carve_tiered, render_carve_with_snapshot, render_fragments,
-    MinConfidence, OutputFormat,
+    carve_wal_snapshots, carved_to_rebuild_row, filter_by_confidence, fragment_to_rebuild_row,
+    recovered_output_path, render_audit, render_carve, render_carve_tiered,
+    render_carve_with_snapshot, render_fragments, MinConfidence, OutputFormat,
 };
-use sqlite_core::rebuild::build_recovered_db;
+use sqlite_core::rebuild::build_recovered_db_with_fragments;
 use sqlite_core::Database;
-use sqlite_forensic::{audit, carve_all_deleted_records, carve_with_fragments, CarvedRecord};
+use sqlite_forensic::{
+    audit, carve_all_deleted_records, carve_with_fragments, CarvedFragment, CarvedRecord,
+};
 
 /// sqlite4n6 — read-only SQLite forensic analysis CLI.
 #[derive(Parser, Debug)]
@@ -220,15 +222,49 @@ fn run_carve_rebuild(args: &CarveArgs) -> Result<(), String> {
 
     let records = collect_full_records(args)?;
     let rows: Vec<_> = records.iter().map(carved_to_rebuild_row).collect();
-    let bytes = build_recovered_db(&rows);
+
+    // Tier-2 fragments land in a SEPARATE recovered_fragments table, on by default;
+    // `--no-fragments` omits the table entirely (single-table db, as before). When
+    // enabled but none are found, the table is still created (empty, predictable).
+    let fragments = if args.wants_fragments() {
+        Some(collect_fragments(args)?)
+    } else {
+        None
+    };
+    let frag_rows: Option<Vec<_>> = fragments
+        .as_ref()
+        .map(|frags| frags.iter().map(fragment_to_rebuild_row).collect());
+
+    let bytes = build_recovered_db_with_fragments(&rows, frag_rows.as_deref());
     std::fs::write(&out_path, &bytes)
         .map_err(|e| format!("cannot write recovered db {}: {e}", out_path.display()))?;
-    println!(
-        "wrote {} recovered record(s) to {}",
-        records.len(),
-        out_path.display()
-    );
+    match &fragments {
+        Some(frags) => println!(
+            "wrote {} record(s) and {} fragment(s) to {}",
+            records.len(),
+            frags.len(),
+            out_path.display()
+        ),
+        None => println!(
+            "wrote {} record(s) to {}",
+            records.len(),
+            out_path.display()
+        ),
+    }
     Ok(())
+}
+
+/// Collect the Tier-2 fragments for the rebuilt `recovered_fragments` table.
+///
+/// Fragments are sourced from the **on-disk image only** (v1 has no WAL fragment
+/// pass), matching the stdout carve's fragment behavior; the confidence filter is
+/// a full-row policy and does not apply to fragments.
+fn collect_fragments(args: &CarveArgs) -> Result<Vec<CarvedFragment>, String> {
+    let db_bytes = std::fs::read(&args.db)
+        .map_err(|e| format!("cannot read database {}: {e}", args.db.display()))?;
+    let db = Database::open(db_bytes)
+        .map_err(|e| format!("cannot parse database {}: {e:?}", args.db.display()))?;
+    Ok(carve_with_fragments(&db).fragments)
 }
 
 /// Collect the full (Tier-1) recovered records, honoring the WAL resolution and

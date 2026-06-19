@@ -1219,4 +1219,84 @@ mod tests {
         let lines = render_carve_tiered(&records, &[frag()], OutputFormat::Table, true);
         assert_eq!(lines, vec!["7".to_string()]);
     }
+
+    // ---- rebuilt-db output: path derivation + safety guard -----------------
+
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn default_output_path_is_stem_recovered_db_in_cwd() {
+        // History.db -> History.recovered.db (final extension stripped).
+        assert_eq!(
+            recovered_output_path(Path::new("/evidence/History.db"), None).unwrap(),
+            PathBuf::from("History.recovered.db")
+        );
+        // ChatStorage.sqlite -> ChatStorage.recovered.db.
+        assert_eq!(
+            recovered_output_path(Path::new("ChatStorage.sqlite"), None).unwrap(),
+            PathBuf::from("ChatStorage.recovered.db")
+        );
+        // A name with no extension keeps the whole stem.
+        assert_eq!(
+            recovered_output_path(Path::new("/data/wal_only"), None).unwrap(),
+            PathBuf::from("wal_only.recovered.db")
+        );
+    }
+
+    #[test]
+    fn explicit_out_overrides_the_derived_path() {
+        let out = PathBuf::from("/tmp/custom.db");
+        assert_eq!(
+            recovered_output_path(Path::new("History.db"), Some(&out)).unwrap(),
+            out
+        );
+    }
+
+    #[test]
+    fn guard_refuses_output_equal_to_evidence_or_sidecars() {
+        let db = Path::new("/evidence/History.db");
+        // Writing back over the evidence file itself is refused.
+        assert!(recovered_output_path(db, Some(Path::new("/evidence/History.db"))).is_err());
+        // Each sidecar is refused too — the whole evidence set is read-only.
+        for sidecar in ["-wal", "-shm", "-journal"] {
+            let mut name = db.as_os_str().to_owned();
+            name.push(sidecar);
+            let p = PathBuf::from(name);
+            assert!(
+                recovered_output_path(db, Some(&p)).is_err(),
+                "must refuse the {sidecar} sidecar"
+            );
+        }
+        // A genuinely different path is allowed.
+        assert!(recovered_output_path(db, Some(Path::new("/out/History.recovered.db"))).is_ok());
+    }
+
+    #[test]
+    fn carved_record_maps_to_rebuild_row_natively() {
+        let mut r = rec(
+            55,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Integer(1), Value::Blob(vec![1, 2, 3])],
+        );
+        r.page = 9;
+        r.offset = 321;
+        let row = carved_to_rebuild_row(&r);
+        assert_eq!(row.page, 9);
+        assert_eq!(row.offset, 321);
+        assert_eq!(row.rowid, Some(55));
+        assert_eq!(row.source, "freelist-page");
+        assert!((row.confidence - 0.9).abs() < 1e-6);
+        assert_eq!(
+            row.cells,
+            vec![Value::Integer(1), Value::Blob(vec![1, 2, 3])]
+        );
+    }
+
+    #[test]
+    fn carved_record_zero_rowid_maps_to_none() {
+        // A clobbered rowid (0, e.g. freeblock reconstruction) becomes NULL.
+        let r = rec(0, 0.4, RecoverySource::FreeblockReconstructed, vec![]);
+        assert_eq!(carved_to_rebuild_row(&r).rowid, None);
+    }
 }

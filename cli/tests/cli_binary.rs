@@ -651,14 +651,15 @@ fn carve_rebuild_write_failure_exits_nonzero() {
 // ---- two-table rebuilt db: recovered_fragments alongside recovered_records ---
 
 /// Default `carve` on a fixture that surfaces a fragment must write a rebuilt db
-/// in which the real `sqlite3` engine sees BOTH `recovered_records` AND
+/// in which the real `sqlite3` engine sees the attributed Tier-1 table
+/// (`recovered_users`, the in-page deleted row's owning table) AND
 /// `recovered_fragments`, the fragment table holding the surviving evidence (the
 /// id-20004 "Anja" fragment). The summary line reports both counts. Skips cleanly
 /// when `sqlite3` is unavailable.
 #[test]
-fn default_carve_writes_both_tables_with_fragments() {
+fn default_carve_writes_attributed_table_and_fragments() {
     let Some(sqlite3) = sqlite3_bin() else {
-        eprintln!("SKIP default_carve_writes_both_tables_with_fragments: no sqlite3");
+        eprintln!("SKIP default_carve_writes_attributed_table_and_fragments: no sqlite3");
         return;
     };
     let dir = Scratch::new("rebuild_frags");
@@ -680,19 +681,30 @@ fn default_carve_writes_both_tables_with_fragments() {
     let produced = dir.join("0D-01.recovered.db");
     assert!(produced.exists(), "rebuilt db must be written");
 
-    // The external engine lists both user tables.
+    // The external engine lists the attributed Tier-1 table + the fragment table.
     let tables = sqlite3_query(
         &sqlite3,
         &produced,
         "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
     );
     assert!(
-        tables.contains("recovered_records"),
-        "recovered_records present: {tables}"
+        tables.contains("recovered_users"),
+        "recovered_users (Tier-1) present: {tables}"
     );
     assert!(
         tables.contains("recovered_fragments"),
         "recovered_fragments present: {tables}"
+    );
+
+    // The Tier-1 table carries the source table's REAL column names.
+    let cols = sqlite3_query(
+        &sqlite3,
+        &produced,
+        "SELECT group_concat(name) FROM pragma_table_info('recovered_users');",
+    );
+    assert!(
+        cols.contains("name") && cols.contains("surname"),
+        "real column names present: {cols}"
     );
 
     // The fragment table carries the surviving distinctive cell.
@@ -707,13 +719,13 @@ fn default_carve_writes_both_tables_with_fragments() {
     );
 }
 
-/// `--no-fragments` writes a single-table rebuilt db: `sqlite3` sees ONLY
-/// `recovered_records`, never `recovered_fragments`, and the summary reports just
-/// the record count. Skips cleanly when `sqlite3` is unavailable.
+/// `--no-fragments` writes the rebuilt db without the fragment table: `sqlite3`
+/// sees the attributed Tier-1 `recovered_users`, never `recovered_fragments`, and
+/// the summary reports just the record count. Skips when `sqlite3` is absent.
 #[test]
-fn no_fragments_writes_only_recovered_records() {
+fn no_fragments_omits_the_fragment_table() {
     let Some(sqlite3) = sqlite3_bin() else {
-        eprintln!("SKIP no_fragments_writes_only_recovered_records: no sqlite3");
+        eprintln!("SKIP no_fragments_omits_the_fragment_table: no sqlite3");
         return;
     };
     let dir = Scratch::new("rebuild_nofrags");
@@ -739,11 +751,206 @@ fn no_fragments_writes_only_recovered_records() {
         "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
     );
     assert!(
-        tables.contains("recovered_records"),
-        "recovered_records present: {tables}"
+        tables.contains("recovered_users"),
+        "recovered_users present: {tables}"
     );
     assert!(
         !tables.contains("recovered_fragments"),
         "--no-fragments must omit the fragment table: {tables}"
+    );
+}
+
+// ---- three-tier table attribution end-to-end ------------------------------
+
+/// Mint a fresh db by piping `script` to `sqlite3`. The script sets
+/// `secure_delete=OFF` so deleted content is recoverable (this host defaults it
+/// ON, which zeroes freed bytes).
+fn mint_db(sqlite3: &str, path: &Path, script: &str) {
+    let _ = std::fs::remove_file(path);
+    let out = Command::new(sqlite3)
+        .arg(path)
+        .arg(script)
+        .output()
+        .expect("sqlite3 must execute");
+    assert!(
+        out.status.success(),
+        "sqlite3 mint failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A secure_delete=OFF script that produces all three attribution tiers:
+/// - `people`: a deleted in-page row → Tier-1 `recovered_people`;
+/// - `amounts`: most rows deleted, freeing whole pages → Tier-2 (its own shape);
+/// - `secret`: bulk-inserted then DROPped → freed pages whose 4-TEXT shape
+///   matches no surviving table → Tier-3 `recovered_unattributed`.
+const THREE_TIER_SCRIPT: &str = "\
+PRAGMA secure_delete=OFF;\n\
+PRAGMA auto_vacuum=0;\n\
+PRAGMA page_size=4096;\n\
+CREATE TABLE people (id INTEGER, name TEXT);\n\
+CREATE TABLE amounts (a REAL, b REAL, c REAL);\n\
+CREATE TABLE secret (x TEXT, y TEXT, z TEXT, w TEXT);\n\
+INSERT INTO people VALUES (1,'alice'),(2,'bob'),(3,'carol'),(4,'dave'),(5,'eve');\n\
+WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<400)\n\
+  INSERT INTO amounts SELECT i*1.5, i*2.5, i*3.5 FROM c;\n\
+WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<200)\n\
+  INSERT INTO secret SELECT 'aaaa'||i,'bbbb'||i,'cccc'||i,'dddd'||i FROM c;\n\
+DELETE FROM people WHERE id=3;\n\
+DELETE FROM amounts WHERE rowid>5;\n\
+DROP TABLE secret;\n";
+
+/// The headline end-to-end: a secure_delete=OFF db with an in-page deletion
+/// (Tier-1), whole freed pages of a surviving table (Tier-2), and a dropped
+/// table whose shape matches nothing (Tier-3). The default `carve` rebuilds a db
+/// the REAL `sqlite3` engine reads back with `recovered_people` (real column
+/// names), `recovered_inferred` (`_table_guess` + `_table_match_ambiguous`), and
+/// `recovered_unattributed`. Skips when `sqlite3` is unavailable.
+#[test]
+fn three_tier_attribution_round_trips_through_sqlite3() {
+    let Some(sqlite3) = sqlite3_bin() else {
+        eprintln!("SKIP three_tier_attribution_round_trips_through_sqlite3: no sqlite3");
+        return;
+    };
+    let dir = Scratch::new("three_tier");
+    let db = dir.join("tier.db");
+    mint_db(&sqlite3, &db, THREE_TIER_SCRIPT);
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "tier.db"])
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "carve must exit 0");
+
+    let produced = dir.join("tier.recovered.db");
+    let tables = sqlite3_query(
+        &sqlite3,
+        &produced,
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
+    );
+    for expected in [
+        "recovered_people",
+        "recovered_inferred",
+        "recovered_unattributed",
+    ] {
+        assert!(tables.contains(expected), "{expected} present in: {tables}");
+    }
+
+    // Tier-1: real column names from the people CREATE TABLE.
+    let people_cols = sqlite3_query(
+        &sqlite3,
+        &produced,
+        "SELECT group_concat(name) FROM pragma_table_info('recovered_people');",
+    );
+    assert!(
+        people_cols.contains("id") && people_cols.contains("name"),
+        "Tier-1 real column names: {people_cols}"
+    );
+
+    // Tier-2: the guess columns exist and name a surviving table, unambiguous.
+    let guess = sqlite3_query(
+        &sqlite3,
+        &produced,
+        "SELECT DISTINCT _table_guess || ':' || _table_match_ambiguous FROM recovered_inferred;",
+    );
+    assert_eq!(guess, "amounts:0", "Tier-2 guess + ambiguity flag: {guess}");
+
+    // Tier-3: the dropped secret table's 4-TEXT rows landed here.
+    let unattr = sqlite3_query(
+        &sqlite3,
+        &produced,
+        "SELECT count(*) FROM recovered_unattributed WHERE c3 IS NOT NULL;",
+    );
+    assert!(
+        unattr.parse::<i64>().unwrap_or(0) > 0,
+        "Tier-3 holds the dropped 4-column rows: {unattr}"
+    );
+
+    assert_eq!(
+        sqlite3_query(&sqlite3, &produced, "PRAGMA integrity_check;"),
+        "ok"
+    );
+}
+
+/// `--xlsx` writes one sheet per recovered table with sanitized names; calamine
+/// (a real external reader) confirms the per-tier sheets exist.
+#[test]
+fn xlsx_has_one_sheet_per_recovered_table() {
+    use calamine::Reader;
+
+    let Some(sqlite3) = sqlite3_bin() else {
+        eprintln!("SKIP xlsx_has_one_sheet_per_recovered_table: no sqlite3");
+        return;
+    };
+    let dir = Scratch::new("three_tier_xlsx");
+    let db = dir.join("tier.db");
+    mint_db(&sqlite3, &db, THREE_TIER_SCRIPT);
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "tier.db", "--xlsx"])
+        .output()
+        .expect("run carve --xlsx");
+    assert!(out.status.success(), "carve --xlsx must exit 0");
+
+    let xlsx = dir.join("tier.recovered.xlsx");
+    assert!(xlsx.exists(), "xlsx companion must be written");
+    let mut wb: calamine::Xlsx<_> =
+        calamine::open_workbook(&xlsx).expect("calamine must open the xlsx");
+    let names = wb.sheet_names();
+    for expected in [
+        "recovered_people",
+        "recovered_inferred",
+        "recovered_unattributed",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "{expected} sheet present in: {names:?}"
+        );
+    }
+}
+
+/// The committed `deleted_places.db` (163 carved rows) must attribute every row
+/// to a tier — none lost. With `moz_places` the sole table, the rows land in
+/// `recovered_moz_places` (Tier-1) and/or `recovered_inferred` (Tier-2), and the
+/// summed count equals the carved 163.
+#[test]
+fn deleted_places_rows_all_attribute_somewhere() {
+    let Some(sqlite3) = sqlite3_bin() else {
+        eprintln!("SKIP deleted_places_rows_all_attribute_somewhere: no sqlite3");
+        return;
+    };
+    let dir = Scratch::new("deleted_places_attr");
+    let db = dir.join("deleted_places.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "deleted_places.db"])
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "carve must exit 0");
+
+    let produced = dir.join("deleted_places.recovered.db");
+    // Sum the row counts across every recovered_* attribution table.
+    let table_names = sqlite3_query(
+        &sqlite3,
+        &produced,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'recovered_%' \
+         AND name <> 'recovered_fragments';",
+    );
+    let mut total = 0i64;
+    for name in table_names.lines() {
+        let n = sqlite3_query(
+            &sqlite3,
+            &produced,
+            &format!("SELECT count(*) FROM \"{name}\";"),
+        );
+        total += n.parse::<i64>().unwrap_or(0);
+    }
+    assert_eq!(
+        total, 163,
+        "all 163 carved rows must attribute to a tier table"
     );
 }

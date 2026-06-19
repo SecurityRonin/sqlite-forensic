@@ -22,6 +22,8 @@ sqlite-forensic reads the raw SQLite file format — header, b-tree, freelist + 
 - **Grades anomalies** (`sqlite-forensic::audit`) into severity-ranked, confidence-scored `forensicnomicon::report::Finding`s: non-empty freelist, uncheckpointed WAL state, page-count mismatch, non-standard reserved space.
 - **Carves deleted records** (`carve_all_deleted_records`) from freelist pages, in-page free blocks, dropped-table pages, and freed overflow-page chains (reassembled when every chain page survives as a freelist leaf) — column count inferred per record — while structurally refusing to re-surface a live row. A separate Tier-2 surface (`carve_with_fragments`; shown by default in the `sqlite4n6 carve` CLI, `--no-fragments` to suppress) salvages partial rows where a distinctive cell survives but full identity is destroyed.
 
+By default the `sqlite4n6 carve` CLI **rebuilds a queryable SQLite database** of what it recovers — a `recovered_records` table and a separate `recovered_fragments` table, with carved cells in their native types (a recovered `BLOB` is stored losslessly) — so you can `sqlite3 evidence.recovered.db "SELECT …"` immediately. `--format table|csv|jsonl` streams to stdout instead (JSONL carries BLOBs as base64).
+
 ---
 
 ## The two crates

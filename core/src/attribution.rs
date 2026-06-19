@@ -14,6 +14,27 @@
 //!
 //! Pure string/structure work: panic-free, `forbid(unsafe)`, no new deps.
 
+/// A live (schema-present) table, as read from `sqlite_master`: its name,
+/// b-tree rootpage, and per-column shape used to attribute a freed row whose
+/// page linkage is gone.
+///
+/// `column_names` is `Some` only when the `CREATE TABLE` statement parsed with
+/// confidence AND its column count equals `affinities.len()`; otherwise `None`,
+/// so a caller falls back to generic `c0..cN` rather than risk wrong names. The
+/// affinities are always present (one per parsed column) and drive shape
+/// matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTable {
+    /// Table name from `sqlite_master.name`.
+    pub name: String,
+    /// 1-based b-tree rootpage from `sqlite_master.rootpage`.
+    pub rootpage: u32,
+    /// Declared column names, or `None` when low-confidence (caller uses `c0..`).
+    pub column_names: Option<Vec<String>>,
+    /// Declared column affinity for each column, in column order.
+    pub affinities: Vec<Affinity>,
+}
+
 /// Column type **affinity** as defined by the `SQLite` file format (§3.1, "Type
 /// Affinity"). Derived from a column's declared type by the documented
 /// substring rules, in priority order. A column with no declared type is

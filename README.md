@@ -87,9 +87,9 @@ Under the hood `sqlite4n6` reads the raw file format itself — freelist pages, 
 | Recover deleted rows from freelist pages | ✅ | — |
 | Recover deleted rows from in-page free blocks | ✅ | — |
 | Recover dropped-table rows (column count inferred) | ✅ | — |
-| Reassemble deleted rows whose payload spilled to overflow-page chains | ✅ partial | — |
-| Salvage partial rows as a separate Tier-2 fragment tier (a distinctive cell survives) | ✅ default | — |
-| Rebuild recovered rows into a queryable SQLite db (native types, lossless BLOBs) | ✅ default | — |
+| Reassemble deleted rows whose payload spilled to overflow-page chains | ✅ intact chains | — |
+| Salvage partial rows as a separate Tier-2 fragment tier (a distinctive cell survives) | ✅ | — |
+| Rebuild recovered rows into a queryable SQLite db (native types, lossless BLOBs) | ✅ | — |
 | Read uncheckpointed WAL overlay as a separate view | ✅ | applied silently |
 | Carve every WAL commit snapshot, LSN-labelled (per-commit timeline) | ✅ | — |
 | Graded, confidence-scored anomaly findings | ✅ | — |

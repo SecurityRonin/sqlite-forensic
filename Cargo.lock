@@ -142,14 +142,14 @@ dependencies = [
 
 [[package]]
 name = "sqlite-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "forensicnomicon",
 ]
 
 [[package]]
 name = "sqlite-forensic"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "forensicnomicon",
  "sqlite-core",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "sqlite4n6"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "forensicnomicon",

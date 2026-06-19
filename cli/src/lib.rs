@@ -887,6 +887,38 @@ pub fn human_size(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+// ---- XLSX export: thumbnail / transcode -----------------------------------
+
+/// Longest-side bound, in pixels, for an embedded image thumbnail. Keeps the
+/// workbook small and the cell legible; not a knob (an internal presentation
+/// constant, like the rebuilt-db page size).
+pub const THUMB_MAX_PX: u32 = 160;
+
+/// Decode an image BLOB, downscale it to a [`THUMB_MAX_PX`] thumbnail (longest
+/// side, aspect preserved, never upscaled), and re-encode it to **PNG** bytes
+/// ready for [`rust_xlsxwriter::Image::new_from_buffer`].
+///
+/// Returns `None` on any failure — undecodable bytes, an unsupported codec, or
+/// an encode error — so the caller falls back to the `<blob:N bytes>`
+/// placeholder rather than panicking on hostile carved input. Transcoding to PNG
+/// is unconditional, so a WebP/TIFF source (which `embed_image` will not accept
+/// directly) still embeds.
+#[must_use]
+pub fn thumbnail_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let (w, h) = (img.width(), img.height());
+    // Downscale only: a source already within the bound is left untouched
+    // (`image::thumbnail` would otherwise enlarge a tiny image to fill).
+    let thumb = if w > THUMB_MAX_PX || h > THUMB_MAX_PX {
+        img.thumbnail(THUMB_MAX_PX, THUMB_MAX_PX)
+    } else {
+        img
+    };
+    let mut out = std::io::Cursor::new(Vec::new());
+    thumb.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1629,10 +1661,14 @@ mod tests {
 
     #[test]
     fn thumbnail_png_does_not_upscale_small_images() {
-        // A 1x1 PNG must not be enlarged; it stays within bounds and re-encodes.
-        let thumb = thumbnail_png(&tiny_png()).expect("tiny png thumbnails");
+        // A real 2x2 PNG must not be enlarged; it stays within bounds and
+        // re-encodes. (`tiny_png()` is a signature-only fixture for the
+        // magic-byte classifier; the thumbnailer needs a fully-decodable image,
+        // so it is encoder-minted here — Doer-Checker over a real round-trip.)
+        let src = rgb_png(2, 2);
+        let thumb = thumbnail_png(&src).expect("small png thumbnails");
         let decoded = image::load_from_memory(&thumb).unwrap();
-        assert!(decoded.width() <= THUMB_MAX_PX && decoded.height() <= THUMB_MAX_PX);
+        assert_eq!((decoded.width(), decoded.height()), (2, 2), "not upscaled");
     }
 
     #[test]

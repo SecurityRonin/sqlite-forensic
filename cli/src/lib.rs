@@ -1679,4 +1679,203 @@ mod tests {
         // A truncated PNG signature with no decodable body also fails soft.
         assert!(thumbnail_png(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).is_none());
     }
+
+    // ---- XLSX export: workbook builder -------------------------------------
+
+    use calamine::{Data, Reader};
+
+    fn rebuild_row(rowid: Option<i64>, cells: Vec<Value>) -> RebuildRow {
+        RebuildRow {
+            page: 3,
+            offset: 128,
+            rowid,
+            source: "freelist-page".to_string(),
+            confidence: 0.9,
+            cells,
+        }
+    }
+
+    /// Open an in-memory .xlsx buffer with calamine (a real external reader).
+    fn open_xlsx(buf: &[u8]) -> calamine::Xlsx<std::io::Cursor<Vec<u8>>> {
+        calamine::open_workbook_from_rs(std::io::Cursor::new(buf.to_vec()))
+            .expect("produced bytes must be a valid xlsx calamine can open")
+    }
+
+    #[test]
+    fn xlsx_has_both_sheets_with_headers() {
+        let records = vec![rebuild_row(
+            Some(5),
+            vec![Value::Text("alice".into()), Value::Integer(30)],
+        )];
+        let frags = vec![FragmentRow {
+            page: 2,
+            offset: 3965,
+            missing: 1,
+            confidence: 0.2,
+            surviving: vec![(0, Value::Integer(20004))],
+        }];
+        let buf = build_recovered_xlsx(&records, Some(&frags)).unwrap();
+        let mut wb = open_xlsx(&buf);
+        let names = wb.sheet_names();
+        assert!(names.iter().any(|n| n == "recovered_records"));
+        assert!(names.iter().any(|n| n == "recovered_fragments"));
+
+        // Records header mirrors the rebuilt-db schema.
+        let recs = wb.worksheet_range("recovered_records").unwrap();
+        let header: Vec<String> = recs
+            .rows()
+            .next()
+            .unwrap()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        assert_eq!(
+            header,
+            vec![
+                "_page",
+                "_offset",
+                "_rowid",
+                "_source",
+                "_confidence",
+                "c0",
+                "c1"
+            ]
+        );
+
+        // Fragments header mirrors the fragment-table schema.
+        let fr = wb.worksheet_range("recovered_fragments").unwrap();
+        let fheader: Vec<String> = fr
+            .rows()
+            .next()
+            .unwrap()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        assert_eq!(
+            fheader,
+            vec!["_page", "_offset", "_missing", "_confidence", "c0"]
+        );
+    }
+
+    #[test]
+    fn xlsx_no_fragments_omits_the_second_sheet() {
+        let records = vec![rebuild_row(Some(1), vec![Value::Integer(7)])];
+        let buf = build_recovered_xlsx(&records, None).unwrap();
+        let wb = open_xlsx(&buf);
+        let names = wb.sheet_names();
+        assert!(names.iter().any(|n| n == "recovered_records"));
+        assert!(
+            !names.iter().any(|n| n == "recovered_fragments"),
+            "no fragments → no fragment sheet"
+        );
+    }
+
+    #[test]
+    fn xlsx_cell_values_round_trip_by_type() {
+        let records = vec![rebuild_row(
+            Some(42),
+            vec![
+                Value::Null,
+                Value::Integer(30),
+                Value::Real(1.5),
+                Value::Text("hello".into()),
+            ],
+        )];
+        let buf = build_recovered_xlsx(&records, None).unwrap();
+        let mut wb = open_xlsx(&buf);
+        let recs = wb.worksheet_range("recovered_records").unwrap();
+        // Row 0 is the header; row 1 is the data row.
+        let row: Vec<&Data> = recs.rows().nth(1).unwrap().iter().collect();
+        // Lead cols: _page=3, _offset=128, _rowid=42, _source, _confidence.
+        assert_eq!(*row[0], Data::Float(3.0));
+        assert_eq!(
+            *row[2],
+            Data::Float(42.0),
+            "integer rowid is a numeric cell"
+        );
+        assert_eq!(*row[3], Data::String("freelist-page".into()));
+        // Cells c0..c3: Null (empty), Integer, Real, Text.
+        assert_eq!(*row[5], Data::Empty, "Null renders as an empty cell");
+        assert_eq!(*row[6], Data::Float(30.0), "Integer is a numeric cell");
+        assert_eq!(*row[7], Data::Float(1.5), "Real is a numeric cell");
+        assert_eq!(
+            *row[8],
+            Data::String("hello".into()),
+            "Text is a string cell"
+        );
+    }
+
+    #[test]
+    fn xlsx_video_blob_shows_typed_placeholder() {
+        // An MP4 BLOB cell must render the `video/<ext> · <size>` placeholder
+        // string — first-frame extraction is deferred.
+        let mut mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isom".to_vec();
+        mp4.resize(4_404_019, 0); // pad to ~4.2 MB so the size string is meaningful
+        let records = vec![rebuild_row(Some(1), vec![Value::Blob(mp4)])];
+        let buf = build_recovered_xlsx(&records, None).unwrap();
+        let mut wb = open_xlsx(&buf);
+        let recs = wb.worksheet_range("recovered_records").unwrap();
+        let cell = recs.rows().nth(1).unwrap()[5].to_string();
+        assert_eq!(cell, "video/mp4 · 4.2 MB", "typed video placeholder");
+    }
+
+    #[test]
+    fn xlsx_other_blob_shows_byte_placeholder() {
+        let records = vec![rebuild_row(Some(1), vec![Value::Blob(vec![1, 2, 3])])];
+        let buf = build_recovered_xlsx(&records, None).unwrap();
+        let mut wb = open_xlsx(&buf);
+        let recs = wb.worksheet_range("recovered_records").unwrap();
+        let cell = recs.rows().nth(1).unwrap()[5].to_string();
+        assert_eq!(cell, "<blob:3 bytes>");
+    }
+
+    #[test]
+    fn xlsx_image_blob_is_embedded_as_media() {
+        // An image BLOB must end up as embedded media inside the xlsx zip
+        // (calamine does not surface embedded images, so assert on the zip).
+        let png = rgb_png(40, 40);
+        let records = vec![rebuild_row(Some(1), vec![Value::Blob(png)])];
+        let buf = build_recovered_xlsx(&records, None).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
+        let mut media = false;
+        for i in 0..zip.len() {
+            let name = zip.by_index(i).unwrap().name().to_string();
+            if name.starts_with("xl/media/") && name.ends_with(".png") {
+                media = true;
+            }
+        }
+        assert!(media, "an embedded image must appear under xl/media/*.png");
+    }
+
+    #[test]
+    fn xlsx_corrupt_image_blob_falls_back_to_placeholder() {
+        // Bytes whose PNG signature is present but body is undecodable must NOT
+        // be embedded; the cell falls back to the <blob:N bytes> placeholder.
+        let bad = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0];
+        let records = vec![rebuild_row(Some(1), vec![Value::Blob(bad.clone())])];
+        let buf = build_recovered_xlsx(&records, None).unwrap();
+        let mut wb = open_xlsx(&buf);
+        let recs = wb.worksheet_range("recovered_records").unwrap();
+        let cell = recs.rows().nth(1).unwrap()[5].to_string();
+        assert_eq!(cell, format!("<blob:{} bytes>", bad.len()));
+    }
+
+    #[test]
+    fn xlsx_empty_records_still_builds_with_header() {
+        // No records: the sheet still exists with the lead-column header.
+        let buf = build_recovered_xlsx(&[], None).unwrap();
+        let mut wb = open_xlsx(&buf);
+        let recs = wb.worksheet_range("recovered_records").unwrap();
+        let header: Vec<String> = recs
+            .rows()
+            .next()
+            .unwrap()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        assert_eq!(
+            header,
+            vec!["_page", "_offset", "_rowid", "_source", "_confidence"]
+        );
+    }
 }

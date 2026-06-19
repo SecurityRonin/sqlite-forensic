@@ -1520,11 +1520,9 @@ mod tests {
     }
 
     fn cols_of<'a>(tables: &'a [RecoveredTable], name: &str) -> &'a [String] {
-        &tables
-            .iter()
-            .find(|t| t.name == name)
-            .unwrap_or_else(|| panic!("missing table {name}"))
-            .columns
+        let t = tables.iter().find(|t| t.name == name);
+        assert!(t.is_some(), "missing table {name}");
+        &t.unwrap().columns
     }
 
     #[test]
@@ -2530,9 +2528,8 @@ mod tests {
         // Sanitized: no '/', ≤ 31 chars.
         let sanitized = names
             .iter()
-            .find(|n| n.starts_with("recovered_avery") || n.contains("very_long"))
-            .or_else(|| names.iter().find(|n| *n != "recovered_people"))
-            .unwrap();
+            .find(|n| n.as_str() != "recovered_people")
+            .expect("a second, sanitized sheet exists");
         assert!(!sanitized.contains('/'));
         assert!(sanitized.chars().count() <= 31);
 
@@ -2546,6 +2543,75 @@ mod tests {
             .map(std::string::ToString::to_string)
             .collect();
         assert_eq!(header, vec!["_page", "_rowid", "name"]);
+    }
+
+    #[test]
+    fn recovered_tables_xlsx_bytes_returns_buffer_and_maps_errors() {
+        // Happy path returns bytes calamine can open.
+        let tables = vec![RecoveredTable {
+            name: "recovered_t".to_string(),
+            columns: vec!["c0".to_string()],
+            rows: vec![vec![Value::Integer(1)]],
+        }];
+        let buf = recovered_tables_xlsx_bytes(&tables, Path::new("/out/x.recovered.xlsx")).unwrap();
+        assert!(!buf.is_empty());
+        let _ = open_xlsx(&buf);
+
+        // Error path: a row wider than Excel's column limit makes the writer fail;
+        // the error maps to a string keyed by the destination path.
+        let wide = vec![RecoveredTable {
+            name: "recovered_wide".to_string(),
+            columns: (0..20_000).map(|i| format!("c{i}")).collect(),
+            rows: vec![(0..20_000).map(Value::Integer).collect()],
+        }];
+        let err = recovered_tables_xlsx_bytes(&wide, Path::new("/out/wide.xlsx")).unwrap_err();
+        assert!(
+            err.contains("recovered xlsx") && err.contains("wide.xlsx"),
+            "error maps to a path-keyed string: {err}"
+        );
+    }
+
+    #[test]
+    fn carve_wal_snapshots_over_the_real_wal_fixture() {
+        // Drive the WAL-snapshot carve in-process so its monomorphization is
+        // exercised by a unit test (the integration test covers the binary path).
+        const MAIN: &[u8] = include_bytes!("../../tests/data/wal_carve.db");
+        const WAL: &[u8] = include_bytes!("../../tests/data/wal_carve.db-wal");
+        let db = Database::open_with_wal(MAIN.to_vec(), WAL).expect("open with wal");
+        let tl = db.wal_timeline().expect("timeline present");
+        let records = carve_wal_snapshots(&db, &tl);
+        assert!(!records.is_empty(), "the WAL fixture yields carved records");
+    }
+
+    #[test]
+    fn group_and_attribute_over_a_real_database() {
+        // Mint a tiny valid db via the writer, open it, and drive the db-backed
+        // attribution wrappers (no sqlite3 needed). The minted db has live tables,
+        // so group_attributed_tables / attribute_records exercise the real path.
+        use sqlite_core::rebuild::{build_recovered_db_tables, RecoveredTable as RT};
+        let seed = vec![RT {
+            name: "people".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::Integer(1), Value::Text("a".into())]],
+        }];
+        let bytes = build_recovered_db_tables(&seed);
+        let db = Database::open(bytes).expect("minted db opens");
+
+        // A freelist record shaped like (INTEGER, TEXT) — attribute_records reads
+        // the db's live schema to classify it.
+        let records = vec![rec(
+            0,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Integer(2), Value::Text("b".into())],
+        )];
+        let attrs = attribute_records(&db, &records);
+        assert_eq!(attrs.len(), 1);
+
+        let tables = group_attributed_tables(&db, &records, None);
+        // The single record must land in exactly one recovered_* table.
+        assert!(tables.iter().all(|t| t.name.starts_with("recovered_")));
+        assert_eq!(tables.iter().map(|t| t.rows.len()).sum::<usize>(), 1);
     }
 
     #[test]

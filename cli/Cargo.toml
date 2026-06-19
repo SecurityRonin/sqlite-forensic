@@ -21,6 +21,18 @@ sqlite-core = { workspace = true }
 sqlite-forensic = { workspace = true }
 forensicnomicon = { workspace = true }
 clap = { workspace = true }
+# XLSX export (`carve --xlsx`): writes the rebuilt tables to a spreadsheet with
+# image blobs embedded in-cell. Both are pure Rust (no C deps) — the workspace
+# forbids unsafe and ships a single static binary. `image` enables only the
+# codecs the in-cell thumbnailer detects (png/jpeg/gif/bmp/webp/tiff).
+rust_xlsxwriter = "0.95"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
+
+[dev-dependencies]
+# Real oracles that read the produced .xlsx back: calamine parses the sheets and
+# cell values; zip confirms embedded image media (`xl/media/*.png`) is present.
+calamine = "0.35"
+zip = "4"
 
 [lints]
 workspace = true

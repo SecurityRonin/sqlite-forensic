@@ -220,17 +220,13 @@ fn run_carve_rebuild(args: &CarveArgs) -> Result<(), String> {
     // path fails fast and nothing is read or written under it.
     let out_path = recovered_output_path(&args.db, args.out.as_deref())?;
 
-    let records = collect_full_records(args)?;
+    // Tier-1 full rows and (when enabled) Tier-2 fragments come from one carve over
+    // the same evidence bytes; the two sets land in two SEPARATE tables. With
+    // `--no-fragments` the fragment set is `None`, omitting the table (single-table
+    // db, as before); when enabled but none are found, an empty table is still
+    // created (predictable).
+    let (records, fragments) = collect_for_rebuild(args)?;
     let rows: Vec<_> = records.iter().map(carved_to_rebuild_row).collect();
-
-    // Tier-2 fragments land in a SEPARATE recovered_fragments table, on by default;
-    // `--no-fragments` omits the table entirely (single-table db, as before). When
-    // enabled but none are found, the table is still created (empty, predictable).
-    let fragments = if args.wants_fragments() {
-        Some(collect_fragments(args)?)
-    } else {
-        None
-    };
     let frag_rows: Option<Vec<_>> = fragments
         .as_ref()
         .map(|frags| frags.iter().map(fragment_to_rebuild_row).collect());
@@ -254,41 +250,53 @@ fn run_carve_rebuild(args: &CarveArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// Collect the Tier-2 fragments for the rebuilt `recovered_fragments` table.
+/// Collect the rebuilt db's two record sets from the evidence: the full (Tier-1)
+/// rows always, and the Tier-2 fragments when `args.wants_fragments()` (else
+/// `None`, which omits the fragment table).
 ///
-/// Fragments are sourced from the **on-disk image only** (v1 has no WAL fragment
-/// pass), matching the stdout carve's fragment behavior; the confidence filter is
-/// a full-row policy and does not apply to fragments.
-fn collect_fragments(args: &CarveArgs) -> Result<Vec<CarvedFragment>, String> {
+/// The evidence bytes are read once. Fragments are sourced from the **on-disk
+/// image only** (v1 has no WAL fragment pass), matching the stdout carve; so under
+/// a WAL the records use the WAL-applied view while the fragments come from the
+/// same bytes opened without the WAL. The confidence filter is a full-row policy
+/// and is not applied to fragments.
+fn collect_for_rebuild(
+    args: &CarveArgs,
+) -> Result<(Vec<CarvedRecord>, Option<Vec<CarvedFragment>>), String> {
     let db_bytes = std::fs::read(&args.db)
         .map_err(|e| format!("cannot read database {}: {e}", args.db.display()))?;
-    let db = Database::open(db_bytes)
-        .map_err(|e| format!("cannot parse database {}: {e:?}", args.db.display()))?;
-    Ok(carve_with_fragments(&db).fragments)
-}
 
-/// Collect the full (Tier-1) recovered records, honoring the WAL resolution and
-/// the confidence filter — the record set the rebuilt db materializes. Fragments
-/// (partial, no-rowid) are intentionally excluded from the rebuilt rows.
-fn collect_full_records(args: &CarveArgs) -> Result<Vec<CarvedRecord>, String> {
-    let db_bytes = std::fs::read(&args.db)
-        .map_err(|e| format!("cannot read database {}: {e}", args.db.display()))?;
-    let records = if let Some(wal_path) = resolve_wal_path(args) {
+    // Open the evidence ONCE (WAL-applied when a sidecar is in play), keeping the
+    // stdout path's error ordering: an unreadable WAL, then a main-file parse, are
+    // surfaced first. The same `db` backs both the full-record carve and — when
+    // enabled — the fragment carve, mirroring the stdout path's single-db reuse.
+    let (db, wal_records) = if let Some(wal_path) = resolve_wal_path(args) {
         let wal_bytes = std::fs::read(&wal_path)
             .map_err(|e| format!("cannot read WAL {}: {e}", wal_path.display()))?;
         let db = Database::open_with_wal(db_bytes, &wal_bytes)
             .map_err(|e| format!("cannot parse database {}: {e:?}", args.db.display()))?;
-        if let Some(timeline) = db.wal_timeline() {
+        let records = if let Some(timeline) = db.wal_timeline() {
             carve_wal_snapshots(&db, &timeline)
         } else {
+            // A present-but-empty/uncommitted WAL yields no timeline; fall back to
+            // the WAL-applied full carve (mirrors the stdout path).
             carve_all_deleted_records(&db)
-        }
+        };
+        (db, records)
     } else {
         let db = Database::open(db_bytes)
             .map_err(|e| format!("cannot parse database {}: {e:?}", args.db.display()))?;
-        carve_all_deleted_records(&db)
+        let records = carve_all_deleted_records(&db);
+        (db, records)
     };
-    Ok(filter_by_confidence(records, args.min_confidence.into()))
+    let records = filter_by_confidence(wal_records, args.min_confidence.into());
+
+    // Tier-2 fragments share the already-open `db` (no second read/parse); `None`
+    // omits the fragment table. v1 has no WAL fragment pass, so a WAL-applied `db`
+    // still yields its on-disk fragment residue here, as on the stdout path.
+    let fragments = args
+        .wants_fragments()
+        .then(|| carve_with_fragments(&db).fragments);
+    Ok((records, fragments))
 }
 
 /// Stdout mode (`--format` / `--rowid-only`): the historical rendering behavior,

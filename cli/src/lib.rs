@@ -1439,4 +1439,76 @@ mod tests {
             "surviving (index, value) pairs preserved natively"
         );
     }
+
+    // ---- XLSX export: blob classification + human size --------------------
+
+    /// A minimal but real 1x1 PNG (the 8-byte signature + IHDR/IDAT/IEND), used
+    /// across the blob-classification and thumbnail tests as a genuine image.
+    fn tiny_png() -> Vec<u8> {
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // signature
+            0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R', // IHDR len + type
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, // bit depth/color + crc
+            0x00, 0x00, 0x00, 0x0c, b'I', b'D', b'A', b'T', // IDAT len + type
+            0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x01, 0x01, // data
+            0x18, 0xdd, 0x8d, 0xb4, // IDAT crc
+            0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82, // IEND
+        ];
+        PNG.to_vec()
+    }
+
+    #[test]
+    fn classify_blob_detects_image_formats() {
+        // PNG (8-byte signature).
+        assert_eq!(classify_blob(&tiny_png()), BlobKind::Image);
+        // JPEG SOI marker FF D8 FF.
+        assert_eq!(
+            classify_blob(&[0xff, 0xd8, 0xff, 0xe0, 0, 16, b'J', b'F', b'I', b'F']),
+            BlobKind::Image
+        );
+        // GIF89a.
+        assert_eq!(classify_blob(b"GIF89a\x01\x00\x01\x00"), BlobKind::Image);
+        // BMP.
+        assert_eq!(
+            classify_blob(b"BM\x00\x00\x00\x00\x00\x00"),
+            BlobKind::Image
+        );
+    }
+
+    #[test]
+    fn classify_blob_detects_video_containers() {
+        // MP4: a `ftyp` box at offset 4 (`....ftypisom`).
+        let mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isom";
+        assert_eq!(classify_blob(mp4), BlobKind::Video { ext: "mp4" });
+        // QuickTime MOV: `ftypqt  `.
+        let mov = b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00";
+        assert_eq!(classify_blob(mov), BlobKind::Video { ext: "mov" });
+        // Matroska / WebM EBML header 1A 45 DF A3.
+        let mkv = &[0x1a, 0x45, 0xdf, 0xa3, 0x01, 0x00, 0x00, 0x00];
+        assert_eq!(classify_blob(mkv), BlobKind::Video { ext: "mkv" });
+        // AVI: RIFF....AVI .
+        let avi = b"RIFF\x24\x00\x00\x00AVI LIST";
+        assert_eq!(classify_blob(avi), BlobKind::Video { ext: "avi" });
+    }
+
+    #[test]
+    fn classify_blob_other_for_non_media() {
+        assert_eq!(classify_blob(b"plain text bytes"), BlobKind::Other);
+        assert_eq!(classify_blob(&[0u8; 4]), BlobKind::Other);
+        // Too short to carry any magic.
+        assert_eq!(classify_blob(&[0xff]), BlobKind::Other);
+        assert_eq!(classify_blob(&[]), BlobKind::Other);
+    }
+
+    #[test]
+    fn human_size_renders_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MB");
+        assert_eq!(human_size(4_404_019), "4.2 MB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.0 GB");
+    }
 }

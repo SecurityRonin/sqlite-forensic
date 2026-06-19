@@ -27,7 +27,7 @@ $ sqlite4n6 carve ChatStorage.sqlite --no-fragments          # full rows only (f
 $ sqlite4n6 audit ChatStorage.sqlite                         # graded anomaly findings
 ```
 
-By default `carve` **rebuilds a queryable SQLite database** of the recovered records — `<name>.recovered.db`, a `recovered_records` table with provenance columns (`_page`, `_offset`, `_rowid`, `_source`, `_confidence`) plus the carved cells in their **native types**, so a recovered `BLOB` is stored losslessly and you can `sqlite3 ChatStorage.recovered.db "SELECT …"` straight away. Pass `--format table|csv|jsonl` to stream rows to stdout instead (JSONL carries BLOBs as base64; table/CSV show a `<blob:N bytes>` placeholder, since raw binary is unsafe in those).
+By default `carve` **rebuilds a queryable SQLite database** of the recovered records — `<name>.recovered.db`, a `recovered_records` table with provenance columns (`_page`, `_offset`, `_rowid`, `_source`, `_confidence`) plus the carved cells in their **native types**, so a recovered `BLOB` is stored losslessly and you can `sqlite3 ChatStorage.recovered.db "SELECT …"` straight away. Tier-2 partial rows land in a **separate `recovered_fragments` table** — provenance columns (`_page`, `_offset`, `_missing`, `_confidence`) and each surviving cell at its native column index (`c0`, `c1`, …) — kept distinct from the full rows so a fragment is never mistaken for a recovered record; `--no-fragments` omits this table for a single-table db. Pass `--format table|csv|jsonl` to stream rows to stdout instead (JSONL carries BLOBs as base64; table/CSV show a `<blob:N bytes>` placeholder, since raw binary is unsafe in those).
 
 ## Install
 

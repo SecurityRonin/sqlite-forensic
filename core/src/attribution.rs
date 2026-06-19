@@ -16,7 +16,8 @@
 
 /// Column type **affinity** as defined by the `SQLite` file format (§3.1, "Type
 /// Affinity"). Derived from a column's declared type by the documented
-/// substring rules, in priority order.
+/// substring rules, in priority order. A column with no declared type is
+/// `Blob` (SQLite's "BLOB or no datatype" affinity).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Affinity {
     /// Declared type contains "INT" → INTEGER affinity.
@@ -32,23 +33,251 @@ pub enum Affinity {
 }
 
 /// Compute a column's [`Affinity`] from its declared type string per the
-/// file-format §3.1 rules.
+/// file-format §3.1 rules, applied in the documented priority order:
+/// INT → TEXT → BLOB/none → REAL → NUMERIC. Case-insensitive; an empty (no)
+/// declared type is [`Affinity::Blob`].
 #[must_use]
-pub fn column_affinity(_declared_type: &str) -> Affinity {
-    unimplemented!("RED")
+pub fn column_affinity(declared_type: &str) -> Affinity {
+    let t = declared_type.to_ascii_uppercase();
+    if t.contains("INT") {
+        Affinity::Integer
+    } else if t.contains("CHAR") || t.contains("CLOB") || t.contains("TEXT") {
+        Affinity::Text
+    } else if t.is_empty() || t.contains("BLOB") {
+        Affinity::Blob
+    } else if t.contains("REAL") || t.contains("FLOA") || t.contains("DOUB") {
+        Affinity::Real
+    } else {
+        Affinity::Numeric
+    }
 }
 
 /// Best-effort extraction of `(column_name, declared_type)` for each column
-/// declared in a `CREATE TABLE` statement, without a SQL-parser dependency.
+/// declared in a `CREATE TABLE` statement, **without** a SQL-parser dependency.
+///
+/// Algorithm (deliberately conservative — wrong names are worse than no names):
+/// 1. Take the outermost parenthesized list (first `(` to its matching `)`,
+///    tracking nesting and skipping over `'…'`, `"…"`, `` `…` ``, and `[…]`
+///    so a comma or paren inside a string/identifier/`CHECK(...)` never splits).
+/// 2. Split that list on **top-level** commas (depth 0).
+/// 3. For each part, read the first identifier — handling `"quoted"`,
+///    `` `backtick` ``, `[bracketed]`, and bare names. Skip a part whose first
+///    word is a table-level constraint keyword (`CONSTRAINT`, `PRIMARY`,
+///    `UNIQUE`, `CHECK`, `FOREIGN`, `KEY`) — those declare constraints, not
+///    columns.
+/// 4. The remaining tokens of the part (up to the next top-level comma) form the
+///    declared type; an empty remainder is no declared type.
+///
+/// Returns `None` when no parenthesized list is found or no column survives —
+/// the low-confidence signal the caller turns into a `c0..cN` fallback.
 #[must_use]
-pub fn column_defs(_create_sql: &str) -> Option<Vec<(String, String)>> {
-    unimplemented!("RED")
+pub fn column_defs(create_sql: &str) -> Option<Vec<(String, String)>> {
+    let inner = outermost_paren_body(create_sql)?;
+    let parts = split_top_level(inner);
+    let mut cols = Vec::new();
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let mut tokens = ColumnTokens::new(part);
+        let Some(name) = tokens.next_identifier() else {
+            continue; // cov:unreachable: a non-empty part always has a leading token
+        };
+        if is_table_constraint_keyword(&name) {
+            continue;
+        }
+        let declared_type = tokens.rest_as_type();
+        cols.push((name, declared_type));
+    }
+    if cols.is_empty() {
+        None
+    } else {
+        Some(cols)
+    }
 }
 
-/// Just the column **names** from [`column_defs`].
+/// Just the column **names** from [`column_defs`] (the common need). `None` when
+/// the body cannot be parsed with confidence.
 #[must_use]
-pub fn column_names(_create_sql: &str) -> Option<Vec<String>> {
-    unimplemented!("RED")
+pub fn column_names(create_sql: &str) -> Option<Vec<String>> {
+    Some(
+        column_defs(create_sql)?
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect(),
+    )
+}
+
+/// The substring between the first top-level `(` and its matching `)`,
+/// respecting string/identifier quoting so a delimiter inside `'…'` / `"…"` /
+/// `` `…` `` / `[…]` does not affect nesting. `None` if unbalanced or absent.
+fn outermost_paren_body(sql: &str) -> Option<&str> {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let mut start = None;
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' | b'`' => quote = Some(c),
+            b'[' => quote = Some(b']'),
+            b'(' => {
+                if start.is_none() {
+                    start = Some(i + 1);
+                    depth = 1;
+                } else {
+                    depth += 1;
+                }
+            }
+            b')' => {
+                if start.is_some() {
+                    depth -= 1;
+                    if depth == 0 {
+                        return sql.get(start?..i);
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split a column-list body on **top-level** commas (depth 0), respecting nested
+/// parens and the four quote styles so a comma inside `CHECK(a,b)` or a quoted
+/// string never splits a column.
+fn split_top_level(body: &str) -> Vec<&str> {
+    let bytes = body.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' | b'`' => quote = Some(c),
+            b'[' => quote = Some(b']'),
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                if let Some(p) = body.get(start..i) {
+                    parts.push(p);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if let Some(p) = body.get(start..) {
+        parts.push(p);
+    }
+    parts
+}
+
+/// Whether `word` (already extracted as a part's first identifier) names a
+/// table-level constraint clause rather than a column.
+fn is_table_constraint_keyword(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN" | "KEY"
+    )
+}
+
+/// A tiny cursor over one column-definition part that yields the leading
+/// identifier (quoted/bracketed/backtick/bare) and then the remaining tokens as
+/// the declared type.
+struct ColumnTokens<'a> {
+    rest: &'a str,
+}
+
+impl<'a> ColumnTokens<'a> {
+    fn new(part: &'a str) -> Self {
+        Self { rest: part }
+    }
+
+    /// Read and consume the leading identifier of the part, unescaping the four
+    /// quote styles. `None` when the part has no identifier start.
+    fn next_identifier(&mut self) -> Option<String> {
+        let s = self.rest.trim_start();
+        let bytes = s.as_bytes();
+        let first = *bytes.first()?;
+        let (name, consumed) = match first {
+            b'"' | b'`' => read_quoted(s, char::from(first)),
+            b'[' => read_quoted(s, ']'),
+            _ => read_bare(s),
+        }?;
+        self.rest = s.get(consumed..).unwrap_or("");
+        Some(name)
+    }
+
+    /// The remainder of the part (after the column name), trimmed, as the
+    /// declared type. We keep the whole remainder so `VARCHAR(20)` and
+    /// `DOUBLE PRECISION` survive. An empty remainder means no declared type.
+    fn rest_as_type(&self) -> String {
+        self.rest.trim().to_string()
+    }
+}
+
+/// Read a quoted identifier opened by the first byte (closing delimiter
+/// `close`), returning `(unescaped_name, bytes_consumed_including_delimiters)`.
+/// A doubled closing delimiter (`""` inside `"…"`) is an escaped literal per
+/// SQL rules (not applicable to `[...]`).
+fn read_quoted(s: &str, close: char) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    let close_b = close as u8;
+    let mut name = String::new();
+    let mut i = 1usize; // skip opening delimiter
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == close_b {
+            if close_b != b']' && bytes.get(i + 1) == Some(&close_b) {
+                name.push(close);
+                i += 2;
+                continue;
+            }
+            return Some((name, i + 1));
+        }
+        name.push(char::from(c));
+        i += 1;
+    }
+    None // unterminated quote → low confidence
+}
+
+/// Read a bare (unquoted) identifier: every byte up to the first whitespace or
+/// `(`. Returns `(name, bytes_consumed)`.
+fn read_bare(s: &str) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() || c == b'(' {
+            break;
+        }
+        i += 1;
+    }
+    if i == 0 {
+        return None; // cov:unreachable: callers trim and check non-empty before this
+    }
+    Some((s.get(..i)?.to_string(), i))
 }
 
 #[cfg(test)]

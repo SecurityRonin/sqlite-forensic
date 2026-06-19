@@ -1027,16 +1027,40 @@ pub enum Attribution {
 /// with no declared type) accepts any value, matching SQLite's "no datatype"
 /// semantics.
 #[must_use]
-pub fn value_fits_affinity(_value: &Value, _affinity: sqlite_core::attribution::Affinity) -> bool {
-    unimplemented!("RED")
+pub fn value_fits_affinity(value: &Value, affinity: sqlite_core::attribution::Affinity) -> bool {
+    use sqlite_core::attribution::Affinity;
+    // BLOB affinity (incl. no-declared-type columns) is SQLite's catch-all: a
+    // value of any storage class can live there.
+    if affinity == Affinity::Blob {
+        return true;
+    }
+    match value {
+        // A NULL fits any column.
+        Value::Null => true,
+        Value::Integer(_) | Value::Real(_) => matches!(
+            affinity,
+            Affinity::Integer | Affinity::Real | Affinity::Numeric
+        ),
+        // NUMERIC accepts text too (SQLite stores a non-numeric string as text in
+        // a NUMERIC column), so a TEXT value is consistent with TEXT or NUMERIC.
+        Value::Text(_) => matches!(affinity, Affinity::Text | Affinity::Numeric),
+        // A BLOB only sits in a BLOB column (handled above) — never a typed one.
+        Value::Blob(_) => false,
+    }
 }
 
 /// Whether a carved record's values match a live table's shape: equal column
 /// count AND every value storage-compatible with the corresponding column
 /// affinity ([`value_fits_affinity`]).
 #[must_use]
-pub fn shape_matches(_values: &[Value], _table: &sqlite_core::attribution::LiveTable) -> bool {
-    unimplemented!("RED")
+pub fn shape_matches(values: &[Value], table: &sqlite_core::attribution::LiveTable) -> bool {
+    if values.len() != table.affinities.len() {
+        return false;
+    }
+    values
+        .iter()
+        .zip(&table.affinities)
+        .all(|(v, &aff)| value_fits_affinity(v, aff))
 }
 
 /// The names of every live table whose shape a record's values match, in the
@@ -1044,10 +1068,14 @@ pub fn shape_matches(_values: &[Value], _table: &sqlite_core::attribution::LiveT
 /// a clean guess; more than one → ambiguous.
 #[must_use]
 pub fn matching_tables(
-    _values: &[Value],
-    _tables: &[sqlite_core::attribution::LiveTable],
+    values: &[Value],
+    tables: &[sqlite_core::attribution::LiveTable],
 ) -> Vec<String> {
-    unimplemented!("RED")
+    tables
+        .iter()
+        .filter(|t| shape_matches(values, t))
+        .map(|t| t.name.clone())
+        .collect()
 }
 
 /// Attribute one carved record to a tier given the live tables and the
@@ -1063,18 +1091,56 @@ pub fn matching_tables(
 ///   or a shape matching no surviving table.
 #[must_use]
 pub fn attribute_record(
-    _rec: &CarvedRecord,
-    _tables: &[sqlite_core::attribution::LiveTable],
-    _page_table_map: &std::collections::BTreeMap<u32, String>,
+    rec: &CarvedRecord,
+    tables: &[sqlite_core::attribution::LiveTable],
+    page_table_map: &std::collections::BTreeMap<u32, String>,
 ) -> Attribution {
-    unimplemented!("RED")
+    // Tier 1 — CERTAIN: an in-page record on a page still owned by a live
+    // table's b-tree. The page→table map is the hard linkage.
+    if matches!(
+        rec.source,
+        RecoverySource::InPageFreeBlock | RecoverySource::FreeblockReconstructed
+    ) {
+        if let Some(name) = page_table_map.get(&rec.page) {
+            return Attribution::Known(name.clone());
+        }
+        // In-page residue on a page that is NOT a live-table page (e.g. the
+        // owning table itself was freed): no certain linkage, and in-page is not
+        // the freelist class, so it is unattributed rather than inferred.
+        return Attribution::Unattributed;
+    }
+
+    // Tier 2 — INFERRED: a whole-page freelist record; the linkage is cut, so
+    // attribute by shape against the surviving tables.
+    if rec.source == RecoverySource::FreelistPage {
+        let mut matches = matching_tables(&rec.values, tables);
+        return match matches.len() {
+            0 => Attribution::Unattributed,
+            1 => Attribution::Inferred {
+                guess: matches.remove(0),
+                ambiguous: false,
+            },
+            _ => Attribution::Inferred {
+                guess: matches.remove(0),
+                ambiguous: true,
+            },
+        };
+    }
+
+    // Tier 3 — UNATTRIBUTED: dropped-table residue or any other source.
+    Attribution::Unattributed
 }
 
 /// Attribute every carved record, reading the live tables and page→table map
 /// from `db` once. The returned vector is parallel to `records`.
 #[must_use]
-pub fn attribute_records(_db: &Database, _records: &[CarvedRecord]) -> Vec<Attribution> {
-    unimplemented!("RED")
+pub fn attribute_records(db: &Database, records: &[CarvedRecord]) -> Vec<Attribution> {
+    let tables = db.live_tables();
+    let page_table_map = db.page_to_table_map();
+    records
+        .iter()
+        .map(|rec| attribute_record(rec, &tables, &page_table_map))
+        .collect()
 }
 
 #[cfg(test)]

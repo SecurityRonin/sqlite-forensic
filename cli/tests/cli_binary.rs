@@ -125,6 +125,91 @@ fn carve_explicit_wal_path() {
     assert!(out.status.success(), "carve --wal <path> must exit 0");
 }
 
+/// Default `carve` (no `--format`) WRITES a rebuilt recovered database to
+/// `<stem>.recovered.db` in the current working directory and prints a one-line
+/// summary to stdout — it does not dump records. The produced file must itself be
+/// a valid SQLite database our reader re-opens.
+#[test]
+fn default_carve_writes_rebuilt_db() {
+    let dir = Scratch::new("rebuild_default");
+    // Copy the evidence into the scratch dir so the recovered db lands beside it
+    // in an isolated CWD (never polluting the repo).
+    let db = dir.join("deleted_places.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "deleted_places.db"])
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "default carve must exit 0");
+
+    let produced = dir.join("deleted_places.recovered.db");
+    assert!(
+        produced.exists(),
+        "default carve must write <stem>.recovered.db in the CWD"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("recovered record") && stdout.contains("deleted_places.recovered.db"),
+        "summary line must report the count and the output path, got: {stdout:?}"
+    );
+    // The produced file re-opens as a valid SQLite database holding our rows.
+    let bytes = std::fs::read(&produced).unwrap();
+    let rebuilt = sqlite_core::Database::open(bytes).expect("recovered db must be valid SQLite");
+    let schema = rebuilt.read_table(1, 5).unwrap();
+    assert!(
+        schema.iter().any(|r| matches!(
+            r.values.get(1),
+            Some(sqlite_core::Value::Text(n)) if n == "recovered_records"
+        )),
+        "the rebuilt db must contain the recovered_records table"
+    );
+}
+
+/// `--out <PATH>` overrides the derived path; the rebuilt db lands exactly there.
+#[test]
+fn carve_out_flag_writes_to_explicit_path() {
+    let dir = Scratch::new("rebuild_out");
+    let target = dir.join("custom_recovered.db");
+    let out = bin()
+        .args(["carve"])
+        .arg(data_dir().join("deleted_places.db"))
+        .arg("--out")
+        .arg(&target)
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "carve --out must exit 0");
+    assert!(target.exists(), "carve --out must write to the given path");
+}
+
+/// The safety guard refuses to write the rebuilt db over the evidence database
+/// (here via `--out` pointing at the input): nonzero exit, evidence untouched.
+#[test]
+fn carve_out_equal_to_evidence_is_refused() {
+    let dir = Scratch::new("rebuild_guard");
+    let db = dir.join("evidence.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+    let before = std::fs::read(&db).unwrap();
+
+    let out = bin()
+        .args(["carve"])
+        .arg(&db)
+        .arg("--out")
+        .arg(&db)
+        .output()
+        .expect("run carve");
+    assert!(
+        !out.status.success(),
+        "writing the rebuilt db over the evidence must be refused"
+    );
+    let after = std::fs::read(&db).unwrap();
+    assert_eq!(
+        before, after,
+        "the evidence file must be left byte-identical"
+    );
+}
+
 /// `audit` grades anomalies on a real database and exits 0, driving `run_audit`,
 /// `open_db`, and the `ConfidenceArg`/`FormatArg` conversions used by the audit
 /// path's table renderer.

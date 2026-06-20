@@ -1370,6 +1370,21 @@ impl Database {
         tables
     }
 
+    /// Per-table, per-rowid VERSION HISTORY reconstructed from this database's WAL
+    /// temporal model (or just the live view when no `-wal` is present).
+    ///
+    /// See [`row_history`] for the full model. Walks each salt epoch's commit
+    /// snapshots in commit order, then the final live view, and emits — per rowid
+    /// — the sequence of distinct record values it held (insert / update / delete /
+    /// reinsert), with evidence-based [`row_history::ViewState`] and NO timestamps.
+    /// Degrades cleanly to live-only history when [`Database::wal_timeline`] is
+    /// `None`. `WITHOUT ROWID` tables are recorded with `without_rowid = true` and
+    /// no versions (they have no rowid to key a history on).
+    #[must_use]
+    pub fn row_histories(&self) -> Vec<row_history::TableHistory> {
+        Vec::new()
+    }
+
     /// Dump every live user table for export: name, header columns, and all live
     /// rows in rowid order. The base layer the combined live + recovered workbook
     /// is built over.

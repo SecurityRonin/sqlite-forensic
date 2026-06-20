@@ -173,15 +173,15 @@ fn carve_explicit_wal_path() {
     assert!(out.status.success(), "carve --wal <path> must exit 0");
 }
 
-/// Default `carve` (no `--format`) WRITES a rebuilt recovered database to
-/// `<stem>.recovered.db` in the current working directory and prints a one-line
-/// summary to stdout — it does not dump records. The produced file must itself be
-/// a valid SQLite database our reader re-opens.
+/// Default `carve` (no `--format`, no `--db`) WRITES the combined
+/// `<stem>.recovered.xlsx` workbook in the current working directory and prints a
+/// one-line summary to stdout — and does NOT write a `.carved.db`. The produced
+/// xlsx is the combined live + recovered workbook (the live table's own sheet).
 #[test]
-fn default_carve_writes_rebuilt_db() {
-    let dir = Scratch::new("rebuild_default");
-    // Copy the evidence into the scratch dir so the recovered db lands beside it
-    // in an isolated CWD (never polluting the repo).
+fn default_carve_writes_combined_xlsx_not_db() {
+    use calamine::Reader;
+
+    let dir = Scratch::new("default_xlsx");
     let db = dir.join("deleted_places.db");
     std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
 
@@ -192,53 +192,104 @@ fn default_carve_writes_rebuilt_db() {
         .expect("run carve");
     assert!(out.status.success(), "default carve must exit 0");
 
-    let produced = dir.join("deleted_places.recovered.db");
+    let xlsx = dir.join("deleted_places.recovered.xlsx");
     assert!(
-        produced.exists(),
-        "default carve must write <stem>.recovered.db in the CWD"
+        xlsx.exists(),
+        "default carve must write <stem>.recovered.xlsx in the CWD"
+    );
+    assert!(
+        !dir.join("deleted_places.carved.db").exists(),
+        "default carve must NOT write a .carved.db (db is opt-in via --db)"
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("record(s)") && stdout.contains("deleted_places.recovered.db"),
-        "summary line must report the count and the output path, got: {stdout:?}"
+        stdout.contains("record(s)") && stdout.contains("deleted_places.recovered.xlsx"),
+        "summary line must report the count and the xlsx path, got: {stdout:?}"
     );
-    // The produced file re-opens as a valid SQLite database holding our rows,
-    // split into attribution-tiered recovered_* tables (here moz_places is the
-    // sole live table, so rows land in recovered_moz_places / recovered_inferred).
-    let bytes = std::fs::read(&produced).unwrap();
-    let rebuilt = sqlite_core::Database::open(bytes).expect("recovered db must be valid SQLite");
+    // The produced xlsx is the COMBINED workbook: the live table's own sheet with
+    // the three trailing flag columns.
+    let mut wb: calamine::Xlsx<_> =
+        calamine::open_workbook(&xlsx).expect("xlsx must open in calamine");
+    let names = wb.sheet_names();
+    assert!(
+        names.iter().any(|n| n == "moz_places"),
+        "the live table gets its own combined sheet: {names:?}"
+    );
+}
+
+/// `carve --db` ADDITIONALLY writes the rebuilt `<stem>.carved.db` alongside the
+/// default xlsx. The produced db re-opens as valid SQLite with recovered_* tables;
+/// the summary names both files.
+#[test]
+fn carve_db_flag_writes_xlsx_and_carved_db() {
+    let dir = Scratch::new("db_flag");
+    let db = dir.join("deleted_places.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "deleted_places.db", "--db"])
+        .output()
+        .expect("run carve --db");
+    assert!(out.status.success(), "carve --db must exit 0");
+
+    let xlsx = dir.join("deleted_places.recovered.xlsx");
+    let carved = dir.join("deleted_places.carved.db");
+    assert!(xlsx.exists(), "the combined .xlsx must be written");
+    assert!(carved.exists(), "--db must additionally write .carved.db");
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("deleted_places.recovered.xlsx")
+            && stdout.contains("deleted_places.carved.db"),
+        "summary must mention both files, got: {stdout:?}"
+    );
+
+    let bytes = std::fs::read(&carved).unwrap();
+    let rebuilt = sqlite_core::Database::open(bytes).expect("carved db must be valid SQLite");
     let schema = rebuilt.read_table(1, 5).unwrap();
     assert!(
         schema.iter().any(|r| matches!(
             r.values.get(1),
             Some(sqlite_core::Value::Text(n)) if n.starts_with("recovered_")
         )),
-        "the rebuilt db must contain at least one recovered_* attribution table"
+        "the carved db must contain at least one recovered_* attribution table"
     );
 }
 
-/// `--out <PATH>` overrides the derived path; the rebuilt db lands exactly there.
+/// `--out <STEM>` overrides the derived stem for BOTH outputs; with `--db` the
+/// carved db lands at `<stem>.carved.db` and the xlsx at `<stem>.recovered.xlsx`.
 #[test]
-fn carve_out_flag_writes_to_explicit_path() {
-    let dir = Scratch::new("rebuild_out");
-    let target = dir.join("custom_recovered.db");
+fn carve_out_flag_sets_stem_for_both_outputs() {
+    let dir = Scratch::new("out_stem");
+    let stem = dir.join("custom");
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("deleted_places.db"))
+        .args(["--db"])
         .arg("--out")
-        .arg(&target)
+        .arg(&stem)
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve --out must exit 0");
-    assert!(target.exists(), "carve --out must write to the given path");
+    assert!(
+        dir.join("custom.recovered.xlsx").exists(),
+        "xlsx lands at <stem>.recovered.xlsx"
+    );
+    assert!(
+        dir.join("custom.carved.db").exists(),
+        "carved db lands at <stem>.carved.db"
+    );
 }
 
-/// The safety guard refuses to write the rebuilt db over the evidence database
-/// (here via `--out` pointing at the input): nonzero exit, evidence untouched.
+/// The safety guard refuses to write an output over the evidence database. Here
+/// the evidence is named `case.recovered.xlsx` and `--out` is the stem `case`, so
+/// the derived combined workbook would land exactly on the evidence: refused,
+/// evidence untouched.
 #[test]
-fn carve_out_equal_to_evidence_is_refused() {
+fn carve_out_collision_with_evidence_is_refused() {
     let dir = Scratch::new("rebuild_guard");
-    let db = dir.join("evidence.db");
+    let db = dir.join("case.recovered.xlsx");
     std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
     let before = std::fs::read(&db).unwrap();
 
@@ -246,12 +297,12 @@ fn carve_out_equal_to_evidence_is_refused() {
         .args(["carve"])
         .arg(&db)
         .arg("--out")
-        .arg(&db)
+        .arg(dir.join("case"))
         .output()
         .expect("run carve");
     assert!(
         !out.status.success(),
-        "writing the rebuilt db over the evidence must be refused"
+        "writing the combined xlsx over the evidence must be refused"
     );
     let after = std::fs::read(&db).unwrap();
     assert_eq!(
@@ -339,14 +390,13 @@ fn malformed_db_audit_exits_nonzero() {
     assert!(stderr.contains("error"), "must report the parse error");
 }
 
-// ---- xlsx export (`carve --xlsx`) -------------------------------------------
+// ---- default combined workbook + opt-in db (`carve` / `carve --db`) ----------
 
-/// `carve --xlsx` on a real fixture writes BOTH `<stem>.recovered.db` and
-/// `<stem>.recovered.xlsx`. The xlsx is now the COMBINED workbook: the source DB
-/// dumped one sheet per live table (here `moz_places`) with recovered rows folded
-/// in. The summary mentions both files.
+/// The default `carve` writes the COMBINED workbook: the source DB dumped one
+/// sheet per live table (here `moz_places`) with recovered rows folded in, each
+/// carrying the three trailing flag columns and interleaving live + recovered rows.
 #[test]
-fn carve_xlsx_writes_db_and_xlsx() {
+fn default_carve_combined_workbook_folds_recovered_rows() {
     use calamine::Reader;
 
     let dir = Scratch::new("xlsx_export");
@@ -355,22 +405,13 @@ fn carve_xlsx_writes_db_and_xlsx() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "deleted_places.db", "--xlsx"])
+        .args(["carve", "deleted_places.db"])
         .output()
-        .expect("run carve --xlsx");
-    assert!(out.status.success(), "carve --xlsx must exit 0");
+        .expect("run carve");
+    assert!(out.status.success(), "default carve must exit 0");
 
-    let recovered_db = dir.join("deleted_places.recovered.db");
     let recovered_xlsx = dir.join("deleted_places.recovered.xlsx");
-    assert!(recovered_db.exists(), "the rebuilt .db must be written");
-    assert!(recovered_xlsx.exists(), "the .xlsx must be written too");
-
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(
-        stdout.contains("deleted_places.recovered.db")
-            && stdout.contains("deleted_places.recovered.xlsx"),
-        "summary must mention both files, got: {stdout:?}"
-    );
+    assert!(recovered_xlsx.exists(), "the .xlsx must be written");
 
     // The combined workbook opens in calamine with the live table's own sheet
     // (`moz_places`), carrying the three trailing flag columns.
@@ -416,11 +457,11 @@ fn carve_xlsx_writes_db_and_xlsx() {
     );
 }
 
-/// `carve --xlsx` with a fixture that surfaces a fragment writes the combined
+/// The default `carve` over a fixture that surfaces a fragment writes the combined
 /// workbook with BOTH the live table's own sheet (`users`) and the separate
 /// `recovered_fragments` tab.
 #[test]
-fn carve_xlsx_includes_fragment_sheet() {
+fn default_carve_xlsx_includes_fragment_sheet() {
     use calamine::Reader;
 
     let dir = Scratch::new("xlsx_frags");
@@ -429,10 +470,10 @@ fn carve_xlsx_includes_fragment_sheet() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "0D-01.db", "--xlsx"])
+        .args(["carve", "0D-01.db"])
         .output()
-        .expect("run carve --xlsx");
-    assert!(out.status.success(), "carve --xlsx must exit 0");
+        .expect("run carve");
+    assert!(out.status.success(), "default carve must exit 0");
 
     let recovered_xlsx = dir.join("0D-01.recovered.xlsx");
     assert!(recovered_xlsx.exists(), "the .xlsx must be written");
@@ -448,27 +489,23 @@ fn carve_xlsx_includes_fragment_sheet() {
     );
 }
 
-/// `--xlsx` when the xlsx companion cannot be written (its path is occupied by a
-/// directory, while the rebuilt `.db` writes fine) is a write error: nonzero exit
-/// with the xlsx diagnostic. Exercises the xlsx-write error arm specifically (the
-/// `.db` write succeeds first, so this is the xlsx path failing on its own).
+/// When the default xlsx cannot be written (its derived path is occupied by a
+/// directory) the carve is a write error: nonzero exit with the xlsx diagnostic.
 #[test]
-fn carve_xlsx_write_failure_exits_nonzero() {
+fn default_carve_xlsx_write_failure_exits_nonzero() {
     let dir = Scratch::new("xlsx_writefail");
     let db = dir.join("evidence.db");
     std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
-    // Occupy the derived xlsx path with a directory so writing the file there
-    // fails, while the sibling `.db` path remains writable.
-    std::fs::create_dir(dir.join("recovered.xlsx")).unwrap();
+    // Occupy the derived xlsx path with a directory so writing the file there fails.
+    std::fs::create_dir(dir.join("recovered.recovered.xlsx")).unwrap();
 
     let out = bin()
         .args(["carve"])
         .arg(&db)
-        .arg("--xlsx")
         .arg("--out")
-        .arg(dir.join("recovered.db"))
+        .arg(dir.join("recovered"))
         .output()
-        .expect("run carve --xlsx");
+        .expect("run carve");
     assert!(
         !out.status.success(),
         "an unwritable xlsx path must fail the carve"
@@ -480,19 +517,19 @@ fn carve_xlsx_write_failure_exits_nonzero() {
     );
 }
 
-/// `--xlsx` is refused in the stdout text modes (`--format`): clap rejects the
+/// `--db` is refused in the stdout text modes (`--format`): clap rejects the
 /// combination with a nonzero exit rather than silently ignoring the flag.
 #[test]
-fn carve_xlsx_conflicts_with_format() {
+fn carve_db_flag_conflicts_with_format() {
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("deleted_places.db"))
-        .args(["--xlsx", "--format", "csv"])
+        .args(["--db", "--format", "csv"])
         .output()
         .expect("run carve");
     assert!(
         !out.status.success(),
-        "--xlsx with --format must be refused by clap"
+        "--db with --format must be refused by clap"
     );
 }
 
@@ -663,30 +700,31 @@ fn carve_format_malformed_db_with_wal_exits_nonzero() {
     assert!(stderr.contains("error"), "must report the parse error");
 }
 
-/// Default (rebuild) mode when the rebuilt db cannot be written (the `--out`
-/// directory does not exist) is a write error: nonzero exit with a diagnostic.
+/// `--db` mode when the carved db cannot be written (the `--out` stem's directory
+/// does not exist) is a write error: nonzero exit with a diagnostic naming the db.
 #[test]
-fn carve_rebuild_write_failure_exits_nonzero() {
+fn carve_db_write_failure_exits_nonzero() {
     let dir = Scratch::new("rebuild_writefail");
     let db = dir.join("evidence.db");
     std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
-    // A target inside a directory that does not exist → std::fs::write fails.
-    let target = dir.join("nonexistent_subdir").join("recovered.db");
+    // A stem inside a directory that does not exist → std::fs::write fails.
+    let target = dir.join("nonexistent_subdir").join("recovered");
 
     let out = bin()
         .args(["carve"])
         .arg(&db)
+        .args(["--db"])
         .arg("--out")
         .arg(&target)
         .output()
         .expect("run carve");
     assert!(
         !out.status.success(),
-        "an unwritable output path must fail the rebuild carve"
+        "an unwritable output path must fail the carve"
     );
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
-        stderr.contains("cannot write recovered db"),
+        stderr.contains("cannot write carved db"),
         "must report the write error, got: {stderr}"
     );
 }
@@ -711,18 +749,18 @@ fn default_carve_writes_attributed_table_and_fragments() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "0D-01.db"])
+        .args(["carve", "0D-01.db", "--db"])
         .output()
         .expect("run carve");
-    assert!(out.status.success(), "default carve must exit 0");
+    assert!(out.status.success(), "carve --db must exit 0");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
         stdout.contains("record(s)") && stdout.contains("fragment(s)"),
         "summary must report both records and fragments, got: {stdout:?}"
     );
 
-    let produced = dir.join("0D-01.recovered.db");
-    assert!(produced.exists(), "rebuilt db must be written");
+    let produced = dir.join("0D-01.carved.db");
+    assert!(produced.exists(), "carved db must be written");
 
     // The external engine lists the attributed Tier-1 table + the fragment table.
     let tables = sqlite3_query(
@@ -777,17 +815,20 @@ fn no_fragments_omits_the_fragment_table() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "0D-01.db", "--no-fragments"])
+        .args(["carve", "0D-01.db", "--db", "--no-fragments"])
         .output()
         .expect("run carve");
-    assert!(out.status.success(), "carve --no-fragments must exit 0");
+    assert!(
+        out.status.success(),
+        "carve --db --no-fragments must exit 0"
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
         stdout.contains("record(s)") && !stdout.contains("fragment(s)"),
         "summary must report records only, got: {stdout:?}"
     );
 
-    let produced = dir.join("0D-01.recovered.db");
+    let produced = dir.join("0D-01.carved.db");
     let tables = sqlite3_query(
         &sqlite3,
         &produced,
@@ -861,12 +902,12 @@ fn three_tier_attribution_round_trips_through_sqlite3() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "tier.db"])
+        .args(["carve", "tier.db", "--db"])
         .output()
         .expect("run carve");
-    assert!(out.status.success(), "carve must exit 0");
+    assert!(out.status.success(), "carve --db must exit 0");
 
-    let produced = dir.join("tier.recovered.db");
+    let produced = dir.join("tier.carved.db");
     let tables = sqlite3_query(
         &sqlite3,
         &produced,
@@ -917,8 +958,8 @@ fn three_tier_attribution_round_trips_through_sqlite3() {
 }
 
 /// The headline combined-workbook layout, end to end via calamine. On the
-/// three-tier fixture `--xlsx` writes the source DB dumped per live table with
-/// recovered rows folded back in:
+/// three-tier fixture the default `carve` writes the source DB dumped per live
+/// table with recovered rows folded back in:
 /// - `people` sheet interleaves its live rows with the Tier-1 deleted row (rowid
 ///   3) in rowid order, `is_deleted=1` only on the recovered row;
 /// - `amounts` sheet folds the Tier-2 freed-page rows in with `is_guessed=1`;
@@ -938,10 +979,10 @@ fn xlsx_combined_workbook_folds_recovered_into_live_sheets() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "tier.db", "--xlsx"])
+        .args(["carve", "tier.db"])
         .output()
-        .expect("run carve --xlsx");
-    assert!(out.status.success(), "carve --xlsx must exit 0");
+        .expect("run carve");
+    assert!(out.status.success(), "carve must exit 0");
 
     let xlsx = dir.join("tier.recovered.xlsx");
     assert!(xlsx.exists(), "xlsx companion must be written");
@@ -1061,12 +1102,12 @@ fn deleted_places_rows_all_attribute_somewhere() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "deleted_places.db"])
+        .args(["carve", "deleted_places.db", "--db"])
         .output()
         .expect("run carve");
-    assert!(out.status.success(), "carve must exit 0");
+    assert!(out.status.success(), "carve --db must exit 0");
 
-    let produced = dir.join("deleted_places.recovered.db");
+    let produced = dir.join("deleted_places.carved.db");
     // Sum the row counts across every recovered_* attribution table.
     let table_names = sqlite3_query(
         &sqlite3,
@@ -1120,10 +1161,10 @@ fn xlsx_combined_embeds_live_image_blob() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "media.db", "--xlsx"])
+        .args(["carve", "media.db"])
         .output()
-        .expect("run carve --xlsx");
-    assert!(out.status.success(), "carve --xlsx must exit 0");
+        .expect("run carve");
+    assert!(out.status.success(), "carve must exit 0");
 
     let xlsx = dir.join("media.recovered.xlsx");
     assert!(xlsx.exists(), "xlsx companion must be written");

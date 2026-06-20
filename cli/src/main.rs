@@ -446,36 +446,38 @@ mod tests {
         );
     }
 
-    /// `--xlsx` is an addition to the default rebuild mode: it parses, sets the
-    /// flag, and leaves the rebuilt-db write path active.
+    /// The bare default carve writes the combined xlsx and NOT the db: the file
+    /// surface is xlsx-only unless `--db` is given.
     #[test]
-    fn xlsx_flag_parses_in_rebuild_mode() {
-        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "--xlsx"]);
-        assert!(args.xlsx, "--xlsx must set the flag");
+    fn default_carve_writes_xlsx_not_db() {
+        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite"]);
         assert!(
-            args.writes_rebuilt_db(),
-            "--xlsx stays in the rebuilt-db (default) write mode"
+            args.writes_xlsx(),
+            "the default carve writes the combined xlsx"
         );
+        assert!(!args.db_flag, "the rebuilt db is opt-in (no --db given)");
     }
 
-    /// `--xlsx` is a rebuild-mode-only concern; it conflicts with the stdout text
+    /// `--db` ADDITIONALLY writes the rebuilt SQLite database alongside the xlsx:
+    /// it parses, sets the flag, and keeps the xlsx-writing default active.
+    #[test]
+    fn db_flag_adds_the_rebuilt_database() {
+        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "--db"]);
+        assert!(args.db_flag, "--db must set the flag");
+        assert!(args.writes_xlsx(), "--db keeps the default xlsx output");
+    }
+
+    /// `--db` is a file-output (default) concern; it conflicts with the stdout text
     /// modes so clap rejects the combination rather than silently ignoring it.
     #[test]
-    fn xlsx_conflicts_with_stdout_modes() {
+    fn db_flag_conflicts_with_stdout_modes() {
         for argv in [
-            &[
-                "sqlite4n6",
-                "carve",
-                "db.sqlite",
-                "--xlsx",
-                "--format",
-                "csv",
-            ][..],
-            &["sqlite4n6", "carve", "db.sqlite", "--xlsx", "--rowid-only"][..],
+            &["sqlite4n6", "carve", "db.sqlite", "--db", "--format", "csv"][..],
+            &["sqlite4n6", "carve", "db.sqlite", "--db", "--rowid-only"][..],
         ] {
             assert!(
                 Cli::try_parse_from(argv).is_err(),
-                "--xlsx must conflict with {argv:?}"
+                "--db must conflict with {argv:?}"
             );
         }
     }

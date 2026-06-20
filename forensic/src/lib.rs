@@ -1149,7 +1149,8 @@ pub fn attribute_records(db: &Database, records: &[CarvedRecord]) -> Vec<Attribu
 /// Carved residue is ORDER-UNKNOWN: a freeblock persists across commits, so
 /// [`carve_at_commit`] / [`carve_with_fragments`] tag where residue was OBSERVED,
 /// not where the row was deleted. Each carved record is therefore emitted as a
-/// [`VersionOrigin::CarvedResidue`] / [`ViewState::CarvedResidue`] version with
+/// [`CarvedResidue`](sqlite_core::row_history::VersionOrigin::CarvedResidue) /
+/// [`CarvedResidue`](sqlite_core::row_history::ViewState::CarvedResidue) version with
 /// `commit_seq: None` (never a fabricated commit position), `is_deleted: true`,
 /// and `is_guessed` set when its [`Attribution`] is `Inferred`. Residue is
 /// attributed to a table via [`attribute_records`] and DEDUPED against any WAL

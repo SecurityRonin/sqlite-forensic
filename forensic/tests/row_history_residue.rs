@@ -50,8 +50,8 @@ fn writer_sql(bin: &str, db: &Path, sql: &str) {
 
 /// The `updated_messages.db` fixture holds the genuine PRIOR version of row 7
 /// ("PRIORVERSION…") in slack — recoverable ONLY by carving, never a live row.
-/// It must surface as an order-unknown CarvedResidue version of `messages`, with
-/// no fabricated commit_seq.
+/// It must surface as an order-unknown `CarvedResidue` version of `messages`,
+/// with no fabricated `commit_seq`.
 #[test]
 fn carved_prior_version_is_order_unknown_residue() {
     let db_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/data/updated_messages.db");
@@ -107,8 +107,8 @@ fn carved_prior_version_is_order_unknown_residue() {
 
 /// Without any carvable residue beyond what the WAL already shows, the residue
 /// merge adds nothing the base history did not have (no double-listing). The
-/// deleted_places fixture's deleted rows are carved residue with no WAL, so they
-/// appear exactly once as CarvedResidue.
+/// `deleted_places` fixture's deleted rows are carved residue with no WAL, so
+/// they appear exactly once as `CarvedResidue`.
 #[test]
 fn residue_is_not_double_listed() {
     let db_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/data/deleted_places.db");
@@ -130,7 +130,7 @@ fn residue_is_not_double_listed() {
 }
 
 /// With a real WAL, a deleted row already surfaced as a WAL `AbsentInFinalView`
-/// version must NOT be re-listed as a separate CarvedResidue version of the same
+/// version must NOT be re-listed as a separate `CarvedResidue` version of the same
 /// rowid + values (the WAL holds it at higher fidelity). Mints the C1/C2/C3
 /// fixture (rowid 2 'b' and rowid 4 'x' both deleted) and asserts each deleted
 /// (rowid, body) pair appears EXACTLY ONCE across the whole history.

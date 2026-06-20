@@ -7,6 +7,9 @@
 //! The binary path is injected by Cargo as `CARGO_BIN_EXE_sqlite4n6`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// Calamine surfaces integer flag cells (is_deleted / is_guessed) as exact f64
+// 0.0/1.0; comparing them by equality is correct here, not a precision hazard.
+#![allow(clippy::float_cmp)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -339,8 +342,9 @@ fn malformed_db_audit_exits_nonzero() {
 // ---- xlsx export (`carve --xlsx`) -------------------------------------------
 
 /// `carve --xlsx` on a real fixture writes BOTH `<stem>.recovered.db` and
-/// `<stem>.recovered.xlsx`, and the xlsx opens in calamine with the
-/// `recovered_records` sheet. The summary mentions both files.
+/// `<stem>.recovered.xlsx`. The xlsx is now the COMBINED workbook: the source DB
+/// dumped one sheet per live table (here `moz_places`) with recovered rows folded
+/// in. The summary mentions both files.
 #[test]
 fn carve_xlsx_writes_db_and_xlsx() {
     use calamine::Reader;
@@ -368,22 +372,53 @@ fn carve_xlsx_writes_db_and_xlsx() {
         "summary must mention both files, got: {stdout:?}"
     );
 
-    // The produced xlsx opens in calamine and carries a per-tier sheet (here
-    // moz_places is the sole live table, so its rows attribute to
-    // recovered_moz_places / recovered_inferred).
+    // The combined workbook opens in calamine with the live table's own sheet
+    // (`moz_places`), carrying the three trailing flag columns.
     let mut wb: calamine::Xlsx<_> =
         calamine::open_workbook(&recovered_xlsx).expect("xlsx must open in calamine");
     let names = wb.sheet_names();
-    let sheet = names
+    assert!(
+        names.iter().any(|n| n == "moz_places"),
+        "the live table gets its own combined sheet: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "recovered_inferred"),
+        "inferred rows fold into table sheets, not a separate tab: {names:?}"
+    );
+    let sheet = wb.worksheet_range("moz_places").unwrap();
+    let header: Vec<String> = sheet
+        .rows()
+        .next()
+        .unwrap()
         .iter()
-        .find(|n| n.as_str() == "recovered_moz_places" || n.as_str() == "recovered_inferred")
-        .unwrap_or_else(|| panic!("an attribution sheet present: {names:?}"))
-        .clone();
-    let _ = wb.worksheet_range(&sheet);
+        .map(std::string::ToString::to_string)
+        .collect();
+    for flag in ["is_deleted", "is_guessed", "table_match_ambiguous"] {
+        assert!(
+            header.iter().any(|h| h == flag),
+            "trailing flag column {flag} present: {header:?}"
+        );
+    }
+    // Both live (is_deleted=0) and recovered (is_deleted=1) rows are present.
+    let del_col = header.iter().position(|h| h == "is_deleted").unwrap();
+    let mut saw_live = false;
+    let mut saw_deleted = false;
+    for row in sheet.rows().skip(1) {
+        match &row[del_col] {
+            calamine::Data::Float(f) if *f == 0.0 => saw_live = true,
+            calamine::Data::Float(f) if *f == 1.0 => saw_deleted = true,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_live && saw_deleted,
+        "combined sheet interleaves live + recovered rows"
+    );
 }
 
-/// `carve --xlsx` with a fixture that surfaces a fragment writes a workbook with
-/// BOTH the attributed Tier-1 sheet (`recovered_users`) and `recovered_fragments`.
+/// `carve --xlsx` with a fixture that surfaces a fragment writes the combined
+/// workbook with BOTH the live table's own sheet (`users`) and the separate
+/// `recovered_fragments` tab.
 #[test]
 fn carve_xlsx_includes_fragment_sheet() {
     use calamine::Reader;
@@ -404,8 +439,8 @@ fn carve_xlsx_includes_fragment_sheet() {
     let wb: calamine::Xlsx<_> = calamine::open_workbook(&recovered_xlsx).expect("xlsx must open");
     let names = wb.sheet_names();
     assert!(
-        names.iter().any(|n| n == "recovered_users"),
-        "Tier-1 sheet present: {names:?}"
+        names.iter().any(|n| n == "users"),
+        "the live table's own combined sheet present: {names:?}"
     );
     assert!(
         names.iter().any(|n| n == "recovered_fragments"),
@@ -881,14 +916,20 @@ fn three_tier_attribution_round_trips_through_sqlite3() {
     );
 }
 
-/// `--xlsx` writes one sheet per recovered table with sanitized names; calamine
-/// (a real external reader) confirms the per-tier sheets exist.
+/// The headline combined-workbook layout, end to end via calamine. On the
+/// three-tier fixture `--xlsx` writes the source DB dumped per live table with
+/// recovered rows folded back in:
+/// - `people` sheet interleaves its live rows with the Tier-1 deleted row (rowid
+///   3) in rowid order, `is_deleted=1` only on the recovered row;
+/// - `amounts` sheet folds the Tier-2 freed-page rows in with `is_guessed=1`;
+/// - `recovered_unattributed` (the dropped `secret` table) and
+///   `recovered_fragments` are SEPARATE tabs; there is no `recovered_inferred`.
 #[test]
-fn xlsx_has_one_sheet_per_recovered_table() {
-    use calamine::Reader;
+fn xlsx_combined_workbook_folds_recovered_into_live_sheets() {
+    use calamine::{Data, Reader};
 
     let Some(sqlite3) = sqlite3_bin() else {
-        eprintln!("SKIP xlsx_has_one_sheet_per_recovered_table: no sqlite3");
+        eprintln!("SKIP xlsx_combined_workbook_folds_recovered_into_live_sheets: no sqlite3");
         return;
     };
     let dir = Scratch::new("three_tier_xlsx");
@@ -904,19 +945,104 @@ fn xlsx_has_one_sheet_per_recovered_table() {
 
     let xlsx = dir.join("tier.recovered.xlsx");
     assert!(xlsx.exists(), "xlsx companion must be written");
-    let wb: calamine::Xlsx<_> =
+    let mut wb: calamine::Xlsx<_> =
         calamine::open_workbook(&xlsx).expect("calamine must open the xlsx");
     let names = wb.sheet_names();
-    for expected in [
-        "recovered_people",
-        "recovered_inferred",
-        "recovered_unattributed",
-    ] {
+
+    // The two live tables get their own combined sheets; Tier-3 + fragments are
+    // separate; no recovered_inferred tab (inferred rows folded into a sheet).
+    for live in ["people", "amounts"] {
         assert!(
-            names.iter().any(|n| n == expected),
-            "{expected} sheet present in: {names:?}"
+            names.iter().any(|n| n == live),
+            "live table {live} has its own sheet: {names:?}"
         );
     }
+    assert!(
+        names.iter().any(|n| n == "recovered_unattributed"),
+        "Tier-3 in its own tab: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "recovered_fragments"),
+        "fragments in their own tab: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "recovered_inferred"),
+        "no recovered_inferred tab: {names:?}"
+    );
+
+    // Helper: read a sheet's header + the index of a named column.
+    let header_of = |wb: &mut calamine::Xlsx<_>, sheet: &str| -> Vec<String> {
+        wb.worksheet_range(sheet)
+            .unwrap()
+            .rows()
+            .next()
+            .unwrap()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect()
+    };
+
+    // people: header carries the real `id`/`name` columns + the three flags.
+    let people_hdr = header_of(&mut wb, "people");
+    for col in [
+        "id",
+        "name",
+        "is_deleted",
+        "is_guessed",
+        "table_match_ambiguous",
+    ] {
+        assert!(
+            people_hdr.iter().any(|h| h == col),
+            "people header has {col}: {people_hdr:?}"
+        );
+    }
+    let del_col = people_hdr.iter().position(|h| h == "is_deleted").unwrap();
+    let people = wb.worksheet_range("people").unwrap();
+    // is_deleted per data row, in sheet order.
+    let deleted_flags: Vec<f64> = people
+        .rows()
+        .skip(1)
+        .filter_map(|r| match &r[del_col] {
+            Data::Float(d) => Some(*d),
+            _ => None,
+        })
+        .collect();
+    // Four live rows survive the id=3 deletion; the carve folds in at least one
+    // recovered (deleted) row. Both surfaces are present in the one sheet.
+    let live_count = deleted_flags.iter().filter(|&&d| d == 0.0).count();
+    let recovered_count = deleted_flags.iter().filter(|&&d| d == 1.0).count();
+    assert_eq!(
+        live_count, 4,
+        "the four surviving live rows: {deleted_flags:?}"
+    );
+    assert!(
+        recovered_count >= 1,
+        "at least one recovered row folded into people: {deleted_flags:?}"
+    );
+    // Every live row precedes the recovered rows whose rowid was destroyed (this
+    // fixture's freeblock reconstruction nulls the rowid → bottom of the sheet).
+    let last_live = deleted_flags.iter().rposition(|&d| d == 0.0).unwrap();
+    let first_recovered = deleted_flags.iter().position(|&d| d == 1.0).unwrap();
+    assert!(
+        last_live < first_recovered,
+        "destroyed-rowid recovered rows sink below the live rows: {deleted_flags:?}"
+    );
+
+    // amounts: the Tier-2 freed-page rows folded in with is_guessed=1.
+    let amounts_hdr = header_of(&mut wb, "amounts");
+    let gcol = amounts_hdr
+        .iter()
+        .position(|h| h == "is_guessed")
+        .expect("is_guessed column");
+    let amounts = wb.worksheet_range("amounts").unwrap();
+    let any_guessed = amounts
+        .rows()
+        .skip(1)
+        .any(|r| matches!(&r[gcol], Data::Float(f) if *f == 1.0));
+    assert!(
+        any_guessed,
+        "amounts holds at least one inferred (is_guessed=1) recovered row"
+    );
 }
 
 /// The committed `deleted_places.db` (163 carved rows) must attribute every row
@@ -960,5 +1086,61 @@ fn deleted_places_rows_all_attribute_somewhere() {
     assert_eq!(
         total, 163,
         "all 163 carved rows must attribute to a tier table"
+    );
+}
+
+/// The combined workbook embeds a LIVE image BLOB in-cell: the base dump shows
+/// images too, not only recovered rows. A live `photos` row holding a real PNG
+/// must surface as embedded media (`xl/media/*.png`) in the produced xlsx.
+#[test]
+fn xlsx_combined_embeds_live_image_blob() {
+    let Some(sqlite3) = sqlite3_bin() else {
+        eprintln!("SKIP xlsx_combined_embeds_live_image_blob: no sqlite3");
+        return;
+    };
+    let dir = Scratch::new("xlsx_live_image");
+
+    // Encode a small real PNG and drop it beside the db so sqlite3 readfile() can
+    // store it verbatim into a live row (no fragile hex literals in SQL).
+    let png_path = dir.join("pic.png");
+    let img = image::RgbImage::from_fn(24, 24, |x, y| {
+        image::Rgb([(x * 10) as u8, (y * 10) as u8, 128])
+    });
+    img.save(&png_path).expect("write png fixture");
+
+    let db = dir.join("media.db");
+    let script = format!(
+        "PRAGMA secure_delete=OFF;\n\
+         PRAGMA auto_vacuum=0;\n\
+         CREATE TABLE photos (id INTEGER, img BLOB);\n\
+         INSERT INTO photos VALUES (1, readfile('{}'));\n",
+        png_path.display()
+    );
+    mint_db(&sqlite3, &db, &script);
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "media.db", "--xlsx"])
+        .output()
+        .expect("run carve --xlsx");
+    assert!(out.status.success(), "carve --xlsx must exit 0");
+
+    let xlsx = dir.join("media.recovered.xlsx");
+    assert!(xlsx.exists(), "xlsx companion must be written");
+    let bytes = std::fs::read(&xlsx).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut media = false;
+    for i in 0..zip.len() {
+        let name = zip.by_index(i).unwrap().name().to_string();
+        let is_png = std::path::Path::new(&name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+        if name.starts_with("xl/media/") && is_png {
+            media = true;
+        }
+    }
+    assert!(
+        media,
+        "the live image BLOB must embed under xl/media/*.png in the combined workbook"
     );
 }

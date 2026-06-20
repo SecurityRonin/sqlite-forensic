@@ -4428,13 +4428,6 @@ impl PriorSnapshot {
         walk_table_page_with_leaf(self, rootpage, column_count, &mut out, &mut seen)?;
         Ok(out)
     }
-
-    /// The 1-based page numbers carried by the rollback journal (the pages whose
-    /// pre-transaction image differs from the live db). Diagnostic provenance.
-    #[must_use]
-    pub fn changed_pages(&self) -> Vec<u32> {
-        self.overlaid.keys().copied().collect()
-    }
 }
 
 /// Walk a table b-tree like [`walk_table_page`] but record each row's LEAF page,

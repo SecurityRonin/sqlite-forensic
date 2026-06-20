@@ -102,3 +102,31 @@ fn recovers_nist_deletes_and_modifications() {
         assert_eq!(recovery.counts.modified, mods.len());
     }
 }
+
+#[test]
+fn wal_applied_database_yields_empty_recovery_not_panic() {
+    // A db opened WAL-applied must not accept a rollback journal (exclusive
+    // timelines) — carve_rollback_journal degrades to an empty recovery.
+    let main = std::fs::read(cfreds("sft-03-WAL_ios.sqlite")).unwrap();
+    let wal = std::fs::read(cfreds("sft-03-WAL_ios.sqlite-wal")).unwrap();
+    let db = Database::open_with_wal(main, &wal).expect("open_with_wal");
+    let journal = std::fs::read(cfreds("SFT-03_PERSIST_ios.sqlite-journal")).unwrap();
+
+    let recovery = carve_rollback_journal(&db, &journal);
+    assert!(
+        recovery.deleted.is_empty(),
+        "WAL-applied: no journal recovery"
+    );
+    assert!(recovery.modified.is_empty());
+    assert_eq!(recovery.counts, Default::default());
+}
+
+#[test]
+fn garbage_journal_yields_empty_recovery_not_panic() {
+    // A garbage journal (no decodable records) recovers nothing, never panics.
+    let main = std::fs::read(cfreds("SFT-03_PERSIST_ios.sqlite")).unwrap();
+    let db = Database::open(main).expect("open main");
+    let recovery = carve_rollback_journal(&db, &[0xABu8; 64]);
+    assert!(recovery.deleted.is_empty());
+    assert!(recovery.modified.is_empty());
+}

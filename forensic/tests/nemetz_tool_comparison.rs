@@ -1,4 +1,5 @@
-//! Direct head-to-head: **our carver vs `undark` vs `fqlite`**, every tool scored
+//! Direct head-to-head: **our carver vs `undark` vs `fqlite` vs `bring2lite` vs
+//! the SQLite Deleted Records Parser (`sqlparse`/SQL-DRP)**, every tool scored
 //! against the **same** independent Nemetz answer key — exactly as our own carver
 //! is scored in `nemetz_metrics.rs`.
 //!
@@ -7,11 +8,30 @@
 //! `oracle_differential.rs` reconciles our output against undark/fqlite as
 //! *oracles over our own fixture* — it answers "do we agree with them?", not "how
 //! does each tool score against ground truth?". This harness answers the second
-//! question: it runs undark and fqlite over the Nemetz corpus and computes, **per
+//! question: it runs the external tools over the Nemetz corpus and computes, **per
 //! tool, per database**, a confusion matrix against the *same* `.xml` answer keys
-//! the Nemetz authors shipped (`nemetz_ground_truth.json`). All three tools pass
+//! the Nemetz authors shipped (`nemetz_ground_truth.json`). All tools pass
 //! through the identical ground-truth comparison, so the recall/precision numbers
 //! are directly comparable.
+//!
+//! # The two additional carving oracles (gated, mirror undark/fqlite)
+//!
+//! - **bring2lite** (Bring2lite, Python 3) — a freeblock / freelist / unallocated
+//!   carver. Gated on `BRING2LITE_CMD` (the wrapper `scripts/run-bring2lite.sh`,
+//!   which emits one recovered record per line as `col0,col1,col2,...` — the same
+//!   row shape undark emits, so its `(col1,col2)` identity is at CSV fields 1/2).
+//!   The wrapper emits bring2lite's carved-deleted output (freeblocks + freelists
+//!   + unalloc) and suppresses its live-b-tree re-dump (`regular-page-parsing/`).
+//! - **SQL-DRP / `sqlparse`** (Mari DeGrazia, Python 2 ported to 3) — gated on
+//!   `SQLDRP_CMD` (`scripts/run-sqldrp.sh`). MEASURED CAPABILITY BOUNDARY: SQL-DRP
+//!   is a printable-STRING carver. Its output is a TSV `Type/Offset/Length/Data`
+//!   where `Data` is a single space-joined printable-ASCII blob per freed region,
+//!   **not** a per-column `(col0,col1,col2)` record. It therefore exposes no
+//!   format-stable `(col1,col2)` cross-tool identity of the kind this head-to-head
+//!   scores, and recovers nothing at all from the integer-valued tables. Under the
+//!   exact-tuple matcher every other tool passes through, SQL-DRP's scored set is
+//!   structurally empty; the table reports this boundary explicitly rather than
+//!   scoring a confounded key (the same discipline that excludes 0C-06/0C-07).
 //!
 //! # The comparison key (format-stable, symmetric, documented)
 //!
@@ -47,10 +67,12 @@
 //! # Gating
 //!
 //! undark legs skip unless `UNDARK_BIN` is set; fqlite legs skip unless
-//! `FQLITE_TAP` is set (optionally `FQLITE_JAVA`) — identical to
-//! `oracle_differential.rs`, so CI without the tools still passes. The `ours`
-//! column needs no tool and is always computed. Run with `--nocapture` to
-//! regenerate the table in `docs/recovery-comparison.md`.
+//! `FQLITE_TAP` is set (optionally `FQLITE_JAVA`); the bring2lite column skips
+//! unless `BRING2LITE_CMD` is set; the SQL-DRP column skips unless `SQLDRP_CMD`
+//! is set — identical pattern to `oracle_differential.rs`, so CI without any of
+//! the tools still passes. The `ours` column needs no tool and is always
+//! computed. Run with `--nocapture` to regenerate the table in
+//! `docs/recovery-comparison.md`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::pedantic)]
 
@@ -76,6 +98,14 @@ fn undark_bin() -> Option<PathBuf> {
 
 fn fqlite_tap() -> Option<PathBuf> {
     std::env::var_os("FQLITE_TAP").map(PathBuf::from)
+}
+
+fn bring2lite_cmd() -> Option<PathBuf> {
+    std::env::var_os("BRING2LITE_CMD").map(PathBuf::from)
+}
+
+fn sqldrp_cmd() -> Option<PathBuf> {
+    std::env::var_os("SQLDRP_CMD").map(PathBuf::from)
 }
 
 /// One tool's confusion matrix on one database, scored against the Nemetz answer
@@ -263,6 +293,64 @@ fn fqlite_recover(tap: &Path, db: &Path) -> BTreeSet<RowId> {
     set
 }
 
+/// bring2lite's recovered `(col1,col2)` set via `scripts/run-bring2lite.sh`. The
+/// wrapper emits one carved-deleted record per line as `col0,col1,col2,...` (the
+/// same row shape undark emits), so the two identity columns are CSV fields 1 and
+/// 2 — the same projection our own carver uses (`values.get(1)`/`get(2)`).
+/// Whatever the tool emits is taken verbatim: a row bring2lite could only decode
+/// as Python `bytes` (e.g. `b'...'`) simply will not match the answer key (an
+/// honest miss, not hidden).
+fn bring2lite_recover(cmd: &Path, db: &Path) -> BTreeSet<RowId> {
+    let out = Command::new(cmd)
+        .arg(db)
+        .output()
+        .expect("bring2lite wrapper must execute");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut set = BTreeSet::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f = split_csv(line);
+        if f.len() >= 3 {
+            set.insert((unquote(&f[1]), unquote(&f[2])));
+        }
+    }
+    set
+}
+
+/// SQL-DRP's recovered `(col1,col2)` set via `scripts/run-sqldrp.sh`. MEASURED
+/// BOUNDARY (see the module header): SQL-DRP is a printable-STRING carver whose
+/// output is a TSV `Type<TAB>Offset<TAB>Length<TAB>Data`, where `Data` is one
+/// space-joined printable-ASCII blob per freed region — never a per-column
+/// `(col0,col1,col2)` record. There is therefore no format-stable `(col1,col2)`
+/// tuple to project, so under the exact-tuple matcher every other tool passes
+/// through, this set is empty by construction. We still parse the output honestly
+/// (skipping the `Type\tOffset\t...` header) so a future structured emitter would
+/// be picked up; today every line is a `Data`-blob row that yields no tuple.
+fn sqldrp_recover(cmd: &Path, db: &Path) -> BTreeSet<RowId> {
+    let out = Command::new(cmd)
+        .arg(db)
+        .output()
+        .expect("sqldrp wrapper must execute");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut set = BTreeSet::new();
+    for line in text.lines() {
+        if line.trim().is_empty() || line.starts_with("Type\t") {
+            continue;
+        }
+        // SQL-DRP is tab-delimited with a single `Data` blob field; it carries no
+        // comma-separated `(col1,col2)` identity, so a comma split yields one
+        // field and inserts nothing. Kept general: if a record ever exposed two
+        // identity columns they would be picked up here.
+        let f = split_csv(line);
+        if f.len() >= 3 {
+            set.insert((unquote(&f[1]), unquote(&f[2])));
+        }
+    }
+    set
+}
+
 /// The in-scope databases for the head-to-head: 0C/0D/0E minus the float-key
 /// exclusions, in id order.
 fn in_scope() -> Vec<(String, String)> {
@@ -349,28 +437,40 @@ fn f0_5(p: f64, r: f64) -> f64 {
     f_beta(p, r, 0.5)
 }
 
-/// Compute per-category totals for ours/undark/fqlite. The `undark`/`fqlite`
-/// closures are `None` when the tool is gated off.
-fn category_totals(
-    cat: &str,
-    undark: Option<&Path>,
-    fqlite: Option<&Path>,
-) -> (CatTotals, Option<CatTotals>, Option<CatTotals>) {
-    let mut o = CatTotals {
+/// Which external tools to run for a category, each gated independently.
+#[derive(Default, Clone, Copy)]
+struct Oracles<'a> {
+    undark: Option<&'a Path>,
+    fqlite: Option<&'a Path>,
+    bring2lite: Option<&'a Path>,
+    sqldrp: Option<&'a Path>,
+}
+
+/// Per-category totals for ours + each gated oracle. A `None` field means the
+/// tool was gated off (its column is omitted from the table).
+struct CategoryRun {
+    ours: CatTotals,
+    undark: Option<CatTotals>,
+    fqlite: Option<CatTotals>,
+    bring2lite: Option<CatTotals>,
+    sqldrp: Option<CatTotals>,
+}
+
+fn empty_totals() -> CatTotals {
+    CatTotals {
         matrix: ToolMatrix::default(),
         d_deleted: 0,
         d_recoverable: 0,
-    };
-    let mut u = undark.map(|_| CatTotals {
-        matrix: ToolMatrix::default(),
-        d_deleted: 0,
-        d_recoverable: 0,
-    });
-    let mut f = fqlite.map(|_| CatTotals {
-        matrix: ToolMatrix::default(),
-        d_deleted: 0,
-        d_recoverable: 0,
-    });
+    }
+}
+
+/// Compute per-category totals for ours and every gated oracle.
+fn category_totals(cat: &str, oracles: Oracles) -> CategoryRun {
+    let mut o = empty_totals();
+    let mut u = oracles.undark.map(|_| empty_totals());
+    let mut f = oracles.fqlite.map(|_| empty_totals());
+    let mut b = oracles.bring2lite.map(|_| empty_totals());
+    let mut s = oracles.sqldrp.map(|_| empty_totals());
 
     for (nid, c) in in_scope().into_iter().filter(|(_, c)| c == cat) {
         let path = db_path(&nid, &c);
@@ -381,42 +481,73 @@ fn category_totals(
         o.d_deleted += gt.d_deleted;
         o.d_recoverable += gt.d_recoverable;
 
-        if let (Some(bin), Some(tot)) = (undark, u.as_mut()) {
-            tot.matrix.add(&score(&undark_recover(bin, &path), &gt));
-            tot.d_deleted += gt.d_deleted;
-            tot.d_recoverable += gt.d_recoverable;
+        let accumulate = |run: Option<&mut CatTotals>, recovered: BTreeSet<RowId>| {
+            if let Some(tot) = run {
+                tot.matrix.add(&score(&recovered, &gt));
+                tot.d_deleted += gt.d_deleted;
+                tot.d_recoverable += gt.d_recoverable;
+            }
+        };
+        if let Some(bin) = oracles.undark {
+            accumulate(u.as_mut(), undark_recover(bin, &path));
         }
-        if let (Some(tap), Some(tot)) = (fqlite, f.as_mut()) {
-            tot.matrix.add(&score(&fqlite_recover(tap, &path), &gt));
-            tot.d_deleted += gt.d_deleted;
-            tot.d_recoverable += gt.d_recoverable;
+        if let Some(tap) = oracles.fqlite {
+            accumulate(f.as_mut(), fqlite_recover(tap, &path));
+        }
+        if let Some(cmd) = oracles.bring2lite {
+            accumulate(b.as_mut(), bring2lite_recover(cmd, &path));
+        }
+        if let Some(cmd) = oracles.sqldrp {
+            accumulate(s.as_mut(), sqldrp_recover(cmd, &path));
         }
     }
-    (o, u, f)
+    CategoryRun {
+        ours: o,
+        undark: u,
+        fqlite: f,
+        bring2lite: b,
+        sqldrp: s,
+    }
 }
 
-/// Emit the three-tool comparison table (visible with `--nocapture`) so the table
-/// in `docs/recovery-comparison.md` is harness-computed, not hand-written.
+/// Emit the head-to-head comparison table (visible with `--nocapture`) so the
+/// table in `docs/recovery-comparison.md` is harness-computed, not hand-written.
+/// Up to five tools per category: ours (always) plus undark / fqlite / bring2lite
+/// / SQL-DRP, each included only when its gate env var is set.
 #[test]
-fn emit_three_tool_comparison() {
+fn emit_tool_comparison() {
     let undark = undark_bin();
     let fqlite = fqlite_tap();
+    let bring2lite = bring2lite_cmd();
+    let sqldrp = sqldrp_cmd();
     if undark.is_none() {
         eprintln!("NOTE undark column omitted: set UNDARK_BIN to include it");
     }
     if fqlite.is_none() {
         eprintln!("NOTE fqlite column omitted: set FQLITE_TAP to include it");
     }
+    if bring2lite.is_none() {
+        eprintln!("NOTE bring2lite column omitted: set BRING2LITE_CMD to include it");
+    }
+    if sqldrp.is_none() {
+        eprintln!("NOTE SQL-DRP column omitted: set SQLDRP_CMD to include it");
+    }
+    let oracles = Oracles {
+        undark: undark.as_deref(),
+        fqlite: fqlite.as_deref(),
+        bring2lite: bring2lite.as_deref(),
+        sqldrp: sqldrp.as_deref(),
+    };
 
     println!(
-        "\n{:<3} {:<6} {:>4} {:>5} {:>3} {:>3} {:>3} {:>4} {:>8} {:>8} {:>5}",
+        "\n{:<3} {:<10} {:>4} {:>5} {:>3} {:>3} {:>3} {:>4} {:>8} {:>8} {:>5}",
         "cat", "tool", "Ddel", "Drec", "TP", "FP", "FN", "live", "rec_sub", "rec_e2e", "prec"
     );
     let print_row = |cat: &str, tool: &str, t: &CatTotals| {
         let m = &t.matrix;
         let fn_ = t.d_recoverable.saturating_sub(m.tp_recoverable);
         println!(
-            "{:<3} {:<6} {:>4} {:>5} {:>3} {:>3} {:>3} {:>4} {:>8.3} {:>8.3} {:>5.3}",
+            "{:<3} {:<10} {:>4} {:>5} {:>3} {:>3} {:>3} {:>4} {:>8.3} {:>8.3} {:>5.3}",
             cat,
             tool,
             t.d_deleted,
@@ -447,23 +578,27 @@ fn emit_three_tool_comparison() {
     };
 
     for cat in ["0C", "0D", "0E"] {
-        let (o, u, f) = category_totals(cat, undark.as_deref(), fqlite.as_deref());
-        print_row(cat, "ours", &o);
-        push_csv(cat, "ours", &o);
-        if let Some(u) = &u {
-            print_row(cat, "undark", u);
-            push_csv(cat, "undark", u);
-        }
-        if let Some(f) = &f {
-            print_row(cat, "fqlite", f);
-            push_csv(cat, "fqlite", f);
+        let run = category_totals(cat, oracles);
+        print_row(cat, "ours", &run.ours);
+        push_csv(cat, "ours", &run.ours);
+        for (tool, totals) in [
+            ("undark", &run.undark),
+            ("fqlite", &run.fqlite),
+            ("bring2lite", &run.bring2lite),
+            ("sqldrp", &run.sqldrp),
+        ] {
+            if let Some(t) = totals {
+                print_row(cat, tool, t);
+                push_csv(cat, tool, t);
+            }
         }
     }
     println!("\nExcluded (FLOAT key columns, no cross-tool identity): {FLOAT_KEY_EXCLUSIONS:?}");
 
-    // Only (re)write the committed CSV when BOTH oracle tools ran, so the file
-    // always carries the full ours/undark/fqlite matrix and never a partial one.
-    // CI without the tools still passes — it just skips the write.
+    // Only (re)write the committed CSV when the original ours/undark/fqlite matrix
+    // is complete, so the file the chart consumes is never partial. The two newer
+    // oracles (bring2lite, SQL-DRP) are appended when their gates are also set; CI
+    // without any tool still passes — it just skips the write.
     if undark.is_some() && fqlite.is_some() {
         let csv_path = format!(
             "{}/../docs/img/comparison_metrics.csv",
@@ -517,8 +652,14 @@ fn ours_leads_on_0c_inpage_recall() {
         eprintln!("SKIP ours_leads_on_0c_inpage_recall: set FQLITE_TAP");
         return;
     };
-    let (ours, _u, f) = category_totals("0C", None, Some(tap.as_path()));
-    let f = f.expect("fqlite requested");
+    let run = category_totals(
+        "0C",
+        Oracles {
+            fqlite: Some(tap.as_path()),
+            ..Oracles::default()
+        },
+    );
+    let (ours, f) = (run.ours, run.fqlite.expect("fqlite requested"));
     // Measured: ours 70 TP on 0C (excl. 06/07) vs fqlite 67. Pinned as a floor and
     // a strict-lead relationship, robust to small tap variation.
     assert!(
@@ -545,8 +686,14 @@ fn undark_rereads_live_rows_on_0d() {
         eprintln!("SKIP undark_rereads_live_rows_on_0d: set UNDARK_BIN");
         return;
     };
-    let (ours, u, _f) = category_totals("0D", Some(bin.as_path()), None);
-    let u = u.expect("undark requested");
+    let run = category_totals(
+        "0D",
+        Oracles {
+            undark: Some(bin.as_path()),
+            ..Oracles::default()
+        },
+    );
+    let (ours, u) = (run.ours, run.undark.expect("undark requested"));
     // Measured: undark re-reads 56 live 0D rows as deleted; ours re-reads 0.
     assert!(
         u.matrix.live_reread >= 20,
@@ -557,6 +704,69 @@ fn undark_rereads_live_rows_on_0d() {
         ours.matrix.live_reread, 0,
         "our carver must never re-surface a live 0D row (got {})",
         ours.matrix.live_reread
+    );
+}
+
+/// bring2lite recovers a real but smaller slice of the deleted set than our carver
+/// on the integer in-page-deletion category (0C): it carves the free-block records
+/// but reaches fewer of them. Pins the measured relationship — bring2lite clears a
+/// true-positive floor (so the column is genuinely exercised, not a no-op) while
+/// our carver strictly leads it. Gated on `BRING2LITE_CMD`.
+#[test]
+fn ours_leads_bring2lite_on_0c_recall() {
+    let Some(cmd) = bring2lite_cmd() else {
+        eprintln!("SKIP ours_leads_bring2lite_on_0c_recall: set BRING2LITE_CMD");
+        return;
+    };
+    let run = category_totals(
+        "0C",
+        Oracles {
+            bring2lite: Some(cmd.as_path()),
+            ..Oracles::default()
+        },
+    );
+    let (ours, b) = (run.ours, run.bring2lite.expect("bring2lite requested"));
+    // Measured: bring2lite 40 TP on 0C (excl. 06/07); ours 70. Floor at 30 so the
+    // column is proven non-empty, with a strict-lead relationship for ours.
+    assert!(
+        b.matrix.tp >= 30,
+        "bring2lite 0C true positives {} fell below the measured floor 30",
+        b.matrix.tp
+    );
+    assert!(
+        ours.matrix.tp > b.matrix.tp,
+        "ours ({}) must lead bring2lite ({}) on 0C in-page recall",
+        ours.matrix.tp,
+        b.matrix.tp
+    );
+}
+
+/// SQL-DRP's measured capability boundary on the cross-tool identity matcher. It
+/// is a printable-STRING carver: its TSV `Data` field is a single space-joined
+/// blob per freed region, never a per-column record, so under the exact
+/// `(col1,col2)` tuple match every other tool passes through it recovers **zero**
+/// answer-key identities across the whole in-scope corpus (and nothing at all from
+/// the integer tables, whose values are not printable strings). This pins that
+/// boundary as a measurement, not an assumption — a stray comma inside a carved
+/// blob may still surface as an honest non-matching phantom (FP), but the true
+/// positive count is structurally 0. Gated on `SQLDRP_CMD`.
+#[test]
+fn sqldrp_recovers_no_cross_tool_identity() {
+    let Some(cmd) = sqldrp_cmd() else {
+        eprintln!("SKIP sqldrp_recovers_no_cross_tool_identity: set SQLDRP_CMD");
+        return;
+    };
+    let mut tp_total = 0usize;
+    for (nid, cat) in in_scope() {
+        let gt = ground_truth(&nid);
+        tp_total += score(&sqldrp_recover(&cmd, &db_path(&nid, &cat)), &gt).tp;
+    }
+    assert_eq!(
+        tp_total, 0,
+        "SQL-DRP recovered {tp_total} answer-key identity(ies) — it is a string \
+         carver with no format-stable (col1,col2) record, so 0 is the documented \
+         boundary; a non-zero count means the output shape changed and the matcher \
+         must be re-examined"
     );
 }
 

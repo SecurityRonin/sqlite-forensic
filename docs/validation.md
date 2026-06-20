@@ -33,9 +33,10 @@ build (1.96), a `gitleaks` secret scan, docs-as-error, and libFuzzer harnesses o
 ### Layer 2 — independent oracles (the substantive validation)
 
 No test we authored is independent of our own assumptions, so each capability is checked
-against a reference we did not write. Five distinct authors/engines (the SQLite team,
-undark's author, fqlite's author, the Nemetz team, the DC3 team) plus the `calamine`
-reader, across C / Java / SQLite-C / Rust:
+against a reference we did not write. Seven distinct authors/engines (the SQLite team,
+undark's author, fqlite's author, bring2lite's author, Mari DeGrazia / SQL-DRP, the
+Nemetz team, the DC3 team) plus the `calamine` reader, across C / Java / Python /
+SQLite-C / Rust:
 
 | Capability | Independent reference | What it establishes | Machine-checked in |
 |---|---|---|---|
@@ -45,6 +46,7 @@ reader, across C / Java / SQLite-C / Rust:
 | **Deleted + modified records** (rollback-journal substrate) | **NIST CFReDS / CFTT** SFT-03 PERSIST — 100 documented deletes + 100 modifications in a `-journal` (ios + android) | `carve_rollback_journal` recovers **100/100 deletes + 100/100 modified prior values** by diffing the journal's pre-transaction snapshot against the live db; the derived oracle (`{1..=2240} \ live PKs`) is cross-checked against NIST's documented IDs | `cfreds_journal_recovery.rs` |
 | **Rollback-journal anomalies** | real sqlite3-engine journals (hot DML, committed-DDL PERSIST) + NIST SFT-03 PERSIST | `audit_journal` emits "consistent with" observations (hot journal, PERSIST-recoverable, checksum mismatch, schema-cookie advance, duplicate page, db-size delta), each showing the offending value; SCHEMA-CHANGE fires only when the journal's prior page-1 image schema cookie differs from the live db's (so DML-only NIST PERSIST does not raise it) | `hot_journal_anomaly.rs`, `cfreds_journal_anomaly.rs` |
 | Deleted-record **carving** | `undark` (C), `fqlite` (Java) — independent carvers | inter-tool **concordance** (agreement, page-level-diagnosed — *not* correctness) | `oracle_differential.rs` (below) |
+| Deleted-record **head-to-head** (carving) | `undark`, `fqlite`, **`bring2lite`** (Python 3), **SQL-DRP / `sqlparse`** (Python 2→3) — four independent carvers, each gated (`UNDARK_BIN` / `FQLITE_TAP` / `BRING2LITE_CMD` / `SQLDRP_CMD`), all scored against the same Nemetz answer key | per-tool precision/recall on the **same** `(col1,col2)` matcher; SQL-DRP's string-carver boundary recorded explicitly (0 cross-tool identities, not a confounded score) | `nemetz_tool_comparison.rs` · [`recovery-comparison.md`](recovery-comparison.md) |
 | **Live b-tree read** | `sqlite3 SELECT` — the engine that wrote the file | live rows read **byte-identical** to the canonical engine | `live_read_matches_sqlite3` |
 | **`.recover` differential** | `sqlite3 .recover` | ours ⊇ `.recover`, 100% content agreement on the overlap | `our_fixture_agrees_with_sqlite3_recover` |
 | **Rebuilt `.carved.db`** | `sqlite3` (`PRAGMA integrity_check`, `SELECT`) | the pure-Rust writer emits a valid DB an external engine reads identically | `rebuild_sqlite3_oracle.rs`, `rebuild_tables_oracle.rs` |

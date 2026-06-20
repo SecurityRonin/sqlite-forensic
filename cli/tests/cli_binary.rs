@@ -393,8 +393,8 @@ fn malformed_db_audit_exits_nonzero() {
 
 /// The default `carve` writes the COMBINED TEMPORAL workbook: the source DB dumped
 /// one VERSION-HISTORY sheet per live table (here `moz_places`), carrying the eight
-/// temporal/flag columns and interleaving live (`present`, is_deleted=0) versions
-/// with carved-residue (is_deleted=1) versions of deleted rows.
+/// temporal/flag columns and interleaving live (`present`, `is_deleted`=0) versions
+/// with carved-residue (`is_deleted`=1) versions of deleted rows.
 #[test]
 fn default_carve_combined_workbook_folds_recovered_rows() {
     use calamine::Reader;
@@ -981,7 +981,7 @@ fn three_tier_attribution_round_trips_through_sqlite3() {
 /// The headline combined-workbook layout, end to end via calamine. On the
 /// three-tier fixture the default `carve` writes the source DB dumped one
 /// VERSION-HISTORY sheet per live table:
-/// - `people` sheet carries its live (`present`, is_deleted=0) versions AND the
+/// - `people` sheet carries its live (`present`, `is_deleted`=0) versions AND the
 ///   carved-residue version of the deleted row (id 3 'carol') — appearing EXACTLY
 ///   once, never double-listed;
 /// - `recovered_unattributed` (the dropped `secret` table) and
@@ -1300,7 +1300,7 @@ fn xlsx_temporal_workbook_has_version_history_from_wal() {
     });
     img.save(&png_path).expect("write png fixture");
 
-    let (reader, db_path) = build_temporal_fixture(&sqlite3, &dir.0, &png_path);
+    let (reader, _db_path) = build_temporal_fixture(&sqlite3, &dir.0, &png_path);
 
     // Confirm the -wal was retained (non-empty) before carving.
     let wal = dir.join("ev.db-wal");
@@ -1366,7 +1366,9 @@ fn xlsx_temporal_workbook_has_version_history_from_wal() {
         }
     };
     let as_s = |d: &Data| -> String { d.to_string() };
-    let body: Vec<(Option<i64>, String, String, i64, i64, String)> = range
+    // (rowid, name, view_state, is_deleted, rowid_reused, wal_commit) per data row.
+    type VRow = (Option<i64>, String, String, i64, i64, String);
+    let body: Vec<VRow> = range
         .rows()
         .skip(1)
         .map(|r| {
@@ -1382,8 +1384,7 @@ fn xlsx_temporal_workbook_has_version_history_from_wal() {
         .collect();
 
     // rowid 1: a historical 'a' (changed_later) AND the current 'A' (present).
-    let r1: Vec<&(Option<i64>, String, String, i64, i64, String)> =
-        body.iter().filter(|t| t.0 == Some(1)).collect();
+    let r1: Vec<&VRow> = body.iter().filter(|t| t.0 == Some(1)).collect();
     assert!(
         r1.iter().any(|t| t.1 == "a" && t.2 == "changed_later"),
         "rowid 1 historical 'a' is changed_later: {r1:?}"

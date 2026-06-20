@@ -1385,6 +1385,10 @@ const SUPERSEDED_FILL: u32 = 0x00DD_EBFF;
 /// 4. `superseded` (`ViewState::ValueChangedLater`) → pale blue (a prior value of a
 ///    still-live rowid that a later commit replaced).
 /// 5. otherwise (`PresentInFinalView` / live current) → no fill.
+// The four bools are independent EVIDENCE bits forming a fixed precedence ladder,
+// not a flag-soup that an enum would clarify — the task mandates this signature so
+// every tint outcome is unit-testable directly.
+#[allow(clippy::fn_params_excessive_bools)]
 fn fill_for(
     rowid_reused: bool,
     is_guessed: bool,
@@ -1462,7 +1466,10 @@ const WITHOUT_ROWID_NOTE: &str = "WITHOUT ROWID — not version-tracked";
 
 /// One rendered version row of a per-table temporal sheet: the real-column cells
 /// followed by the eight temporal/flag cells, plus the four tint inputs the
-/// renderer feeds to [`fill_for`] (so the fill decision is made once, here).
+/// renderer feeds to `fill_for` (so the fill decision is made once, here).
+// The four bools are the independent tint inputs of the 5-level precedence, each
+// separately consumed by the renderer — not a state machine an enum would clarify.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct TemporalRow {
     /// Real-column cells followed by the eight temporal/flag cells.
@@ -1598,7 +1605,7 @@ pub fn temporal_sheet(
 /// followed by the `extra` tables (`recovered_unattributed`, `recovered_fragments`)
 /// as separate sheets. Sheet names are sanitized and de-duplicated via
 /// [`sanitize_sheet_name`]. The header row is bold; each version row is tinted by
-/// the 5-level [`fill_for`] precedence (reused → purple, guessed → yellow, deleted
+/// the 5-level `fill_for` precedence (reused → purple, guessed → yellow, deleted
 /// → red, superseded → blue, present/live → none). Every cell follows its storage
 /// class — a `Blob` image (live, historical, OR carved) is thumbnailed and embedded
 /// in-cell exactly as the separate recovered tables do.
@@ -1694,13 +1701,16 @@ pub fn plan_combined_workbook(
     // version renders `commit:(salt1,salt2,frame_index)`. No timeline → no salts.
     let timeline = db.wal_timeline();
     let resolve_lsn = |id: &sqlite_core::CommitId| -> Option<sqlite_core::WalLsn> {
-        timeline.as_ref()?.snapshot_at(*id).map(|s| s.lsn())
+        timeline
+            .as_ref()?
+            .snapshot_at(*id)
+            .map(sqlite_core::CommitSnapshot::lsn)
     };
 
     let mut sheets = Vec::with_capacity(histories.len());
     let mut dropped = Vec::new();
     for h in &histories {
-        let (sheet, n) = temporal_sheet(h, &resolve_lsn, row_cap);
+        let (sheet, n) = temporal_sheet(h, resolve_lsn, row_cap);
         if n > 0 {
             dropped.push((h.table.clone(), n));
         }
@@ -3596,6 +3606,9 @@ mod tests {
 
     use sqlite_core::row_history::{RowVersion, TableHistory, VersionOrigin, ViewState};
 
+    // A test constructor mirroring RowVersion's fields 1:1; the bool/arity lints are
+    // noise on a flat field-by-field builder.
+    #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
     fn version(
         rowid: Option<i64>,
         values: Vec<Value>,
@@ -3751,6 +3764,34 @@ mod tests {
         assert_eq!(cells[6], Value::Integer(1)); // is_guessed
         assert_eq!(cells[7], Value::Integer(0)); // rowid_reused
         assert_eq!(cells[8], Value::Integer(1)); // attribution_uncertain
+    }
+
+    #[test]
+    fn temporal_sheet_commit_with_unresolved_lsn_degrades() {
+        // A Commit-origin version whose LSN the resolver cannot resolve degrades
+        // its wal_commit to `commit:?` (never a panic), exercising the resolver
+        // call + the wal_commit_token None-lsn fallback.
+        let v = version(
+            Some(9),
+            vec![Value::Integer(9)],
+            VersionOrigin::Commit(sample_commit_id()),
+            Some(3),
+            ViewState::AbsentInFinalView,
+            true,
+            false,
+            false,
+            false,
+        );
+        let h = TableHistory {
+            table: "t".to_string(),
+            columns: vec!["id".to_string()],
+            without_rowid: false,
+            versions: vec![v],
+        };
+        let (sheet, _) = temporal_sheet(&h, no_lsn, EXCEL_MAX_ROWS);
+        // _rowid, wal_commit cells.
+        assert_eq!(sheet.rows[0].cells[1], Value::Integer(9));
+        assert_eq!(sheet.rows[0].cells[2], Value::Text("commit:?".into()));
     }
 
     #[test]

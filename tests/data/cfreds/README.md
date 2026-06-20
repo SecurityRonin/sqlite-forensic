@@ -80,21 +80,26 @@ byte-identical Unicode (first row `(1, "WALK LIKE AN EGYPTIAN", "Bangles",
 (`UPDATE … SET Quantity = 200`) per variation:
 
 - **PERSIST** (rollback-journal mode): the 100 deletes leave the live table at
-  2140 rows (PKs `1..2240` minus 100). The deleted rows' full content survives in
-  the `-journal` page images (header zeroed post-commit, bodies intact). Recovery
-  of these is a **pending capability** — see *Known gap* below.
+  2140 rows (PKs `1..2240` minus 100), and the 100 modifications set `Quantity=200`.
+  Both survive in the `-journal` page images (header zeroed post-commit, bodies
+  intact) and are **recovered 100/100** (deletes + modified prior values) by
+  `carve_rollback_journal` — validated by `forensic/tests/cfreds_journal_recovery.rs`.
 - **WAL** (uncheckpointed): the main db retains all 2240 rows (pre-delete); the
   100 deletes live in the `-wal`. Our WAL handling surfaces both the 2240
   (main-only) and 2140 (WAL-applied) states. Validated by
   `forensic/tests/cfreds_recovery.rs`.
 
-### Known gap (tracked)
+### Rollback-journal recovery (validated)
 
-`carve_all_deleted_records` reads only the main database, so the **SFT-03 PERSIST
-rollback-journal deletions are not yet recovered** (0/100 today, though all 100
-are confirmed present in the `-journal`). Rollback-journal (`-journal`) carving —
-the DELETE/PERSIST analog of the existing WAL-frame recovery — is designed in
+Rollback-journal (`-journal`) carving — the DELETE/PERSIST analog of WAL-frame
+recovery — is implemented (`carve_rollback_journal`): it diffs the journal's
+pre-transaction snapshot against the live db and recovers **100/100 deletes +
+100/100 modified prior values** from SFT-03 PERSIST (ios + android). It auto-folds
+into the combined workbook (deletes red, modifications blue) and JSONL, source
+`rollback-journal`. Design + format details:
 [`../../../docs/design/journal-recovery.md`](../../../docs/design/journal-recovery.md).
+Remaining: the §6 anomaly observations (hot journal, checksum mismatch, …) into
+the `audit` output.
 
 ## MD5 manifest
 

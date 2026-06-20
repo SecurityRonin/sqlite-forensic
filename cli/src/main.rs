@@ -342,6 +342,18 @@ fn run_carve_files(args: &CarveArgs) -> Result<(), String> {
             xlsx_path.display()
         ),
     }
+    // When a rollback `-journal` was folded in, report its recovery counts too, so
+    // the summary reflects the prior rows in the workbook rather than only the
+    // free-space carve (the journal's deleted/modified rows are tinted red/blue in
+    // each table sheet, not counted among `records`).
+    if let Some(j) = &journal {
+        if j.counts.deleted > 0 || j.counts.modified > 0 {
+            println!(
+                "recovered {} deleted + {} modified row(s) from the rollback journal",
+                j.counts.deleted, j.counts.modified
+            );
+        }
+    }
     Ok(())
 }
 

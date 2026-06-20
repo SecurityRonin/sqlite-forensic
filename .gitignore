@@ -12,3 +12,9 @@
 # README that records that provenance IS committed.
 /tests-oracle-corpus/*
 !/tests-oracle-corpus/README.md
+
+# Reference papers: copyrighted academic PDFs cited in the design/docs are NOT
+# committed or redistributed; their citations are recorded in
+# docs/references/README.md, which IS committed.
+/docs/references/*
+!/docs/references/README.md

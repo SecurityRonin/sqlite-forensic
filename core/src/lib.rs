@@ -69,6 +69,13 @@ pub enum Error {
     MalformedFreelist,
     /// An overflow-page chain cycled or exceeded the file's page count.
     MalformedOverflow,
+    /// A rollback-journal page size was not a power of two in `[512, 65536]`.
+    /// Carries the offending value (Show-the-unrecognized-value).
+    BadJournalPageSize(u32),
+    /// A rollback journal was applied to a database opened WAL-applied, or whose
+    /// page size disagrees with the journal's. WAL and rollback-journal modes are
+    /// mutually exclusive timelines and must not be overlaid.
+    JournalModeConflict,
 }
 
 /// A freed overflow-page chain could not be followed to a complete, trustworthy
@@ -3960,6 +3967,276 @@ pub(crate) fn enc_varint_into(value: usize) -> Vec<u8> {
         }
     }
     groups
+}
+
+/// The 8-byte rollback-journal segment magic (`pager.c` `aJournalMagic`).
+const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+
+/// Hard cap on page records walked in one journal segment, to bound work on a
+/// crafted/garbage journal whose stride scan would otherwise run the file length.
+const MAX_JOURNAL_RECORDS: usize = 1_000_000;
+
+/// Sector-size candidates probed when reconstructing a zeroed (PERSIST) journal
+/// header. Real VFS sector sizes exceed 512, so 512 is a candidate, not an
+/// assumption; the page size is also tried (file-format §"Rollback Journal").
+const SECTOR_CANDIDATES: [u32; 3] = [512, 4096, 0]; // 0 = "use page_size"
+
+/// Parsed (or reconstructed) rollback-journal header (design §5).
+///
+/// `Valid` is a header whose magic is intact (Tier A — hot journal / crash
+/// residue): every parameter, including the checksum `nonce`, is authoritative.
+/// `ReconstructedZeroed` is the PERSIST post-commit case (Tier B): the first
+/// sector was zeroed on commit, so the page size comes from the main database
+/// and the sector size from candidate scoring — the nonce is gone, so page
+/// checksums cannot be verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalHeader {
+    /// Tier A: header magic present; all fields trusted (`pager.c` offsets).
+    Valid {
+        /// Page records declared in this segment (`0xFFFFFFFF`/`0` ⇒ walk to EOF).
+        n_rec: u32,
+        /// Database page count at transaction start (`dbOrigSize`).
+        mx_page: u32,
+        /// Checksum initializer (`cksumInit`), offset 12.
+        nonce: u32,
+        /// VFS sector size the header is padded to.
+        sector_size: u32,
+        /// Database page size at transaction start.
+        page_size: u32,
+    },
+    /// Tier B: header zeroed (PERSIST post-commit); parameters reconstructed.
+    ReconstructedZeroed {
+        /// Page size taken from the main database header (authoritative).
+        page_size: u32,
+        /// Sector size selected by candidate scoring (record offset stride).
+        sector_size: u32,
+    },
+}
+
+/// One pre-transaction page image recovered from a rollback journal (design §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalPageImage {
+    /// 1-based database page number this image restores.
+    pub pgno: u32,
+    /// 0-based segment index this record came from.
+    pub segment: usize,
+    /// The original page content (`page_size` bytes).
+    pub bytes: Vec<u8>,
+    /// `Some(true/false)` in Tier A (nonce known) — whether the stored checksum
+    /// matched; `None` in Tier B (nonce zeroed, unverifiable).
+    pub checksum_valid: Option<bool>,
+}
+
+/// A parsed rollback journal: its header tier plus the ordered, first-wins
+/// page images (design §3/§5). The temporal inverse of the WAL overlay —
+/// these images are the database as it was BEFORE the last transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackJournal {
+    header: JournalHeader,
+    images: Vec<JournalPageImage>,
+    duplicate_pgno: bool,
+}
+
+/// The journal page checksum (`pager.c` `pager_cksum`): `nonce` plus every-200th
+/// byte from the tail, starting at `page_size - 200` and stepping down by 200
+/// while the index is positive, using wrapping u32 arithmetic. It detects torn
+/// page writes; it is not a cryptographic integrity guarantee.
+fn journal_cksum(nonce: u32, page: &[u8]) -> u32 {
+    let mut sum = nonce;
+    let mut x = page.len() as i64 - 200;
+    while x > 0 {
+        // x is in (0, page.len()) by the loop bound, so indexing is in-range.
+        if let Some(&b) = page.get(x as usize) {
+            sum = sum.wrapping_add(u32::from(b));
+        }
+        x -= 200;
+    }
+    sum
+}
+
+/// Walk page records of `page_size` bytes from `start`, with the checksum
+/// `nonce` (`None` ⇒ Tier B, unverifiable), stopping at EOF or after `limit`
+/// records. Returns the images in file order; a partial trailing record is
+/// dropped (truncation tolerance). Bounded by [`MAX_JOURNAL_RECORDS`].
+fn walk_journal_records(
+    bytes: &[u8],
+    start: usize,
+    page_size: usize,
+    nonce: Option<u32>,
+    segment: usize,
+    limit: usize,
+) -> Vec<JournalPageImage> {
+    let stride = 4usize.saturating_add(page_size).saturating_add(4);
+    let mut out = Vec::new();
+    let mut off = start;
+    let cap = limit.min(MAX_JOURNAL_RECORDS);
+    while out.len() < cap {
+        let Some(rec) = bytes.get(off..off.saturating_add(stride)) else {
+            break; // EOF or partial trailing record: stop (truncation tolerant).
+        };
+        let pgno = u32::from_be_bytes([rec[0], rec[1], rec[2], rec[3]]);
+        if pgno == 0 {
+            break; // page 0 is not a valid record; treat as end-of-segment.
+        }
+        let page = &rec[4..4 + page_size];
+        let stored = u32::from_be_bytes([
+            rec[4 + page_size],
+            rec[5 + page_size],
+            rec[6 + page_size],
+            rec[7 + page_size],
+        ]);
+        let checksum_valid = nonce.map(|n| journal_cksum(n, page) == stored);
+        out.push(JournalPageImage {
+            pgno,
+            segment,
+            bytes: page.to_vec(),
+            checksum_valid,
+        });
+        off = off.saturating_add(stride);
+    }
+    out
+}
+
+/// Score a candidate record walk for the Tier-B sector reconstruction: more
+/// records and all page numbers within `1..=page_bound` rank higher; a record
+/// count of zero scores zero so an off-stride candidate never wins.
+fn score_journal_candidate(images: &[JournalPageImage], page_bound: u32) -> usize {
+    if images.is_empty() {
+        return 0;
+    }
+    let in_range = images
+        .iter()
+        .filter(|i| i.pgno >= 1 && i.pgno <= page_bound)
+        .count();
+    // All-in-range walks are strongly preferred; weight the in-range fraction so
+    // a candidate that mostly decodes to impossible page numbers loses to one
+    // that decodes cleanly even with fewer records.
+    if in_range == images.len() {
+        1000 + images.len()
+    } else {
+        in_range
+    }
+}
+
+impl RollbackJournal {
+    /// LOWER-LEVEL, UNAUTHENTICATED parse (design §5): interpret `bytes` as a
+    /// rollback journal given an externally-supplied `page_size`. Does NOT bind
+    /// the journal to a particular database — prefer [`Database::rollback_prior`],
+    /// which supplies the authoritative page size from the main db.
+    ///
+    /// Tier A (magic present) trusts the header and verifies each checksum. Tier B
+    /// (magic absent — PERSIST post-commit) reconstructs the sector size by
+    /// candidate scoring and walks records (checksums unverifiable). Robust: a
+    /// malformed/truncated journal yields fewer images, never a panic; a page size
+    /// that is not a power of two in `[512, 65536]` is a typed
+    /// [`Error::BadJournalPageSize`] carrying the offending value.
+    pub fn parse(bytes: &[u8], page_size: u32) -> Result<Self, Error> {
+        if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
+            return Err(Error::BadJournalPageSize(page_size));
+        }
+        let ps = page_size as usize;
+        let page_bound = u32::try_from(bytes.len() / ps.max(1)).unwrap_or(u32::MAX);
+
+        let header_valid = bytes.len() >= 28 && bytes.starts_with(&JOURNAL_MAGIC);
+        if header_valid {
+            // Tier A: trust the header.
+            let n_rec = be_u32(bytes, 8);
+            let nonce = be_u32(bytes, 12);
+            let mx_page = be_u32(bytes, 16);
+            let sector_size = be_u32(bytes, 20);
+            let hdr_page_size = be_u32(bytes, 24);
+            // nRec ∈ {0, 0xFFFFFFFF} ⇒ walk to EOF; else exactly n_rec records.
+            let limit = if n_rec == 0 || n_rec == u32::MAX {
+                MAX_JOURNAL_RECORDS
+            } else {
+                n_rec as usize
+            };
+            let start = sector_size.max(1) as usize;
+            let imgs = walk_journal_records(bytes, start, ps, Some(nonce), 0, limit);
+            let header = JournalHeader::Valid {
+                n_rec,
+                mx_page,
+                nonce,
+                sector_size,
+                // The journal's pages are images of THIS db, so the externally
+                // supplied page size is authoritative; expose it even if the
+                // header field disagrees (a tampered/mismatched header field).
+                page_size: if hdr_page_size == page_size {
+                    hdr_page_size
+                } else {
+                    page_size
+                },
+            };
+            return Ok(Self::from_walk(header, imgs));
+        }
+
+        // Tier B: header zeroed/absent (PERSIST post-commit). Score sector
+        // candidates and pick the best; checksums are unverifiable (nonce gone).
+        let mut best: Option<(usize, u32, Vec<JournalPageImage>)> = None;
+        for cand in SECTOR_CANDIDATES {
+            let sector = if cand == 0 { page_size } else { cand };
+            let imgs =
+                walk_journal_records(bytes, sector as usize, ps, None, 0, MAX_JOURNAL_RECORDS);
+            let score = score_journal_candidate(&imgs, page_bound);
+            let better = best.as_ref().is_none_or(|(bs, _, _)| score > *bs);
+            if better && score > 0 {
+                best = Some((score, sector, imgs));
+            }
+        }
+        // No candidate decoded a single in-range record (garbage, or a journal too
+        // short for one record): an empty Tier-B journal, sector size unknown →
+        // page size. Degrade gracefully rather than erroring.
+        let (sector_size, imgs) = best
+            .map(|(_, s, i)| (s, i))
+            .unwrap_or((page_size, Vec::new()));
+        let header = JournalHeader::ReconstructedZeroed {
+            page_size,
+            sector_size,
+        };
+        Ok(Self::from_walk(header, imgs))
+    }
+
+    /// Apply first-wins dedup to a walked record set, recording whether any
+    /// `pgno` repeated (the duplicate-page anomaly, design §3).
+    fn from_walk(header: JournalHeader, walked: Vec<JournalPageImage>) -> Self {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut images = Vec::with_capacity(walked.len());
+        let mut duplicate_pgno = false;
+        for img in walked {
+            if seen.insert(img.pgno) {
+                images.push(img);
+            } else {
+                // Keep the FIRST occurrence as the truest pre-transaction image;
+                // flag the duplicate rather than silently absorbing it.
+                duplicate_pgno = true;
+            }
+        }
+        Self {
+            header,
+            images,
+            duplicate_pgno,
+        }
+    }
+
+    /// The parsed (or reconstructed) header.
+    #[must_use]
+    pub fn header(&self) -> &JournalHeader {
+        &self.header
+    }
+
+    /// The ordered, first-wins pre-transaction page images.
+    #[must_use]
+    pub fn page_images(&self) -> &[JournalPageImage] {
+        &self.images
+    }
+
+    /// Whether a `pgno` appeared more than once across the parsed segments — the
+    /// spec says a page is journaled at most once, so a repeat is consistent with
+    /// corruption, a savepoint/super-journal artifact, or tampering (design §3).
+    #[must_use]
+    pub fn has_duplicate_pgno(&self) -> bool {
+        self.duplicate_pgno
+    }
 }
 
 /// Bounds-checked big-endian u32; out-of-range yields 0 (never panics).

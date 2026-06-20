@@ -131,11 +131,18 @@ recover all 20; SQL-DRP (main-image only) recovers none — matching the survey.
   `b"SQLite"` header check and a bytes-aware `remove_ascii_non_printable`). TSV
   (`-f`/`-o`) mode; it reads the main image only and does not consult a `-wal`.
 - **Undark** and **FQLite** — **CITED, not run** here (no `UNDARK_BIN` / `FQLITE_TAP`
-  available in this run). The repo's separate Nemetz head-to-head
-  (`forensic/tests/nemetz_tool_comparison.rs`, written up in
-  [`recovery-comparison.md`](recovery-comparison.md)) does run them when those env
-  vars are set. Their false-positive figures here are the survey's reported
+  available in this run). Their false-positive figures here are the survey's reported
   numbers on its corpus.
+
+> **Companion comparison — the Nemetz head-to-head.** `bring2lite` and SQL-DRP are
+> also wired as standing, env-gated oracles into the repo's third-party-ground-truth
+> head-to-head (`forensic/tests/nemetz_tool_comparison.rs`, written up in
+> [`recovery-comparison.md`](recovery-comparison.md)), through the **same** committed
+> wrappers used here — `scripts/run-bring2lite.sh` (`BRING2LITE_CMD`) and
+> `scripts/run-sqldrp.sh` (`SQLDRP_CMD`). That table scores precision/recall against
+> the Nemetz answer key on the `(col1,col2)` matcher (where SQL-DRP's string-carver
+> nature surfaces as a documented 0-identity boundary); this page scores the
+> survey's **false-positive** scenarios. Read the two together for the full picture.
 
 ## Limits of this comparison
 

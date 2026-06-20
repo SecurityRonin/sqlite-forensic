@@ -167,10 +167,13 @@ PY
 
 ## §F Independent oracle tools (VENDORED, not committed)
 
-Two independent reference carvers validate `carve_deleted_records` (differential
-methodology in `docs/validation.md`; harness in
-`forensic/tests/oracle_differential.rs`). `tools/` is gitignored — neither tool is
-**committed**; these entries are their provenance record.
+Four independent reference carvers validate `carve_deleted_records` (differential
+methodology in `docs/validation.md`; the head-to-head harness is
+`forensic/tests/nemetz_tool_comparison.rs`; the fixture differential is
+`forensic/tests/oracle_differential.rs`). `tools/` is gitignored — none of the
+tool sources are **committed**; these entries are their provenance record. The
+thin normalizing wrappers in `scripts/` (`run-bring2lite.sh`, `run-sqldrp.sh`)
+**are** committed and are the stable interface the harness shells out to.
 
 ### §F.1 `undark` (C) — test gate `UNDARK_BIN`
 
@@ -209,6 +212,72 @@ an oracle, the CLI cancellation was the only blocker.
 - Invocation: `tools/fqlite/run-tap.sh <db>` → CSV `rowid,col1,col2,…` of
   recovered DELETED rows (rowid `-1` when fqlite cannot recover it; the fqlite
   comparison is keyed by url content).
+
+### §F.3 `bring2lite` (Python 3) — test gate `BRING2LITE_CMD`
+
+A freeblock / freelist / unallocated-area carver. Its CLI path imports PyQt5 at
+module load (the `Visualizer` is never used in `--gui 0` mode), and the Python-3
+source emits `SyntaxWarning`s for `is`-with-literal comparisons.
+
+- Classification: `VENDORED` (third-party tool), confidence `✓` (run on the full
+  0C/0D/0E head-to-head scope).
+- Tool: `bring2lite` (Bring2lite), Python 3.
+- Upstream: <https://github.com/bring2lite/bring2lite>
+- Commit: `e876bf28c1ba03fc598d92832374f72794760ca1`.
+- Upstream identity sha256: `main.py`
+  `5654260c3c9131a70957b6375d6d86ffc6700c95cce0a813e81a7b989984fe94`,
+  `classes/gui.py`
+  `9273ea13001b96ef53255b084f58d27ebb6b6a69d1153039712bc48660280ea4`.
+- Setup recipe (all under the gitignored `tools/bring2lite/`):
+  1. `git clone` at the commit; copy the `bring2lite/` package to
+     `tools/bring2lite/pkg`.
+  2. Replace the `is`/`is not` literal comparisons with `==`/`!=` in
+     `classes/{gui,sqlite_parser,journal_parser,visualizer}.py` (clears every
+     `SyntaxWarning`; behaviour-preserving).
+  3. A headless **PyQt5 shim** (`tools/bring2lite/shim/PyQt5/`) provides inert
+     stubs so the top-level `from PyQt5.QtWidgets import …` in `visualizer.py`
+     loads on a host without PyQt5. `scripts/run-bring2lite.sh` prepends the shim
+     to `PYTHONPATH` **only when a real PyQt5 is absent** (a genuine install
+     always wins); no Qt symbol is ever called in CLI mode.
+- CLI: `python3 main.py --filename <db> --out <dir> --format CSV`. Output is a tree
+  of per-page `.log` files; the carved-deleted records land in `freeblocks/`,
+  `freelists/`, and `unalloc-parsing/` (the `regular-page-parsing/` tree is the
+  live b-tree, not a recovery claim).
+- Invocation (the harness gate): `BRING2LITE_CMD=scripts/run-bring2lite.sh`. The
+  wrapper runs the tool into a temp dir and emits one recovered record per line as
+  `col0,col1,col2,…` (the same row shape undark emits), suppressing the live
+  `regular-page-parsing/` re-dump. Its `(col1,col2)` identity is at CSV fields 1/2.
+
+### §F.4 SQLite Deleted Records Parser / `sqlparse` (Python 2 → 3) — test gate `SQLDRP_CMD`
+
+A printable-**string** carver: it walks every page, and from each leaf-table
+b-tree's unallocated space and freeblock chain it extracts the printable-ASCII
+runs into a flat `Data` field. It is NOT a per-column record parser.
+
+- Classification: `VENDORED` (third-party tool, Python-2 ported to 3), confidence
+  `✓` (run on the full 0C/0D/0E head-to-head scope).
+- Tool: SQLite Deleted Records Parser (`sqlparse`) v1.3, Mari DeGrazia. GPLv3.
+- Upstream: <https://github.com/mdegrazia/SQLite-Deleted-Records-Parser>
+- Commit: `4ce67cadc813264a959a71d9f0da5a749dfb4e0f`.
+- Original `sqlparse_v1.3.py` sha256
+  `e60b02e8a9a258109b06bdd32ce9f4a7ff05d879fdf0c069d2ebcbba638f9f16`.
+- Setup recipe (under the gitignored `tools/sqldrp/`):
+  1. `2to3 -w -n sqlparse_v1.3.py` (Python-2 → 3: `print` statements, etc.).
+  2. Magic check: `"SQLite" not in header` → `b"SQLite" not in header` (the
+     16-byte header is `bytes` in Py3).
+  3. `remove_ascii_non_printable`: make it bytes-aware — iterate raw byte values
+     (Py3 `bytes` yields ints, so the original `ord(ch)` would raise), keep
+     printable ASCII + tab, then decode to text.
+- CLI: `python3 sqlparse_v1.3.py -f <db> -o <out.tsv>` → TSV
+  `Type<TAB>Offset<TAB>Length<TAB>Data`.
+- Invocation (the harness gate): `SQLDRP_CMD=scripts/run-sqldrp.sh`, which emits
+  that TSV on stdout. **Measured capability boundary:** the `Data` blob is not a
+  `(col0,col1,col2)` record, so under the head-to-head's exact `(col1,col2)`
+  matcher SQL-DRP exposes no cross-tool identity and recovers 0 answer-key rows
+  (and nothing from the integer tables); this is reported explicitly rather than
+  scored against a confounded key (see `docs/recovery-comparison.md`). Its
+  string-carving value — false-positive avoidance and WAL-vs-main-image substrate —
+  is measured in `docs/competitive-landscape.md`.
 
 > `sqlite_dissect` was also evaluated as an oracle but its free-block carver
 > produced misaligned/garbled columns on these fixtures, so it was rejected as a
@@ -430,6 +499,9 @@ own md5 manifest in `tests/data/nemetz/README.md` to avoid duplicating it here.
 
 Not committed (provenance only — see §F, §G and the per-directory READMEs):
 `tools/undark`, the fqlite tap under `tools/fqlite/` (source, jars, built classes
-— recipe in `tools/fqlite/README.md`), and the DC3 corpus under
-`tests-oracle-corpus/dc3-sqlite-dissect/` (full sha256/md5 list in
-`tests-oracle-corpus/README.md`).
+— recipe in `tools/fqlite/README.md`), the `bring2lite` checkout + PyQt5 shim
+under `tools/bring2lite/` (§F.3), the Py3-ported `sqlparse` under `tools/sqldrp/`
+(§F.4), and the DC3 corpus under `tests-oracle-corpus/dc3-sqlite-dissect/` (full
+sha256/md5 list in `tests-oracle-corpus/README.md`). The committed
+`scripts/run-bring2lite.sh` / `scripts/run-sqldrp.sh` wrappers are the stable
+harness interface to the gitignored tool sources.

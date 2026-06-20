@@ -1253,8 +1253,8 @@ impl Database {
             let Ok(root) = u32::try_from(*root) else {
                 continue; // cov:unreachable: a real rootpage is a small positive page number
             };
-            let mut visited = 0usize;
-            self.collect_rowids(root, &mut ids, &mut visited);
+            let mut seen = std::collections::BTreeSet::new();
+            self.collect_rowids(root, &mut ids, &mut seen);
         }
         ids
     }
@@ -1287,8 +1287,8 @@ impl Database {
             let Ok(root) = u32::try_from(*root) else {
                 continue; // cov:unreachable: a real rootpage is a small positive page number
             };
-            let mut visited = 0usize;
-            self.collect_rows(root, &mut rows, &mut visited);
+            let mut seen = std::collections::BTreeSet::new();
+            self.collect_rows(root, &mut rows, &mut seen);
         }
         rows
     }
@@ -1597,11 +1597,16 @@ impl Database {
         &self,
         page: u32,
         rows: &mut std::collections::BTreeMap<i64, Vec<Value>>,
-        visited: &mut usize,
+        seen: &mut std::collections::BTreeSet<u32>,
     ) {
-        *visited += 1;
-        if *visited > MAX_PAGES_PER_WALK {
-            return; // cov:unreachable: test b-trees are far below the 1M-page cap
+        // Visit each page at most once. A manipulated interior left-child or
+        // right-most pointer (anti-forensic corpus category 12) can point back
+        // into an already-visited page, and a counter-only guard would still
+        // recurse a million frames deep before stopping — a stack overflow. The
+        // visited-set bounds recursion DEPTH to the number of distinct pages,
+        // mirroring `collect_pages`'s cycle guard.
+        if page == 0 || seen.len() > MAX_PAGES_PER_WALK || !seen.insert(page) {
+            return;
         }
         let Ok(slice) = self.page_slice(page) else {
             return; // cov:unreachable: schema rootpages and their children are in range
@@ -1634,14 +1639,10 @@ impl Database {
                 for i in 0..cell_count {
                     let cell_off = be_u16(slice, cell_ptr_array + i * 2) as usize;
                     let child = be_u32(slice, cell_off);
-                    if child != 0 && child != page {
-                        self.collect_rows(child, rows, visited);
-                    }
+                    self.collect_rows(child, rows, seen);
                 }
                 let right = be_u32(slice, hdr_off + 8);
-                if right != 0 && right != page {
-                    self.collect_rows(right, rows, visited);
-                }
+                self.collect_rows(right, rows, seen);
             }
             _ => {} // cov:unreachable: a table b-tree root/child is leaf (0x0d) or interior (0x05)
         }
@@ -1654,11 +1655,13 @@ impl Database {
         &self,
         page: u32,
         ids: &mut std::collections::BTreeSet<i64>,
-        visited: &mut usize,
+        seen: &mut std::collections::BTreeSet<u32>,
     ) {
-        *visited += 1;
-        if *visited > MAX_PAGES_PER_WALK {
-            return; // cov:unreachable: test b-trees are far below the 1M-page cap
+        // Visit each page at most once (see `collect_rows` for the rationale): a
+        // manipulated child pointer that revisits a page must not recurse
+        // unboundedly. The visited-set bounds recursion depth to distinct pages.
+        if page == 0 || seen.len() > MAX_PAGES_PER_WALK || !seen.insert(page) {
+            return;
         }
         let Ok(slice) = self.page_slice(page) else {
             return; // cov:unreachable: schema rootpages and their children are in range
@@ -1683,14 +1686,10 @@ impl Database {
                 for i in 0..cell_count {
                     let cell_off = be_u16(slice, cell_ptr_array + i * 2) as usize;
                     let child = be_u32(slice, cell_off);
-                    if child != 0 && child != page {
-                        self.collect_rowids(child, ids, visited);
-                    }
+                    self.collect_rowids(child, ids, seen);
                 }
                 let right = be_u32(slice, hdr_off + 8);
-                if right != 0 && right != page {
-                    self.collect_rowids(right, ids, visited);
-                }
+                self.collect_rowids(right, ids, seen);
             }
             _ => {} // cov:unreachable: a table b-tree root/child is leaf (0x0d) or interior (0x05)
         }
@@ -1801,8 +1800,8 @@ fn read_table_via(
     column_count: usize,
 ) -> Result<Vec<Row>, Error> {
     let mut rows = Vec::new();
-    let mut visited = 0usize;
-    walk_table_page(src, root_page, column_count, &mut rows, &mut visited)?;
+    let mut seen = std::collections::BTreeSet::new();
+    walk_table_page(src, root_page, column_count, &mut rows, &mut seen)?;
     Ok(rows)
 }
 
@@ -1811,11 +1810,20 @@ fn walk_table_page(
     page: u32,
     column_count: usize,
     rows: &mut Vec<Row>,
-    visited: &mut usize,
+    seen: &mut std::collections::BTreeSet<u32>,
 ) -> Result<(), Error> {
-    *visited += 1;
-    if *visited > MAX_PAGES_PER_WALK {
+    // Visit each page at most once. A manipulated interior child pointer
+    // (anti-forensic corpus category 12) can revisit an already-walked page; a
+    // counter-only guard still recurses up to the cap deep before stopping,
+    // overflowing the stack. The visited-set bounds recursion DEPTH to the
+    // number of distinct pages. A revisited page is silently skipped (Ok) so a
+    // crafted cycle yields the partial-but-valid rows already collected rather
+    // than an error.
+    if seen.len() > MAX_PAGES_PER_WALK {
         return Err(Error::TooManyPages);
+    }
+    if !seen.insert(page) {
+        return Ok(());
     }
     let slice = src.page(page).ok_or(Error::PageOutOfRange(page))?;
 
@@ -1835,10 +1843,10 @@ fn walk_table_page(
                 let p = cell_ptr_array + i * 2;
                 let cell_off = be_u16(slice, p) as usize;
                 let child = be_u32(slice, cell_off);
-                walk_table_page(src, child, column_count, rows, visited)?;
+                walk_table_page(src, child, column_count, rows, seen)?;
             }
             let right = be_u32(slice, hdr_off + 8);
-            walk_table_page(src, right, column_count, rows, visited)
+            walk_table_page(src, right, column_count, rows, seen)
         }
         other => Err(Error::NotATablePage(other)),
     }

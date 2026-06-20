@@ -114,6 +114,10 @@ pub struct RowView {
     /// Whether the table's schema could be reconstructed for this view. `false`
     /// flags rows attributed here `attribution_uncertain`.
     pub schema_known: bool,
+    /// This view's logical provenance — [`VersionOrigin::Live`] for the final
+    /// view, [`VersionOrigin::Commit`] (carrying the real [`CommitId`](crate::CommitId))
+    /// for a WAL commit view. Copied verbatim onto every version first seen here.
+    pub origin: VersionOrigin,
     /// This view's rows: rowid → decoded values. A rowid absent from the map is
     /// absent in this view.
     pub rows: BTreeMap<i64, Vec<Value>>,
@@ -133,6 +137,117 @@ pub struct RowView {
 ///
 /// Pure: no I/O. The result is in chronological order for this rowid.
 #[must_use]
-pub fn build_rowid_versions(_rowid: i64, _views: &[RowView]) -> Vec<RowVersion> {
-    Vec::new()
+pub fn build_rowid_versions(rowid: i64, views: &[RowView]) -> Vec<RowVersion> {
+    // ---- 1. Collapse the per-view presence sequence into maximal runs --------
+    // A "present run" is a maximal stretch of views holding the SAME value with
+    // no intervening absence; an absence (the rowid missing from a view's map)
+    // breaks a run even when the value later reappears identically. We record
+    // each present run's value, the EARLIEST view it appeared in (the label),
+    // that view's trust flags, and whether an absence GAP preceded it.
+    struct Run<'a> {
+        values: &'a [Value],
+        earliest_seq: Option<u32>,
+        origin: VersionOrigin,
+        uncertain: bool,
+        gap_before: bool,
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    let mut seen_present = false;
+    let mut pending_gap = false;
+    for view in views {
+        match view.rows.get(&rowid) {
+            None => {
+                // An absence only counts as a gap once the rowid has appeared.
+                if seen_present {
+                    pending_gap = true;
+                }
+            }
+            Some(values) => {
+                let uncertain = !view.checksum_valid || !view.schema_known;
+                let extends = matches!(runs.last(), Some(r) if r.values == values.as_slice());
+                if extends && !pending_gap {
+                    // Same value, no gap: extend the current run (collapse).
+                } else if extends && pending_gap {
+                    // Same value across a gap: still the same record by evidence —
+                    // collapse into the existing run (not a reuse), clearing the
+                    // gap so it is not treated as a delete+reinsert.
+                } else {
+                    runs.push(Run {
+                        values,
+                        earliest_seq: view.commit_seq,
+                        origin: view.origin.clone(),
+                        uncertain,
+                        gap_before: pending_gap,
+                    });
+                }
+                seen_present = true;
+                pending_gap = false;
+            }
+        }
+    }
+
+    if runs.is_empty() {
+        return Vec::new();
+    }
+
+    // ---- 2. Final-view facts -------------------------------------------------
+    // The rowid's value in the final live view (None if absent there). Whether
+    // the LAST run reaches the final view (no trailing gap after it).
+    let final_values: Option<&[Value]> = views
+        .iter()
+        .rev()
+        .find(|v| v.is_final)
+        .and_then(|v| v.rows.get(&rowid))
+        .map(Vec::as_slice);
+    let present_in_final = final_values.is_some();
+
+    // ---- 3. Reuse detection --------------------------------------------------
+    // Reuse = a present run, a gap, then a DIFFERENT value. `gap_before` on any
+    // run past the first is exactly that signal (a same-value-across-gap run was
+    // collapsed in step 1, so it never carries gap_before here).
+    let rowid_reused = runs.iter().skip(1).any(|r| r.gap_before);
+
+    // ---- 4. Emit one RowVersion per run --------------------------------------
+    let last_idx = runs.len() - 1;
+    // A run is "ended by deletion" iff the rowid DISAPPEARED right after it — the
+    // NEXT run begins after a gap (reuse), or it is the last run and the rowid is
+    // absent in the final view. A run replaced by a different value with NO gap is
+    // a direct UPDATE (ValueChangedLater), not a deletion.
+    let next_gap: Vec<bool> = (0..runs.len())
+        .map(|i| runs.get(i + 1).is_some_and(|r| r.gap_before))
+        .collect();
+    runs.iter()
+        .enumerate()
+        .map(|(i, run)| {
+            let is_last = i == last_idx;
+            // The final value reaches the last run iff that run is present in the
+            // final view AND its value equals the final value.
+            let is_final_value = is_last && present_in_final && final_values == Some(run.values);
+            let deleted_here = next_gap[i] || (is_last && !present_in_final);
+            let view_state = if is_final_value {
+                ViewState::PresentInFinalView
+            } else if deleted_here {
+                // The rowid disappeared after this value — its last value before
+                // the gap/end is AbsentInFinalView (a completed deletion).
+                ViewState::AbsentInFinalView
+            } else {
+                // An earlier value later replaced by a different one (direct update).
+                ViewState::ValueChangedLater
+            };
+            let is_deleted = matches!(view_state, ViewState::AbsentInFinalView);
+            RowVersion {
+                rowid: Some(rowid),
+                values: run.values.to_vec(),
+                // The version's origin is the EARLIEST view it appeared in — the
+                // same view that supplies its `commit_seq` label.
+                origin: run.origin.clone(),
+                commit_seq: run.earliest_seq,
+                view_state,
+                is_deleted,
+                is_guessed: false,
+                rowid_reused,
+                attribution_uncertain: run.uncertain,
+            }
+        })
+        .collect()
 }

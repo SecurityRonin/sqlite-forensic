@@ -10,8 +10,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use sqlite_core::row_history::{build_rowid_versions, RowView, ViewState};
-use sqlite_core::Value;
+use sqlite_core::row_history::{build_rowid_versions, RowView, VersionOrigin, ViewState};
+use sqlite_core::{CommitId, Value, WalSegmentId};
 
 /// Shorthand: a one-column TEXT row.
 fn txt(s: &str) -> Vec<Value> {
@@ -30,6 +30,11 @@ fn commit_view(seq: u32, values: Option<Vec<Value>>) -> RowView {
         is_final: false,
         checksum_valid: true,
         schema_known: true,
+        origin: VersionOrigin::Commit(CommitId {
+            segment: WalSegmentId(0),
+            commit_frame_index: seq as usize,
+            db_size_after_commit: 1,
+        }),
         rows,
     }
 }
@@ -45,6 +50,7 @@ fn final_view(values: Option<Vec<Value>>) -> RowView {
         is_final: true,
         checksum_valid: true,
         schema_known: true,
+        origin: VersionOrigin::Live,
         rows,
     }
 }

@@ -1438,3 +1438,93 @@ fn xlsx_temporal_workbook_has_version_history_from_wal() {
 
     teardown_reader(reader);
 }
+
+/// The CFReDS SFT-03 PERSIST pair: a `-journal` sits beside the main db with the
+/// pre-images of the last transaction (100 `invoice_items` deletions + 100
+/// modifications). The default `carve` must auto-discover the `<db>-journal`,
+/// fold its recovery into the combined workbook, and surface in the
+/// `invoice_items` sheet: the 100 deleted prior rows flagged `is_deleted=1`
+/// (red), and the 100 modified rows' PRIOR values as `changed_later` superseded
+/// (blue) versions — the live rows staying current. Counts are floored at 99 (the
+/// recovery target is the full 100/100). The corpus pair is committed, so this
+/// test reads it directly (no sqlite3 mint, no env gate); output lands in a
+/// scratch copy so the evidence `-journal` is never touched.
+#[test]
+fn xlsx_combined_folds_rollback_journal_recovery() {
+    use calamine::{Data, Reader};
+
+    let dir = Scratch::new("journal_xlsx");
+    let src = data_dir().join("cfreds");
+    let db = dir.join("SFT-03_PERSIST_ios.sqlite");
+    std::fs::copy(src.join("SFT-03_PERSIST_ios.sqlite"), &db).unwrap();
+    std::fs::copy(
+        src.join("SFT-03_PERSIST_ios.sqlite-journal"),
+        dir.join("SFT-03_PERSIST_ios.sqlite-journal"),
+    )
+    .unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "SFT-03_PERSIST_ios.sqlite"])
+        .output()
+        .expect("run carve");
+    assert!(
+        out.status.success(),
+        "carve must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let xlsx = dir.join("SFT-03_PERSIST_ios.recovered.xlsx");
+    assert!(xlsx.exists(), "xlsx companion must be written");
+    let mut wb: calamine::Xlsx<_> =
+        calamine::open_workbook(&xlsx).expect("calamine must open the xlsx");
+    assert!(
+        wb.sheet_names().iter().any(|n| n == "invoice_items"),
+        "invoice_items has its own sheet: {:?}",
+        wb.sheet_names()
+    );
+
+    let sheet = wb.worksheet_range("invoice_items").unwrap();
+    let header: Vec<String> = sheet
+        .rows()
+        .next()
+        .unwrap()
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    for col in ["_rowid", "view_state", "is_deleted"] {
+        assert!(
+            header.iter().any(|h| h == col),
+            "invoice_items header has {col}: {header:?}"
+        );
+    }
+    let i_del = header.iter().position(|h| h == "is_deleted").unwrap();
+    let i_view = header.iter().position(|h| h == "view_state").unwrap();
+
+    // Deleted prior rows: is_deleted=1 carved_residue versions folded under the
+    // KNOWN table at their rowid → red tint.
+    let deleted = sheet
+        .rows()
+        .skip(1)
+        .filter(|r| matches!(&r[i_del], Data::Float(d) if *d == 1.0))
+        .count();
+    assert!(
+        deleted >= 99,
+        "the journal's 100 deletions fold in as is_deleted=1 versions (got {deleted})"
+    );
+    assert_eq!(deleted, 100, "target is the full 100/100 deletions");
+
+    // Modified rows: the PRIOR value surfaces as a `changed_later` superseded
+    // version (blue), is_deleted=0 (the live row stays current).
+    let superseded = sheet
+        .rows()
+        .skip(1)
+        .filter(|r| matches!(&r[i_view], Data::String(s) if s == "changed_later"))
+        .filter(|r| matches!(&r[i_del], Data::Float(d) if *d == 0.0))
+        .count();
+    assert!(
+        superseded >= 99,
+        "the journal's 100 modifications fold in as changed_later superseded versions (got {superseded})"
+    );
+    assert_eq!(superseded, 100, "target is the full 100/100 modifications");
+}

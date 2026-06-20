@@ -15,8 +15,9 @@
 
 use std::path::{Path, PathBuf};
 
+use forensicnomicon::report::{Observation, Source};
 use sqlite_core::Database;
-use sqlite_forensic::audit_journal;
+use sqlite_forensic::{audit_journal, audit_journal_findings};
 
 fn cfreds(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -208,6 +209,31 @@ fn tier_a_journal_triggers_hot_checksum_duplicate_dbsize_shrink() {
         "shrink (mx_page > current) names vacuum/truncation; note = {:?}",
         dbsize.note
     );
+
+    // The structured Evidence carries the offending pgno(s) + the record count for
+    // the checksum mismatch, and both page numbers for the size delta.
+    let ck_ev = cksum.evidence();
+    assert!(
+        ck_ev
+            .iter()
+            .any(|e| e.field == "checksum_mismatch_pgno" && e.value == "2"),
+        "checksum evidence names the offending pgno; evidence = {ck_ev:?}"
+    );
+    assert!(
+        ck_ev.iter().any(|e| e.field == "page_records"),
+        "checksum evidence carries the record-count denominator; evidence = {ck_ev:?}"
+    );
+    let db_ev = dbsize.evidence();
+    assert!(
+        db_ev.iter().any(|e| e.field == "mx_page" && e.value == "9"),
+        "size-delta evidence carries mx_page; evidence = {db_ev:?}"
+    );
+    assert!(
+        db_ev
+            .iter()
+            .any(|e| e.field == "current_pages" && e.value == "1"),
+        "size-delta evidence carries the current page count; evidence = {db_ev:?}"
+    );
 }
 
 #[test]
@@ -257,6 +283,25 @@ fn tier_a_no_delta_when_size_unchanged_or_unknown() {
         !codes_of(&db, &zero).contains(&"SQLITE-JOURNAL-DBSIZE-DELTA"),
         "mx_page == 0 sentinel → no size delta"
     );
+}
+
+#[test]
+fn journal_findings_carry_source_and_code() {
+    let main = std::fs::read(cfreds("SFT-03_PERSIST_ios.sqlite")).unwrap();
+    let journal = std::fs::read(cfreds("SFT-03_PERSIST_ios.sqlite-journal")).unwrap();
+    let db = Database::open(main).expect("open main");
+    let source = Source {
+        analyzer: "sqlite-forensic".to_string(),
+        scope: "SFT-03_PERSIST_ios.sqlite-journal".to_string(),
+        version: None,
+    };
+    let findings = audit_journal_findings(&db, &journal, &source);
+    let codes: Vec<String> = findings.iter().map(|f| f.code.to_string()).collect();
+    assert!(codes.iter().any(|c| c == "SQLITE-JOURNAL-RECOVERABLE"));
+    assert!(codes.iter().any(|c| c == "SQLITE-JOURNAL-SCHEMA-CHANGE"));
+    assert!(findings
+        .iter()
+        .all(|f| f.source.analyzer == "sqlite-forensic"));
 }
 
 #[test]

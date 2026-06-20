@@ -19,6 +19,9 @@
 //!   deletions), an active WAL overlay (uncheckpointed state), and a header/file
 //!   page-count mismatch into severity-ranked
 //!   [`forensicnomicon::report::Finding`]s.
+//! - [`audit_journal`] grades the rollback-`-journal` design-§6 observations
+//!   (hot journal, recoverable PERSIST pre-images, checksum mismatch, journaled
+//!   schema page, duplicate page record, db-size delta) — additive to [`audit`].
 //!
 //! Deferred: a full anomaly suite (overflow-chain integrity, schema-format /
 //! text-encoding checks) and a fuzz harness.
@@ -79,6 +82,50 @@ pub enum AnomalyKind {
         /// Page count implied by `file_len / page_size`.
         file_pages: u32,
     },
+    /// A `-journal` with an intact header (valid magic) sits beside the database
+    /// — a *hot journal*. Consistent with an interrupted or in-progress write
+    /// transaction (crash, power loss, process kill, or acquisition captured
+    /// mid-write); `SQLite` would roll it back on next open, so the main db may
+    /// require rollback. The journal holds the pre-interruption state. (Design §6
+    /// item 1 — state the observation; never assert "anti-forensic".)
+    HotJournal,
+    /// A committed PERSIST `-journal` (header zeroed, bodies intact) carries
+    /// recoverable pre-images. Consistent with a normally-committed transaction
+    /// whose deleted/modified rows remain recoverable (design §6 item 2).
+    JournalRecoverable {
+        /// Number of pre-transaction page images the journal carries.
+        images: usize,
+    },
+    /// One or more journal page records failed the `pager.c` checksum (Tier A
+    /// only — Tier B has no nonce to verify against). Consistent with corruption,
+    /// a torn page (power-loss mid-sector), or post-write modification of the
+    /// journal (design §6 item 3).
+    JournalChecksumMismatch {
+        /// The page numbers whose stored checksum did not match, ascending.
+        pgnos: Vec<u32>,
+        /// Total page records the journal carries (the denominator).
+        total: usize,
+    },
+    /// The schema page (page 1) is present among the journal's page images.
+    /// Consistent with a DDL change (CREATE/DROP/ALTER) in the last transaction;
+    /// the prior schema is recoverable (design §6 item 6).
+    JournalSchemaChange,
+    /// A `pgno` appeared more than once across the journal's page records. The
+    /// spec journals a page at most once, so a repeat is consistent with
+    /// corruption, a savepoint/super-journal artifact, or tampering (design §6
+    /// item 9).
+    JournalDuplicatePage,
+    /// The database page count recorded at transaction start (`mxPage`, Tier A
+    /// only) differs from the current page count: the last transaction changed
+    /// the db size. `mxPage < current` ⇒ growth (INSERTs); `mxPage > current` ⇒
+    /// shrink, consistent with auto-vacuum/incremental-vacuum or truncation — NOT
+    /// an ordinary `DELETE` (design §6 item 5).
+    JournalDbSizeDelta {
+        /// Database page count at transaction start (`mxPage`, journal header).
+        mx_page: u32,
+        /// Current database page count.
+        current_pages: u32,
+    },
 }
 
 impl AnomalyKind {
@@ -90,8 +137,14 @@ impl AnomalyKind {
                 Severity::Low
             }
             AnomalyKind::DeletedRecordRecovered { .. }
-            | AnomalyKind::WalUncheckpointedState { .. } => Severity::Medium,
-            AnomalyKind::PageCountMismatch { .. } => Severity::High,
+            | AnomalyKind::WalUncheckpointedState { .. }
+            | AnomalyKind::JournalRecoverable { .. }
+            | AnomalyKind::JournalSchemaChange
+            | AnomalyKind::JournalDuplicatePage => Severity::Medium,
+            AnomalyKind::PageCountMismatch { .. }
+            | AnomalyKind::HotJournal
+            | AnomalyKind::JournalChecksumMismatch { .. } => Severity::High,
+            AnomalyKind::JournalDbSizeDelta { .. } => Severity::Low,
         }
     }
 
@@ -104,6 +157,12 @@ impl AnomalyKind {
             AnomalyKind::NonEmptyFreelist { .. } => "SQLITE-FREELIST-NONEMPTY",
             AnomalyKind::WalUncheckpointedState { .. } => "SQLITE-WAL-UNCHECKPOINTED",
             AnomalyKind::PageCountMismatch { .. } => "SQLITE-PAGECOUNT-MISMATCH",
+            AnomalyKind::HotJournal => "SQLITE-JOURNAL-HOT",
+            AnomalyKind::JournalRecoverable { .. } => "SQLITE-JOURNAL-RECOVERABLE",
+            AnomalyKind::JournalChecksumMismatch { .. } => "SQLITE-JOURNAL-CHECKSUM-MISMATCH",
+            AnomalyKind::JournalSchemaChange => "SQLITE-JOURNAL-SCHEMA-CHANGE",
+            AnomalyKind::JournalDuplicatePage => "SQLITE-JOURNAL-DUPLICATE-PAGE",
+            AnomalyKind::JournalDbSizeDelta { .. } => "SQLITE-JOURNAL-DBSIZE-DELTA",
         }
     }
 
@@ -144,6 +203,56 @@ impl AnomalyKind {
                  length ({file_pages} pages) — consistent with truncation, \
                  carving, or out-of-band modification"
             ),
+            AnomalyKind::HotJournal => "a hot rollback journal (valid header magic) sits beside \
+                 the database — consistent with an interrupted or in-progress write transaction \
+                 (crash, power loss, process kill, or acquisition captured mid-write); SQLite \
+                 would roll it back on next open, so the main database may require rollback"
+                .to_string(),
+            AnomalyKind::JournalRecoverable { images } => format!(
+                "the rollback journal carries {images} pre-transaction page \
+                 image(s) (PERSIST post-commit) — consistent with a committed \
+                 transaction whose pre-images (deleted/modified rows) remain \
+                 recoverable"
+            ),
+            AnomalyKind::JournalChecksumMismatch { pgnos, total } => {
+                let list = pgnos
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{} of {total} journal page record(s) failed the page \
+                     checksum (page(s) {list}) — consistent with corruption, a \
+                     torn page write (power-loss mid-sector), or post-write \
+                     modification of the journal",
+                    pgnos.len()
+                )
+            }
+            AnomalyKind::JournalSchemaChange => "the schema page (page 1) is among the journal's \
+                 page images — consistent with a DDL change (CREATE/DROP/ALTER) in the last \
+                 transaction; the prior schema is recoverable"
+                .to_string(),
+            AnomalyKind::JournalDuplicatePage => "a page number appears more than once across the \
+                 journal's page records — the spec journals a page at most once, so this is \
+                 consistent with corruption, a savepoint/super-journal artifact, or tampering"
+                .to_string(),
+            AnomalyKind::JournalDbSizeDelta {
+                mx_page,
+                current_pages,
+            } => {
+                let direction = if *mx_page < *current_pages {
+                    "the database grew (consistent with INSERTs adding pages)"
+                } else {
+                    "the database shrank (consistent with auto-vacuum / \
+                     incremental-vacuum or truncation, NOT an ordinary DELETE)"
+                };
+                format!(
+                    "the journal records a transaction-start page count \
+                     (mxPage = {mx_page}) that differs from the current page \
+                     count ({current_pages}) — the last transaction changed the \
+                     database size: {direction}"
+                )
+            }
         }
     }
 }
@@ -207,14 +316,22 @@ impl Observation for Anomaly {
             // Deleted-record residue and free (deallocated) pages are recoverability
             // findings; the code keywords don't trip Category::from_code's Residue
             // classifier, so classify them explicitly.
-            AnomalyKind::DeletedRecordRecovered { .. } | AnomalyKind::NonEmptyFreelist { .. } => {
-                Category::Residue
-            }
-            // A WAL-only/uncheckpointed state and a header/file page-count mismatch
-            // are integrity-of-state observations.
-            AnomalyKind::WalUncheckpointedState { .. } | AnomalyKind::PageCountMismatch { .. } => {
-                Category::Integrity
-            }
+            // Deleted-record residue and free pages are recoverability findings;
+            // so are a recoverable PERSIST journal and a journaled schema page
+            // (the prior schema/rows are recoverable from the journal images).
+            AnomalyKind::DeletedRecordRecovered { .. }
+            | AnomalyKind::NonEmptyFreelist { .. }
+            | AnomalyKind::JournalRecoverable { .. }
+            | AnomalyKind::JournalSchemaChange => Category::Residue,
+            // A WAL-only/uncheckpointed state, a header/file page-count mismatch,
+            // and the journal integrity observations (hot journal, checksum /
+            // duplicate corruption, db-size delta) are integrity-of-state.
+            AnomalyKind::WalUncheckpointedState { .. }
+            | AnomalyKind::PageCountMismatch { .. }
+            | AnomalyKind::HotJournal
+            | AnomalyKind::JournalChecksumMismatch { .. }
+            | AnomalyKind::JournalDuplicatePage
+            | AnomalyKind::JournalDbSizeDelta { .. } => Category::Integrity,
             other => Category::from_code(other.code()),
         }
     }
@@ -270,7 +387,49 @@ impl Observation for Anomaly {
                     location: None,
                 },
             ],
-            AnomalyKind::NonZeroReservedSpace { .. } => Vec::new(),
+            AnomalyKind::JournalRecoverable { images } => vec![Evidence {
+                field: "page_images".to_string(),
+                value: images.to_string(),
+                location: None,
+            }],
+            AnomalyKind::JournalChecksumMismatch { pgnos, total } => {
+                let mut ev: Vec<Evidence> = pgnos
+                    .iter()
+                    .map(|pgno| Evidence {
+                        field: "checksum_mismatch_pgno".to_string(),
+                        value: pgno.to_string(),
+                        location: Some(Location::Other {
+                            space: "sqlite:page".to_string(),
+                            value: u64::from(*pgno),
+                        }),
+                    })
+                    .collect();
+                ev.push(Evidence {
+                    field: "page_records".to_string(),
+                    value: total.to_string(),
+                    location: None,
+                });
+                ev
+            }
+            AnomalyKind::JournalDbSizeDelta {
+                mx_page,
+                current_pages,
+            } => vec![
+                Evidence {
+                    field: "mx_page".to_string(),
+                    value: mx_page.to_string(),
+                    location: None,
+                },
+                Evidence {
+                    field: "current_pages".to_string(),
+                    value: current_pages.to_string(),
+                    location: None,
+                },
+            ],
+            AnomalyKind::NonZeroReservedSpace { .. }
+            | AnomalyKind::HotJournal
+            | AnomalyKind::JournalSchemaChange
+            | AnomalyKind::JournalDuplicatePage => Vec::new(),
         }
     }
 }
@@ -1177,6 +1336,98 @@ pub fn audit(db: &Database) -> Vec<Anomaly> {
 #[must_use]
 pub fn audit_findings(db: &Database, source: &Source) -> Vec<Finding> {
     audit(db)
+        .into_iter()
+        .map(|a| a.to_finding(source.clone()))
+        .collect()
+}
+
+/// Audit a rollback `-journal` (raw bytes) bound to `db` for the design-§6
+/// observations, additive to [`audit`] (which covers main-db anomalies only).
+///
+/// The journal is parsed with the database's authoritative page size and graded
+/// into observations, each derivable from the parser API and each "consistent
+/// with …" (the examiner draws the conclusion):
+/// - a **hot journal** (valid header magic) — an interrupted/in-progress write;
+/// - a **recoverable** PERSIST journal (zeroed header, page images intact);
+/// - **checksum mismatch(es)** (Tier A) — corruption / torn page / modification;
+/// - a **journaled schema page** (page 1) — a DDL change, prior schema recoverable;
+/// - a **duplicate page record** — corruption / savepoint / tampering;
+/// - a **db-size delta** (Tier A `mxPage` vs current) — growth or shrink.
+///
+/// Read-only and panic-free: an unparsable/garbage journal simply yields no
+/// observations rather than an error or panic.
+#[must_use]
+pub fn audit_journal(db: &Database, journal: &[u8]) -> Vec<Anomaly> {
+    let mut out = Vec::new();
+
+    let Ok(parsed) = RollbackJournal::parse(journal, db.header().page_size) else {
+        // A page size outside [512, 65536] / non-power-of-two is the only parse
+        // error; a database that opened cannot have one, so this degrades to no
+        // observations rather than masking a real failure.
+        return out;
+    };
+
+    let images = parsed.page_images();
+
+    match parsed.header() {
+        JournalHeader::Valid { mx_page, .. } => {
+            // A valid-magic header is a hot journal (interrupted/in-progress).
+            out.push(Anomaly::new(AnomalyKind::HotJournal));
+
+            // mxPage (db size at txn start) vs the current page count. 0 is the
+            // "size unknown" sentinel, so only a non-zero, differing value is a
+            // reportable size delta.
+            let current_pages = db.page_count();
+            if *mx_page != 0 && *mx_page != current_pages {
+                out.push(Anomaly::new(AnomalyKind::JournalDbSizeDelta {
+                    mx_page: *mx_page,
+                    current_pages,
+                }));
+            }
+        }
+        JournalHeader::ReconstructedZeroed { .. } => {
+            // A zeroed (PERSIST post-commit) header with >=1 page image carries
+            // recoverable pre-images.
+            if !images.is_empty() {
+                out.push(Anomaly::new(AnomalyKind::JournalRecoverable {
+                    images: images.len(),
+                }));
+            }
+        }
+    }
+
+    // Checksum mismatches (Tier A only — Tier B's checksum_valid is None).
+    let bad: Vec<u32> = images
+        .iter()
+        .filter(|i| i.checksum_valid == Some(false))
+        .map(|i| i.pgno)
+        .collect();
+    if !bad.is_empty() {
+        out.push(Anomaly::new(AnomalyKind::JournalChecksumMismatch {
+            pgnos: bad,
+            total: images.len(),
+        }));
+    }
+
+    // The schema page (page 1) among the images ⇒ a DDL change is recoverable.
+    if images.iter().any(|i| i.pgno == 1) {
+        out.push(Anomaly::new(AnomalyKind::JournalSchemaChange));
+    }
+
+    // A page journaled more than once (the spec forbids it).
+    if parsed.has_duplicate_pgno() {
+        out.push(Anomaly::new(AnomalyKind::JournalDuplicatePage));
+    }
+
+    out
+}
+
+/// Audit a rollback `-journal` and convert each design-§6 observation to the
+/// canonical [`Finding`] under `source`, ready to merge into a `Report`. The
+/// additive counterpart to [`audit_findings`] for the journal sidecar.
+#[must_use]
+pub fn audit_journal_findings(db: &Database, journal: &[u8], source: &Source) -> Vec<Finding> {
+    audit_journal(db, journal)
         .into_iter()
         .map(|a| a.to_finding(source.clone()))
         .collect()

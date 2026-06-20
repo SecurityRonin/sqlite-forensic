@@ -25,8 +25,8 @@ use sqlite4n6::{
 use sqlite_core::rebuild::build_recovered_db_tables;
 use sqlite_core::Database;
 use sqlite_forensic::{
-    audit, carve_all_deleted_records, carve_rollback_journal, carve_with_fragments, CarvedFragment,
-    CarvedRecord, JournalRecovery,
+    audit, audit_journal, carve_all_deleted_records, carve_rollback_journal, carve_with_fragments,
+    Anomaly, CarvedFragment, CarvedRecord, JournalRecovery,
 };
 
 /// sqlite4n6 — read-only SQLite forensic analysis CLI.
@@ -185,6 +185,15 @@ struct AuditArgs {
     /// Output format.
     #[arg(long, value_enum, default_value = "table")]
     format: FormatArg,
+
+    /// Ignore any `<db>-journal` rollback-journal sidecar — do not fold its
+    /// design-§6 observations (hot journal, recoverable pre-images, checksum
+    /// mismatch, journaled schema page, duplicate page, db-size delta) into the
+    /// audit. By default, when no WAL is in play and a `<db>-journal` sits beside
+    /// the database, those observations join the main-db anomalies. A WAL always
+    /// takes precedence (the two journal modes are mutually exclusive).
+    #[arg(long)]
+    no_journal: bool,
 }
 
 fn main() -> ExitCode {
@@ -474,9 +483,48 @@ fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// The `<db>-journal` rollback-journal sidecar to fold into an `audit`, applying
+/// the same resolution policy as `carve`: `--no-journal` disables it; a `<db>-wal`
+/// on disk ALWAYS takes precedence (the two journal modes are mutually exclusive,
+/// so a journal is only consulted when no WAL is in play); otherwise auto-detect
+/// the conventional `<db>-journal` sidecar when it exists. Returns the path only
+/// when a rollback journal is actually in play (and present).
+fn resolve_audit_journal_path(db: &Path, no_journal: bool) -> Option<PathBuf> {
+    if no_journal {
+        return None;
+    }
+    // A WAL wins outright: never consult a rollback journal alongside a WAL view.
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    if PathBuf::from(wal).exists() {
+        return None;
+    }
+    let mut name = db.as_os_str().to_owned();
+    name.push("-journal");
+    let candidate = PathBuf::from(name);
+    candidate.exists().then_some(candidate)
+}
+
+/// The design-§6 rollback-journal observations to fold into `audit` (when a
+/// `<db>-journal` is in play and no WAL takes precedence), bound to `db`. Reads
+/// the journal as owned bytes (the evidence sidecar is never opened read-write).
+/// Returns an empty vector when no journal applies (`--no-journal`, a WAL is in
+/// play, or none on disk); a journal read error surfaces loudly rather than
+/// silently degrading to empty.
+fn audit_journal_for(args: &AuditArgs, db: &Database) -> Result<Vec<Anomaly>, String> {
+    let Some(journal_path) = resolve_audit_journal_path(&args.db, args.no_journal) else {
+        return Ok(Vec::new());
+    };
+    let journal_bytes = std::fs::read(&journal_path)
+        .map_err(|e| format!("cannot read journal {}: {e}", journal_path.display()))?;
+    Ok(audit_journal(db, &journal_bytes))
+}
+
 fn run_audit(args: &AuditArgs) -> Result<(), String> {
     let db = open_db(&args.db)?;
-    let anomalies = audit(&db);
+    let mut anomalies = audit(&db);
+    // Fold in the rollback-journal §6 observations when a `<db>-journal` applies.
+    anomalies.extend(audit_journal_for(args, &db)?);
     for line in render_audit(&anomalies, args.format.into()) {
         println!("{line}");
     }

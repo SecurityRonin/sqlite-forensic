@@ -57,7 +57,7 @@ construction).
 
 Three scenarios were built with the real `sqlite3` engine following the survey's
 Table 5 construction (fixtures + generator in
-[`../tests/data/paper_fp/`](../tests/data/paper_fp/README.md)). Each tool was run
+[`tests/data/paper_fp/`](https://github.com/SecurityRonin/sqlite-forensic/blob/main/tests/data/paper_fp/README.md)). Each tool was run
 on the **same** files; recovered records were scored by content against the
 ground-truth live/deleted sets. `precision = TP / (TP + FP)`,
 `recall = TP / deleted`.

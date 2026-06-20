@@ -821,6 +821,37 @@ fn default_carve_writes_attributed_table_and_fragments() {
     );
 }
 
+/// Default `carve` on the NIST CFReDS SFT-03 PERSIST database (with its
+/// `-journal` sidecar present) must REPORT the rollback-journal recovery in the
+/// summary — not silently fold 200 prior rows into the workbook while the stdout
+/// summary counts only the free-space carve ("1 record(s)"). NIST ground truth:
+/// 100 deleted + 100 modified `invoice_items` rows live in the `-journal`.
+#[test]
+fn carve_summary_reports_rollback_journal_recovery() {
+    let dir = Scratch::new("journal_summary");
+    let db = dir.join("case.sqlite");
+    std::fs::copy(data_dir().join("cfreds/SFT-03_PERSIST_ios.sqlite"), &db).unwrap();
+    std::fs::copy(
+        data_dir().join("cfreds/SFT-03_PERSIST_ios.sqlite-journal"),
+        dir.join("case.sqlite-journal"),
+    )
+    .unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "case.sqlite"])
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "carve must exit 0");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("rollback journal")
+            && stdout.contains("100 deleted")
+            && stdout.contains("100 modified"),
+        "summary must report the rollback-journal recovery counts, got: {stdout:?}"
+    );
+}
+
 /// `--no-fragments` writes the rebuilt db without the fragment table: `sqlite3`
 /// sees the attributed Tier-1 `recovered_users`, never `recovered_fragments`, and
 /// the summary reports just the record count. Skips when `sqlite3` is absent.

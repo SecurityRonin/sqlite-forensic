@@ -7,7 +7,7 @@
 
 # sqlite-forensic
 
-**The deleted rows are the evidence — and `sqlite3` can't see them.** `sqlite4n6` carves deleted records back out of any SQLite database — browser history, chat apps, mobile artifacts — into a **review-ready spreadsheet you can open in seconds**, the deleted rows folded back into their tables and flagged. It opens the evidence read-only, never writes it, and never re-surfaces a live row as "deleted".
+**The deleted rows are the evidence — and `sqlite3` can't see them.** `sqlite4n6` carves deleted records back out of any SQLite database — browser history, chat apps, mobile artifacts — into a **review-ready spreadsheet you can open in seconds**: each table as a per-rowid **version history** (live, prior-changed, and deleted versions interleaved in WAL commit order) recovered from the uncheckpointed WAL and free space. It opens the evidence read-only, never writes it, and never re-surfaces a live row as "deleted".
 
 ```bash
 brew install securityronin/tap/sqlite4n6
@@ -25,7 +25,7 @@ $ sqlite4n6 carve History.db
 wrote 412 record(s) and 9 fragment(s) to History.recovered.xlsx
 ```
 
-Open `History.recovered.xlsx` and the deleted rows are already **folded back into each table by rowid** and tinted, with `is_deleted` / `is_guessed` flag columns — a review-ready view, no schema to reconstruct by hand and no flags to learn. **Image BLOBs come back as in-cell thumbnails; every cell is recovered natively and losslessly.** Prefer a queryable database? Add `--db` and you also get `History.carved.db`:
+Open `History.recovered.xlsx` and each table is its own **version history** — live rows interleaved with the **prior (changed) and deleted versions** recovered from the uncheckpointed WAL and free space, ordered by the WAL's logical commit sequence and tinted by state (current / superseded / deleted / guessed / rowid-reused), with `wal_commit` / `commit_seq` / `view_state` / `is_deleted` columns. A review-ready view, no schema to reconstruct by hand. **Image BLOBs come back as in-cell thumbnails; every cell is recovered natively and losslessly.** Prefer a queryable database? Add `--db` and you also get `History.carved.db`:
 
 ```console
 $ sqlite4n6 carve History.db --db
@@ -69,7 +69,17 @@ cargo install --git https://github.com/SecurityRonin/sqlite-forensic sqlite4n6
 
 ## What you get
 
-By default `carve` writes a **combined review workbook** — `<name>.recovered.xlsx` — so there is nothing to parse and nothing to reconstruct by hand. The source database is dumped **one sheet per live table** (its real column names) with the recovered (deleted) rows **folded back into their table by rowid**. Each recovered row is tinted **pale red** and carries three trailing flag columns — `is_deleted` (1 for a carved row), `is_guessed` (1 when the row was attributed by shape, consistent with that table rather than hard-linked), and `table_match_ambiguous` (1 when more than one table fit the shape). Rows whose rowid was destroyed sink to the bottom of their sheet. Unattributed rows and partial fragments stay in their own `recovered_unattributed` / `recovered_fragments` tabs. **Image BLOBs — live and recovered — are shown as in-cell thumbnails** (PNG/JPEG/GIF/BMP/WebP/TIFF); a video BLOB shows a typed `video/<ext> · <size>` placeholder (first-frame extraction is deferred). A sheet exceeding Excel's 1,048,576-row limit is truncated with a warning naming the table and dropped count.
+By default `carve` writes a **combined review workbook** — `<name>.recovered.xlsx` — so there is nothing to parse and nothing to reconstruct by hand. The source database is dumped **one sheet per live table**, and each sheet is that table's **per-rowid VERSION HISTORY**: its live rows interleaved with the **prior (changed) and deleted versions** recovered from the uncheckpointed `-wal` and from free space. The versions of one rowid are ordered by `commit_seq` — the WAL's **logical commit order**; there is **no wall-clock timestamp in a SQLite WAL**, only this commit sequence. Each version row carries, after the real columns:
+
+- `_rowid` — the rowid (blank when destroyed);
+- `wal_commit` — `live` for the current view, `commit:(salt1,salt2,frame_index)` for a WAL commit version, `residue` for order-unknown carved residue;
+- `commit_seq` — the logical commit sequence (blank for the live view / residue);
+- `view_state` — `present` (the current row), `changed_later` (a prior value a later commit replaced), `absent_final` (deleted), or `carved_residue`;
+- `is_deleted`, `is_guessed`, `rowid_reused`, `attribution_uncertain` — 0/1 evidence flags.
+
+Rows are tinted by a five-level precedence so the state reads at a glance: **current = no fill, superseded (changed-later) = blue, deleted / carved = red, guessed (shape-inferred) = yellow, rowid-reused = purple** (a reused rowid — delete-then-reinsert — overrides the others, since the two versions may be different entities). Residue attributed to no live table, and partial fragments, stay in their own `recovered_unattributed` / `recovered_fragments` tabs. **Image BLOBs — live, historical, or carved — are shown as in-cell thumbnails** (PNG/JPEG/GIF/BMP/WebP/TIFF); a video BLOB shows a typed `video/<ext> · <size>` placeholder (first-frame extraction is deferred). A sheet exceeding Excel's 1,048,576-row limit is truncated with a warning naming the table and dropped count.
+
+The version history covers **only the uncheckpointed WAL window** (the `-wal` present at capture) plus free-space residue; once a checkpoint folds the WAL into the main file, that prior-version evidence is gone. **WITHOUT ROWID tables have no rowid to track**, so their sheet carries a single "WITHOUT ROWID — not version-tracked" note instead of versions. Every version is an observation — a value the rowid is *consistent with having held at that commit* — never a wall-clock claim.
 
 Need a queryable database too? Add `--db` to also write `<name>.carved.db` (same stem, `--out`'s stem honored) — the raw carved records as a SQLite file, **attributed back to their source table in three honest tiers** — observed fact, forensic inference, and unknown — each in its own table, all carrying the provenance columns (`_page`, `_offset`, `_rowid`, `_source`, `_confidence`) and the carved cells in their **native types** (a recovered `BLOB` is stored byte-for-byte):
 

@@ -10,7 +10,7 @@ writes the file or its sidecars.
 ## Use
 
 ```console
-$ sqlite4n6 carve evidence.db                 # combined live + recovered workbook → evidence.recovered.xlsx
+$ sqlite4n6 carve evidence.db                 # per-table version-history workbook → evidence.recovered.xlsx
 $ sqlite4n6 carve evidence.db --db            # also write a queryable evidence.carved.db
 $ sqlite4n6 carve evidence.db --out out       # set the output stem (→ out.recovered.xlsx)
 $ sqlite4n6 carve evidence.db --format jsonl  # stream rows to stdout (or: table, csv)
@@ -22,16 +22,25 @@ $ sqlite4n6 audit evidence.db                 # severity-ranked anomaly findings
 in-page free blocks, dropped-table pages, and an uncheckpointed `-wal` overlay —
 plus lower-confidence partial fragments in a structurally separate tier. By
 default it writes a **combined workbook** `<name>.recovered.xlsx` — the source
-database dumped **one sheet per live table** (its real column names) with the
-recovered (deleted) rows **folded back into their table by rowid**, tinted pale
-red and carrying three trailing flag columns: `is_deleted`, `is_guessed` (1 when
-attributed by shape — consistent with that table, not hard-linked) and
-`table_match_ambiguous`. Destroyed-rowid rows sink to the bottom of their sheet;
-unattributed rows and partial fragments keep their own `recovered_unattributed` /
-`recovered_fragments` tabs. Image BLOBs — live and recovered — show as in-cell
-thumbnails and video BLOBs as a typed `video/<ext> · <size>` placeholder
-(first-frame extraction deferred); a sheet past Excel's 1,048,576-row limit is
-truncated with a warning.
+database dumped **one sheet per live table**, each sheet being that table's
+**per-rowid VERSION HISTORY**: live rows interleaved with the **prior (changed)
+and deleted versions** recovered from the uncheckpointed `-wal` and free space,
+ordered by `commit_seq` — the WAL's **logical commit order** (there is **no
+wall-clock timestamp in a SQLite WAL**, only this commit sequence). After the real
+columns each version row carries `_rowid`, `wal_commit`
+(`live` / `commit:(salt1,salt2,frame_index)` / `residue`), `commit_seq`,
+`view_state` (`present` / `changed_later` / `absent_final` / `carved_residue`),
+and the 0/1 flags `is_deleted`, `is_guessed`, `rowid_reused`,
+`attribution_uncertain`. Rows are tinted by a five-level precedence —
+**current = none, superseded = blue, deleted/carved = red, guessed = yellow,
+rowid-reused = purple** (a reused rowid overrides the rest, as its versions may be
+different entities). The history covers **only the uncheckpointed WAL window**;
+**WITHOUT ROWID tables are not version-tracked** (their sheet carries a single
+annotation note). Residue attributed to no live table and partial fragments keep
+their own `recovered_unattributed` / `recovered_fragments` tabs. Image BLOBs —
+live, historical, or carved — show as in-cell thumbnails and video BLOBs as a
+typed `video/<ext> · <size>` placeholder (first-frame extraction deferred); a
+sheet past Excel's 1,048,576-row limit is truncated with a warning.
 
 `--db` additionally writes a **queryable SQLite database** (`<name>.carved.db`,
 stem honored from `--out`) holding the raw carved records with each row

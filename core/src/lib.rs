@@ -4791,4 +4791,52 @@ mod tests {
         assert!(db.carve_overflow_fragments(&[0x05u8; 4096]).is_empty());
         assert!(db.carve_overflow_fragments(&[]).is_empty());
     }
+
+    // --- WAL frame checksum (file-format §4.2) -------------------------------
+
+    #[test]
+    fn wal_checksum_known_vector_both_endiannesses() {
+        // The §4.2 algorithm over a hand-constructed 8-byte input, from a zero
+        // seed. Input is two 32-bit words x0, x1; the recurrence is
+        //   s0 += x0 + s1;  s1 += x1 + s0;
+        // From (s0,s1)=(0,0): s0 = x0; s1 = x1 + x0.
+        //
+        // BIG-ENDIAN words (magic 0x377f0683 per the spec): bytes
+        // [00 00 00 02][00 00 00 03] -> x0=2, x1=3 -> s0=2, s1=5.
+        let data_be = [0, 0, 0, 2, 0, 0, 0, 3];
+        assert_eq!(wal_checksum(WalChecksumEndian::Big, 0, 0, &data_be), (2, 5));
+
+        // LITTLE-ENDIAN words (magic 0x377f0682): the SAME bytes read LE give
+        // x0=0x02000000, x1=0x03000000 -> s0=0x02000000,
+        // s1 = 0x03000000 + 0x02000000 = 0x05000000 (wrapping u32).
+        assert_eq!(
+            wal_checksum(WalChecksumEndian::Little, 0, 0, &data_be),
+            (0x0200_0000, 0x0500_0000)
+        );
+
+        // Seed carries forward: from (s0,s1)=(2,5) over the same BE input ->
+        // s0 = 2 + (2 + 5) = 9; s1 = 5 + (3 + 9) = 17.
+        assert_eq!(
+            wal_checksum(WalChecksumEndian::Big, 2, 5, &data_be),
+            (9, 17)
+        );
+
+        // Wrapping arithmetic must not panic on overflow (u32 wrap, not i32).
+        let big = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let _ = wal_checksum(WalChecksumEndian::Big, u32::MAX, u32::MAX, &big);
+    }
+
+    #[test]
+    fn wal_checksum_endian_from_magic_matches_spec() {
+        // file-format §4.2: 0x377f0683 = BIG-endian words, 0x377f0682 = LITTLE.
+        assert_eq!(
+            WalChecksumEndian::from_magic(0x377f_0683),
+            Some(WalChecksumEndian::Big)
+        );
+        assert_eq!(
+            WalChecksumEndian::from_magic(0x377f_0682),
+            Some(WalChecksumEndian::Little)
+        );
+        assert_eq!(WalChecksumEndian::from_magic(0xdead_beef), None);
+    }
 }

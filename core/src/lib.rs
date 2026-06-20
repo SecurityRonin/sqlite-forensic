@@ -1580,11 +1580,12 @@ impl Database {
     /// Walk a single table b-tree rooted at `root_page` (1-based) and collect
     /// every leaf row as typed values. `column_count` is the table's declared
     /// column count, used to apply the `INTEGER PRIMARY KEY` rowid-alias rule.
+    ///
+    /// Shares ONE b-tree/overflow walk with the snapshot-scoped read
+    /// ([`CommitSnapshot::read_table`]) via the [`PageSource`] abstraction, so the
+    /// live and historical paths can never diverge.
     pub fn read_table(&self, root_page: u32, column_count: usize) -> Result<Vec<Row>, Error> {
-        let mut rows = Vec::new();
-        let mut visited = 0usize;
-        self.walk_table_page(root_page, column_count, &mut rows, &mut visited)?;
-        Ok(rows)
+        read_table_via(self, root_page, column_count)
     }
 
     /// Bytes of the 1-based `page` number, or `PageOutOfRange`.
@@ -1609,142 +1610,218 @@ impl Database {
             .get(start..end)
             .ok_or(Error::PageOutOfRange(page))
     }
+}
 
-    fn walk_table_page(
-        &self,
-        page: u32,
-        column_count: usize,
-        rows: &mut Vec<Row>,
-        visited: &mut usize,
-    ) -> Result<(), Error> {
-        *visited += 1;
-        if *visited > MAX_PAGES_PER_WALK {
-            return Err(Error::TooManyPages);
-        }
-        let slice = self.page_slice(page)?;
+/// A source of page images for the shared b-tree / overflow walk — the seam that
+/// lets the live [`Database`] (main file ⊕ WAL overlay) and a historical
+/// [`CommitSnapshot`] (materialized commit pages) share ONE table-read
+/// implementation instead of forking parallel copies.
+///
+/// All page numbers are 1-based. Implementations resolve page 1 with the
+/// 100-byte file header in place (so the walk reads the b-tree header at offset
+/// `SQLITE_HEADER_SIZE` for page 1, 0 otherwise).
+trait PageSource {
+    /// The 1-based `page`'s full image, or `None` for page 0 / out of range.
+    fn page(&self, page: u32) -> Option<&[u8]>;
+    /// Usable bytes per page (`page_size` − reserved-space), for the overflow and
+    /// local-payload computations.
+    fn usable(&self) -> usize;
+    /// The highest valid 1-based page number (the cycle/over-range bound).
+    fn page_bound(&self) -> u32;
+    /// The database text encoding, for decoding TEXT values.
+    fn encoding(&self) -> TextEncoding;
+}
 
-        // Page 1 carries the 100-byte file header before its b-tree header.
-        let hdr_off = if page == 1 { SQLITE_HEADER_SIZE } else { 0 };
+impl PageSource for Database {
+    fn page(&self, page: u32) -> Option<&[u8]> {
+        self.page_slice(page).ok()
+    }
+    fn usable(&self) -> usize {
+        self.header.usable_size() as usize
+    }
+    fn page_bound(&self) -> u32 {
+        self.file_page_count()
+    }
+    fn encoding(&self) -> TextEncoding {
+        self.header.text_encoding
+    }
+}
 
-        let page_type = *slice.get(hdr_off).ok_or(Error::TruncatedCell)?;
-        let cell_count = be_u16(slice, hdr_off + 3) as usize;
+impl PageSource for CommitSnapshot {
+    fn page(&self, page: u32) -> Option<&[u8]> {
+        self.overlaid.get(&page).map(Vec::as_slice)
+    }
+    fn usable(&self) -> usize {
+        self.usable as usize
+    }
+    fn page_bound(&self) -> u32 {
+        // The committed page count at this snapshot — the cycle/over-range bound
+        // for an overflow walk over the snapshot's materialized pages.
+        self.id.db_size_after_commit
+    }
+    fn encoding(&self) -> TextEncoding {
+        // Text encoding from the snapshot's OWN page-1 header (byte 56), so a
+        // historical read decodes TEXT per the encoding as of this commit.
+        self.overlaid
+            .get(&1)
+            .map(|p| match be_u32(p, TEXT_ENCODING_OFFSET) {
+                2 => TextEncoding::Utf16Le,
+                3 => TextEncoding::Utf16Be,
+                _ => TextEncoding::Utf8,
+            })
+            .unwrap_or_default()
+    }
+}
 
-        match page_type {
-            0x0d => self.read_leaf_cells(slice, hdr_off, cell_count, column_count, rows),
-            0x05 => {
-                // Interior table page: 12-byte header; cell = 4-byte child ptr +
-                // varint key. Recurse into every child plus the right-most ptr.
-                let cell_ptr_array = hdr_off + 12;
-                for i in 0..cell_count {
-                    let p = cell_ptr_array + i * 2;
-                    let cell_off = be_u16(slice, p) as usize;
-                    let child = be_u32(slice, cell_off);
-                    self.walk_table_page(child, column_count, rows, visited)?;
-                }
-                let right = be_u32(slice, hdr_off + 8);
-                self.walk_table_page(right, column_count, rows, visited)
+/// Walk a single table b-tree rooted at `root_page` over any [`PageSource`],
+/// collecting every leaf row as typed values. The one implementation shared by
+/// the live and snapshot-scoped reads.
+fn read_table_via(
+    src: &dyn PageSource,
+    root_page: u32,
+    column_count: usize,
+) -> Result<Vec<Row>, Error> {
+    let mut rows = Vec::new();
+    let mut visited = 0usize;
+    walk_table_page(src, root_page, column_count, &mut rows, &mut visited)?;
+    Ok(rows)
+}
+
+fn walk_table_page(
+    src: &dyn PageSource,
+    page: u32,
+    column_count: usize,
+    rows: &mut Vec<Row>,
+    visited: &mut usize,
+) -> Result<(), Error> {
+    *visited += 1;
+    if *visited > MAX_PAGES_PER_WALK {
+        return Err(Error::TooManyPages);
+    }
+    let slice = src.page(page).ok_or(Error::PageOutOfRange(page))?;
+
+    // Page 1 carries the 100-byte file header before its b-tree header.
+    let hdr_off = if page == 1 { SQLITE_HEADER_SIZE } else { 0 };
+
+    let page_type = *slice.get(hdr_off).ok_or(Error::TruncatedCell)?;
+    let cell_count = be_u16(slice, hdr_off + 3) as usize;
+
+    match page_type {
+        0x0d => read_leaf_cells(src, slice, hdr_off, cell_count, column_count, rows),
+        0x05 => {
+            // Interior table page: 12-byte header; cell = 4-byte child ptr +
+            // varint key. Recurse into every child plus the right-most ptr.
+            let cell_ptr_array = hdr_off + 12;
+            for i in 0..cell_count {
+                let p = cell_ptr_array + i * 2;
+                let cell_off = be_u16(slice, p) as usize;
+                let child = be_u32(slice, cell_off);
+                walk_table_page(src, child, column_count, rows, visited)?;
             }
-            other => Err(Error::NotATablePage(other)),
+            let right = be_u32(slice, hdr_off + 8);
+            walk_table_page(src, right, column_count, rows, visited)
         }
+        other => Err(Error::NotATablePage(other)),
     }
+}
 
-    fn read_leaf_cells(
-        &self,
-        slice: &[u8],
-        hdr_off: usize,
-        cell_count: usize,
-        column_count: usize,
-        rows: &mut Vec<Row>,
-    ) -> Result<(), Error> {
-        let cell_ptr_array = hdr_off + 8; // leaf b-tree header is 8 bytes
-        for i in 0..cell_count {
-            let p = cell_ptr_array + i * 2;
-            let cell_off = be_u16(slice, p) as usize;
-            let row = self.decode_leaf_cell(slice, cell_off, column_count)?;
-            rows.push(row);
-        }
-        Ok(())
+fn read_leaf_cells(
+    src: &dyn PageSource,
+    slice: &[u8],
+    hdr_off: usize,
+    cell_count: usize,
+    column_count: usize,
+    rows: &mut Vec<Row>,
+) -> Result<(), Error> {
+    let cell_ptr_array = hdr_off + 8; // leaf b-tree header is 8 bytes
+    for i in 0..cell_count {
+        let p = cell_ptr_array + i * 2;
+        let cell_off = be_u16(slice, p) as usize;
+        let row = decode_leaf_cell(src, slice, cell_off, column_count)?;
+        rows.push(row);
     }
+    Ok(())
+}
 
-    /// Decode one table-leaf cell at `off` into a [`Row`], reassembling the
-    /// payload from its overflow-page chain when it spills past the leaf page.
-    fn decode_leaf_cell(
-        &self,
-        slice: &[u8],
-        off: usize,
-        column_count: usize,
-    ) -> Result<Row, Error> {
-        let (payload_len, n1) = read_varint(slice, off)?;
-        let (rowid, n2) = read_varint(slice, off + n1)?;
-        let payload_start = off + n1 + n2;
-        let total = usize::try_from(payload_len).map_err(|_| Error::TruncatedCell)?;
+/// Decode one table-leaf cell at `off` into a [`Row`], reassembling the payload
+/// from its overflow-page chain (resolved through the SAME [`PageSource`]) when
+/// it spills past the leaf page.
+fn decode_leaf_cell(
+    src: &dyn PageSource,
+    slice: &[u8],
+    off: usize,
+    column_count: usize,
+) -> Result<Row, Error> {
+    let (payload_len, n1) = read_varint(slice, off)?;
+    let (rowid, n2) = read_varint(slice, off + n1)?;
+    let payload_start = off + n1 + n2;
+    let total = usize::try_from(payload_len).map_err(|_| Error::TruncatedCell)?;
 
-        let usable = self.header.usable_size() as usize;
-        let local = local_payload_len(total, usable);
+    let usable = src.usable();
+    let local = local_payload_len(total, usable);
 
-        let payload = if local >= total {
-            // Whole payload is on the leaf page (no spill).
-            slice
-                .get(payload_start..payload_start + total)
-                .ok_or(Error::TruncatedCell)?
-                .to_vec()
-        } else {
-            // Spilled: `local` bytes on the leaf, then a 4-byte overflow page
-            // pointer, then the remainder follows the overflow chain.
-            let head = slice
-                .get(payload_start..payload_start + local)
-                .ok_or(Error::TruncatedCell)?;
-            let first_overflow = be_u32(slice, payload_start + local);
-            let mut buf = Vec::with_capacity(total);
-            buf.extend_from_slice(head);
-            self.read_overflow_chain(first_overflow, total - local, &mut buf)?;
-            buf
-        };
+    let payload = if local >= total {
+        // Whole payload is on the leaf page (no spill).
+        slice
+            .get(payload_start..payload_start + total)
+            .ok_or(Error::TruncatedCell)?
+            .to_vec()
+    } else {
+        // Spilled: `local` bytes on the leaf, then a 4-byte overflow page
+        // pointer, then the remainder follows the overflow chain.
+        let head = slice
+            .get(payload_start..payload_start + local)
+            .ok_or(Error::TruncatedCell)?;
+        let first_overflow = be_u32(slice, payload_start + local);
+        let mut buf = Vec::with_capacity(total);
+        buf.extend_from_slice(head);
+        read_overflow_chain(src, first_overflow, total - local, &mut buf)?;
+        buf
+    };
 
-        let values = decode_record(&payload, column_count, rowid, self.header.text_encoding)?;
-        Ok(Row { rowid, values })
+    let values = decode_record(&payload, column_count, rowid, src.encoding())?;
+    Ok(Row { rowid, values })
+}
+
+/// Follow an overflow-page chain starting at `first` (1-based page number) over
+/// a [`PageSource`], appending up to `remaining` payload bytes to `buf`. Each
+/// overflow page is a 4-byte big-endian "next page" pointer (0 ends the chain)
+/// followed by up to `usable - 4` content bytes.
+///
+/// Bounded against cyclic/over-long chains via [`Error::MalformedOverflow`].
+fn read_overflow_chain(
+    src: &dyn PageSource,
+    first: u32,
+    mut remaining: usize,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let usable = src.usable();
+    let per_page = usable.saturating_sub(4);
+    if per_page == 0 {
+        return Err(Error::MalformedOverflow);
     }
+    let total_pages = src.page_bound();
+    let cap = total_pages as usize + 1;
 
-    /// Follow an overflow-page chain starting at `first` (1-based page number),
-    /// appending up to `remaining` payload bytes to `buf`. Each overflow page is
-    /// a 4-byte big-endian "next page" pointer (0 ends the chain) followed by up
-    /// to `usable - 4` content bytes.
-    ///
-    /// Bounded against cyclic/over-long chains via [`Error::MalformedOverflow`].
-    fn read_overflow_chain(
-        &self,
-        first: u32,
-        mut remaining: usize,
-        buf: &mut Vec<u8>,
-    ) -> Result<(), Error> {
-        let usable = self.header.usable_size() as usize;
-        let per_page = usable.saturating_sub(4);
-        if per_page == 0 {
+    let mut page = first;
+    let mut visited = 0usize;
+    while remaining > 0 {
+        if page == 0 || page > total_pages {
             return Err(Error::MalformedOverflow);
         }
-        let total_pages = self.file_page_count();
-        let cap = total_pages as usize + 1;
-
-        let mut page = first;
-        let mut visited = 0usize;
-        while remaining > 0 {
-            if page == 0 || page > total_pages {
-                return Err(Error::MalformedOverflow);
-            }
-            visited += 1;
-            if visited > cap {
-                return Err(Error::MalformedOverflow);
-            }
-            let slice = self.page_slice(page)?;
-            let next = be_u32(slice, 0);
-            let take = remaining.min(per_page);
-            let chunk = slice.get(4..4 + take).ok_or(Error::TruncatedCell)?;
-            buf.extend_from_slice(chunk);
-            remaining -= take;
-            page = next;
+        visited += 1;
+        if visited > cap {
+            return Err(Error::MalformedOverflow);
         }
-        Ok(())
+        let slice = src.page(page).ok_or(Error::PageOutOfRange(page))?;
+        let next = be_u32(slice, 0);
+        let take = remaining.min(per_page);
+        let chunk = slice.get(4..4 + take).ok_or(Error::TruncatedCell)?;
+        buf.extend_from_slice(chunk);
+        remaining -= take;
+        page = next;
     }
+    Ok(())
 }
 
 /// Number of payload bytes stored locally on a table-leaf page for a record of
@@ -1996,13 +2073,60 @@ pub struct CommitSnapshot {
     /// chain is broken (post-reset residue, tampering, or corruption) — kept, not
     /// dropped, so the forensic layer can label it.
     checksum_valid: bool,
-    /// Page size (bytes), retained so the snapshot can drive a snapshot-scoped
-    /// table/overflow read without a back-reference to the owning database.
-    page_size: u32,
     /// Usable bytes per page (`page_size` − reserved), parsed from the snapshot's
     /// OWN page-1 header, so a snapshot-scoped read uses the reserved-space value
     /// as of this commit rather than the live database's.
     usable: u32,
+}
+
+/// One user table as of a [`CommitSnapshot`] — its schema parsed from the
+/// snapshot's OWN materialized page 1, NOT from the live database. A rootpage can
+/// be dropped and reused by a different table across commits, so reading the
+/// schema from the snapshot is the only correct way to interpret its b-trees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotTable {
+    /// The table's `sqlite_master.name`.
+    pub name: String,
+    /// 1-based root page of the table's b-tree as of this commit.
+    pub rootpage: u32,
+    /// Parsed column names from the table's `CREATE TABLE`, in declared order.
+    /// Empty when the schema SQL could not be parsed with confidence.
+    pub columns: Vec<String>,
+    /// Whether this is a `WITHOUT ROWID` table (file-format §2.4). Such a table
+    /// uses an INDEX b-tree with no rowid key, so the rowid-based snapshot read
+    /// does not apply — flagged so a caller never mis-reads it as a rowid table.
+    pub without_rowid: bool,
+}
+
+/// Whether a `CREATE TABLE` statement declares a `WITHOUT ROWID` table
+/// (file-format §2.4). Detection keys off the trailing `WITHOUT ROWID` clause,
+/// case-insensitively and tolerant of internal whitespace, while ignoring any
+/// occurrence inside a quoted identifier/string so a column literally named
+/// "without rowid" is not a false positive.
+fn without_rowid_sql(create_sql: &str) -> bool {
+    // Strip quoted spans ('...', "...", `...`, [...]) so the clause search sees
+    // only unquoted SQL text, then normalize whitespace and look for the clause.
+    let bytes = create_sql.as_bytes();
+    let mut unquoted = String::with_capacity(create_sql.len());
+    let mut quote: Option<u8> = None;
+    for &c in bytes {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' | b'`' => quote = Some(c),
+                b'[' => quote = Some(b']'),
+                _ => unquoted.push(c as char),
+            },
+        }
+    }
+    // Collapse runs of ASCII whitespace to single spaces, uppercase, and look for
+    // the clause as a discrete token sequence near the end of the statement.
+    let normalized: String = unquoted.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.to_ascii_uppercase().contains("WITHOUT ROWID")
 }
 
 impl CommitSnapshot {
@@ -2062,6 +2186,80 @@ impl CommitSnapshot {
     pub fn page_version(&self, page_no: u32) -> Option<CommittedPageVersion> {
         let bytes = self.overlaid.get(&page_no)?.clone();
         Some(CommittedPageVersion { page_no, bytes })
+    }
+
+    /// The user tables AS OF this commit, parsed from the snapshot's OWN page 1
+    /// (the `sqlite_master` b-tree), NOT from the live database.
+    ///
+    /// A rootpage can be dropped and reused by a different table across commits,
+    /// so the schema MUST come from the snapshot itself — reading today's live
+    /// schema would mis-attribute a historical b-tree. Returns one
+    /// [`SnapshotTable`] per `type='table'` row whose name is not an internal
+    /// `sqlite_*` table, carrying its rootpage, parsed column names, and a
+    /// `WITHOUT ROWID` flag (file-format §2.4). Best-effort and panic-free: an
+    /// unreadable page-1 schema yields an empty vector.
+    #[must_use]
+    pub fn tables(&self) -> Vec<SnapshotTable> {
+        // sqlite_master is a 5-column table rooted at page 1:
+        // (type, name, tbl_name, rootpage, sql). Walk it through THIS snapshot's
+        // pages via the shared b-tree reader.
+        let Ok(schema) = read_table_via(self, 1, 5) else {
+            return Vec::new(); // cov:unreachable: a committed snapshot has a readable page 1
+        };
+        let mut out = Vec::new();
+        for row in schema {
+            let is_table = matches!(row.values.first(), Some(Value::Text(t)) if t == "table");
+            if !is_table {
+                continue;
+            }
+            let Some(Value::Text(name)) = row.values.get(1) else {
+                continue; // cov:unreachable: a 'table' schema row has a TEXT name
+            };
+            if name.starts_with("sqlite_") {
+                continue;
+            }
+            let Some(Value::Integer(root)) = row.values.get(3) else {
+                continue; // cov:unreachable: a 'table' schema row has an integer rootpage
+            };
+            let Ok(rootpage) = u32::try_from(*root) else {
+                continue; // cov:unreachable: a real rootpage is a small positive page number
+            };
+            let sql = match row.values.get(4) {
+                Some(Value::Text(s)) => s.as_str(),
+                _ => "", // cov:unreachable: a 'table' schema row carries its CREATE TABLE sql
+            };
+            let columns = attribution::column_names(sql).unwrap_or_default();
+            out.push(SnapshotTable {
+                name: name.clone(),
+                rootpage,
+                columns,
+                without_rowid: without_rowid_sql(sql),
+            });
+        }
+        out
+    }
+
+    /// Read every row of the table b-tree rooted at `rootpage` AS OF this commit,
+    /// resolving overflow chains through the snapshot's OWN materialized pages, in
+    /// rowid order.
+    ///
+    /// This is the snapshot-scoped counterpart to [`Database::read_table`]: it
+    /// shares the SAME b-tree/overflow walk via [`PageSource`], so a large row
+    /// decodes with the page content as of this commit (not stale/future content
+    /// the live view would supply). `column_count` drives only the
+    /// `INTEGER PRIMARY KEY` rowid-alias rule (pass the table's declared arity,
+    /// e.g. `SnapshotTable::columns.len()`). Returns `(rowid, values)` per row.
+    ///
+    /// Bounded and panic-free on hostile input, exactly as the live path: a
+    /// cyclic/over-deep b-tree or overflow chain surfaces a typed [`Error`] rather
+    /// than looping or panicking.
+    pub fn read_table(
+        &self,
+        rootpage: u32,
+        column_count: usize,
+    ) -> Result<Vec<(i64, Vec<Value>)>, Error> {
+        let rows = read_table_via(self, rootpage, column_count)?;
+        Ok(rows.into_iter().map(|r| (r.rowid, r.values)).collect())
     }
 }
 
@@ -2338,7 +2536,6 @@ impl WalTimeline {
                     salt1,
                     salt2,
                     checksum_valid: chain_valid,
-                    page_size,
                     usable,
                 });
                 last_commit_global_frame = Some(frame_no);
@@ -4976,8 +5173,8 @@ mod tests {
     /// Wrap a minted main-db image into a `(main, wal)` pair whose WAL commits a
     /// full rewrite of every page in ONE commit, with correct §4.2 checksums (so
     /// the snapshot is checksum-valid). The snapshot then materializes exactly the
-    /// minted db, with its real page-1 sqlite_master b-tree — the no-sqlite3 way to
-    /// drive `CommitSnapshot::tables` / snapshot reads against a genuine schema.
+    /// minted db, with its real page-1 `sqlite_master` b-tree — the no-sqlite3 way
+    /// to drive `CommitSnapshot::tables` / snapshot reads against a genuine schema.
     fn wrap_db_in_wal(main: &[u8], page_size: u32) -> Vec<u8> {
         let ps = page_size as usize;
         let n_pages = main.len() / ps;

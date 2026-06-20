@@ -203,7 +203,11 @@ impl AnomalyKind {
                 "the -wal sidecar carries {overlaid_pages} committed page version(s) \
                  the main file does not reflect — consistent with capture while a \
                  write transaction was checkpoint-pending; the main file alone \
-                 under-reports the true state"
+                 under-reports the true state; acquire the live -wal before the \
+                 application terminates, because a checkpoint (e.g. on its next clean \
+                 close) folds the WAL into the main file and discards the \
+                 uncheckpointed deleted/superseded residue, which the \
+                 post-checkpoint main file alone would no longer contain"
             ),
             AnomalyKind::PageCountMismatch {
                 header_pages,

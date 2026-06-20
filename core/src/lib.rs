@@ -445,6 +445,63 @@ impl Database {
         })
     }
 
+    /// Materialize the single pre-transaction state from a rollback `-journal`,
+    /// binding it to THIS database (design §5). The journal's page images (the
+    /// bytes BEFORE the last transaction) are overlaid on the live pages, yielding
+    /// a [`PriorSnapshot`] — a DISTINCT read-only view, never a [`Database`], so a
+    /// prior/deleted row can never be read as "live" (secure-by-design).
+    ///
+    /// The main db's page size is authoritative (a PERSIST journal has a zeroed
+    /// header). **Errors with [`Error::JournalModeConflict`]** when `self` was
+    /// opened WAL-applied ([`Database::open_with_wal`]): WAL and rollback-journal
+    /// modes are mutually exclusive timelines and must not be overlaid.
+    ///
+    /// Robust and panic-free: a malformed/truncated journal yields a prior
+    /// snapshot with fewer overlaid pages (degrading toward the live image), never
+    /// a panic; a non-power-of-two page size is a typed
+    /// [`Error::BadJournalPageSize`].
+    pub fn rollback_prior(&self, journal: &[u8]) -> Result<PriorSnapshot, Error> {
+        if self.wal_applied() {
+            return Err(Error::JournalModeConflict);
+        }
+        let page_size = self.header.page_size;
+        let parsed = RollbackJournal::parse(journal, page_size)?;
+
+        // Start from the live main pages, then overlay the journal's prior images.
+        let main_pages = self.file_page_count();
+        let mut overlaid: std::collections::BTreeMap<u32, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        for pgno in 1..=main_pages {
+            if let Some(slice) = self.raw_page(pgno) {
+                overlaid.insert(pgno, slice.to_vec());
+            }
+        }
+        let mut grew_db = false;
+        for img in parsed.page_images() {
+            if img.pgno > main_pages {
+                grew_db = true;
+            }
+            overlaid.insert(img.pgno, img.bytes.clone());
+        }
+
+        // Usable bytes per page from the PRIOR page-1 header (reserved byte @ 20),
+        // so a reserved-space change in the last txn is honored. Fall back to the
+        // live header when page 1 is not in the snapshot.
+        let reserved = overlaid
+            .get(&1)
+            .and_then(|p| p.get(RESERVED_SPACE_OFFSET).copied())
+            .unwrap_or(self.header.reserved);
+        let usable = page_size.saturating_sub(u32::from(reserved));
+        let page_bound = overlaid.keys().copied().next_back().unwrap_or(main_pages);
+
+        Ok(PriorSnapshot {
+            overlaid,
+            usable,
+            page_bound,
+            grew_db,
+        })
+    }
+
     /// Whether a non-empty WAL overlay is in effect (at least one committed
     /// frame was applied on top of the main file).
     #[must_use]
@@ -4236,6 +4293,124 @@ impl RollbackJournal {
     #[must_use]
     pub fn has_duplicate_pgno(&self) -> bool {
         self.duplicate_pgno
+    }
+}
+
+/// A read-only, page-addressable image of the database AS IT WAS BEFORE the last
+/// transaction (design §4/§5). The temporal inverse of [`CommitSnapshot`]:
+/// `prior[pgno]` is the rollback-journal image where present, else the live main
+/// page. Diffing this against the current database yields the last transaction's
+/// deletions (rowid present here, absent now) and modifications (present in both,
+/// values differ — the journal carries the OLD value).
+///
+/// Returned by [`Database::rollback_prior`] as a DISTINCT type, never a
+/// [`Database`], so prior/deleted rows can never be read as "live"
+/// (secure-by-design). Shares ONE b-tree/overflow walk with the live and
+/// commit-snapshot reads via the internal [`PageSource`] seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorSnapshot {
+    /// The pre-transaction page images: journal-where-present overlaid on the main
+    /// db. Materializes EVERY valid journal page type (interior, leaf, overflow,
+    /// page 1, freelist trunk, pointer-map) so a prior table can be walked through
+    /// its interior pages and overflow chains reassembled.
+    overlaid: std::collections::BTreeMap<u32, Vec<u8>>,
+    /// Usable bytes per page, parsed from the prior snapshot's OWN page-1 header
+    /// (so a reserved-space change in the last txn is honored).
+    usable: u32,
+    /// The 1-based page count bound (max overlaid page), for cycle/over-range
+    /// guards in the b-tree / overflow walk.
+    page_bound: u32,
+    /// Whether any journal page image's number exceeded the current main-db page
+    /// count — diagnostic only (the txn grew the db).
+    grew_db: bool,
+}
+
+impl PageSource for PriorSnapshot {
+    fn page(&self, page: u32) -> Option<&[u8]> {
+        self.overlaid.get(&page).map(Vec::as_slice)
+    }
+    fn usable(&self) -> usize {
+        self.usable as usize
+    }
+    fn page_bound(&self) -> u32 {
+        self.page_bound
+    }
+    fn encoding(&self) -> TextEncoding {
+        // Encoding from the prior snapshot's OWN page-1 header (byte 56), so a
+        // historical read decodes TEXT per the encoding as of the prior state.
+        self.overlaid
+            .get(&1)
+            .map(|p| match be_u32(p, TEXT_ENCODING_OFFSET) {
+                2 => TextEncoding::Utf16Le,
+                3 => TextEncoding::Utf16Be,
+                _ => TextEncoding::Utf8,
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl PriorSnapshot {
+    /// The user tables AS OF the prior state, parsed from the snapshot's OWN page 1
+    /// (the prior `sqlite_master`), NOT the live database — so a DROP/CREATE in the
+    /// last transaction is interpreted against the prior schema. Best-effort and
+    /// panic-free: an unreadable page-1 schema yields an empty vector.
+    #[must_use]
+    pub fn tables(&self) -> Vec<SnapshotTable> {
+        let Ok(schema) = read_table_via(self, 1, 5) else {
+            return Vec::new(); // cov:unreachable: the prior snapshot has a readable page 1
+        };
+        let mut out = Vec::new();
+        for row in schema {
+            let is_table = matches!(row.values.first(), Some(Value::Text(t)) if t == "table");
+            if !is_table {
+                continue;
+            }
+            let Some(Value::Text(name)) = row.values.get(1) else {
+                continue; // cov:unreachable: a 'table' schema row has a TEXT name
+            };
+            if name.starts_with("sqlite_") {
+                continue;
+            }
+            let Some(Value::Integer(root)) = row.values.get(3) else {
+                continue; // cov:unreachable: a 'table' schema row has an integer rootpage
+            };
+            let Ok(rootpage) = u32::try_from(*root) else {
+                continue; // cov:unreachable: a real rootpage is a small positive page number
+            };
+            let sql = match row.values.get(4) {
+                Some(Value::Text(s)) => s.as_str(),
+                _ => "", // cov:unreachable: a 'table' schema row carries its CREATE TABLE sql
+            };
+            let columns = attribution::column_names(sql).unwrap_or_default();
+            out.push(SnapshotTable {
+                name: name.clone(),
+                rootpage,
+                columns,
+                without_rowid: without_rowid_sql(sql),
+            });
+        }
+        out
+    }
+
+    /// Read every row of the table b-tree rooted at `rootpage` AS OF the prior
+    /// state, in rowid order, resolving overflow chains through the snapshot's OWN
+    /// pages. The snapshot-scoped counterpart to [`Database::read_table`]: a typed
+    /// [`Error`] (never a panic) on a cyclic/over-deep b-tree or overflow chain.
+    pub fn read_table(
+        &self,
+        rootpage: u32,
+        column_count: usize,
+    ) -> Result<Vec<(i64, Vec<Value>)>, Error> {
+        let rows = read_table_via(self, rootpage, column_count)?;
+        Ok(rows.into_iter().map(|r| (r.rowid, r.values)).collect())
+    }
+
+    /// Whether the last transaction GREW the database (a journal page number
+    /// exceeded the current main-db page count). Pages beyond the prior size are
+    /// new — their pre-images were not journaled — which bounds what rolls back.
+    #[must_use]
+    pub fn grew_db(&self) -> bool {
+        self.grew_db
     }
 }
 

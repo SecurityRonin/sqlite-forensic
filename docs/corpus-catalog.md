@@ -205,13 +205,26 @@ an oracle, the CLI cancellation was the only blocker.
 - Commit: `26922bd9e3cdc60c93b72dfb1fb2f5972a0af6a6`.
 - Build: clone at the commit, null-guard the unguarded `gui.add_table(...)` calls
   in `Job.java`, stub the `rag`/`erm` LLM packages, compile the engine + the
-  `HeadlessTap` driver against JavaFX 22 + commons-codec/jspecify/antlr/sqlite-jdbc
-  (JDK 25, `--release 21`). Full recipe in `tools/fqlite/README.md`; engine API
-  map + the JavaFX-coupling findings (relevant to a future upstream CLI revival)
-  in `tools/fqlite/ENGINE_NOTES.md`. Both gitignored.
-- Invocation: `tools/fqlite/run-tap.sh <db>` → CSV `rowid,col1,col2,…` of
-  recovered DELETED rows (rowid `-1` when fqlite cannot recover it; the fqlite
-  comparison is keyed by url content).
+  `HeadlessTap` driver against **OpenJFX 22.0.2 SDK** + `commons-codec-1.17.1` /
+  `jspecify-1.0.0` / `antlr4-runtime-4.8` / `sqlite-jdbc-3.51.1.0` (OpenJDK 25,
+  `--release 21`, `--add-modules javafx.base,javafx.graphics,javafx.controls`).
+  Full recipe in `tools/fqlite/README.md`; engine API map + the JavaFX-coupling
+  findings (relevant to a future upstream CLI revival) in
+  `tools/fqlite/ENGINE_NOTES.md`. Both gitignored.
+- Invocation: `FQLITE_JAVA=<jdk-25>/bin/java tools/fqlite/run-tap.sh <db>` → CSV
+  `rowid,col1,col2,…` of recovered DELETED rows (rowid `-1` when the header rowid
+  is unrecoverable; the fqlite comparison is keyed by content).
+- Paper false-positive run (identical bytes): on `tests/data/paper_fp/f.db` (0F)
+  it recovers 11/50 deleted freelist rows with 0 live false positives; on `b.db`
+  (0B) it recovers the 5 surviving OLD residue rows with 0 false positives. See
+  `docs/competitive-landscape.md`.
+- WAL limitation (scenario 10): the `-wal` reader (`WALReader`) is instantiated by
+  a JavaFX `ImportDBTask`, and the WAL table wiring in `Job.processDB()` is inside
+  `if (gui != null)` blocks, so `Job.run()` headless leaves `job.wal == null` and
+  recovers nothing from a WAL-only file. The tap sets `readWAL`/`walpath` and
+  drains `job.wal.resultlist`, but the GUI-coupled instantiation is not reachable
+  without reconstructing the `ImportDBTask` flow — so the WAL scenario keeps
+  FQLite's cited (paper) figure; no measured WAL number is fabricated.
 
 ### §F.3 `bring2lite` (Python 3) — test gate `BRING2LITE_CMD`
 

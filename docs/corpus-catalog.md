@@ -350,6 +350,43 @@ PY
 - md5 `wal_carve.db` = `6747389de0fefcc4c23543353a31325a`, 8192 bytes.
 - md5 `wal_carve.db-wal` = `598e80ad38536f4b7a6cb51ddaedc767`, 8272 bytes.
 
+## §K `tests/data/cfreds/` + `tests/data/sharifctf/`  (REAL-ext, **committed**)
+
+The **NIST CFReDS / CFTT SQLite test sets** — the authoritative, U.S.-Government
+reference data for SQLite forensic tool testing. Authored by NIST (created on real
+Android `sqlite 3.19.0` / iOS `sqlite 3.32.3` devices) with published ground truth
+and per-file MD5s; **10/10 `.sqlite` MD5s verified against NIST's published
+hashes**. Public domain (17 U.S.C. § 105) — committed. Full provenance +
+manifest: `tests/data/cfreds/README.md` (the single detailed index for this set).
+
+- Classification `REAL-ext`, confidence `✓` (downloaded, MD5-matched to NIST,
+  schema + ground-truth parse confirmed). Drives `core/tests/cfreds_encoding.rs`
+  and `forensic/tests/cfreds_recovery.rs`.
+- **SFT-01** (encodings): the same `Albums`/`Weekly_Ratings` schema stored as
+  UTF-8 (4096 B page), UTF-16BE (1024 B), UTF-16LE (8192 B) on both platforms;
+  ground truth = encoding, page size, journal mode, 100 rows. Validates the
+  header-encoding decode against real-device data (the independent replacement for
+  the self-minted `core/tests/utf16_text_tests.rs` fixtures).
+- **SFT-03** (deleted & modified): `invoice_items` (~2240 rows), 100 deletes + 100
+  `UPDATE … SET Quantity=200` modifications per variation.
+  - *WAL* variation (uncheckpointed): main-only view = 2240 rows, WAL-applied =
+    2140; our WAL handling surfaces both. Validated now.
+  - *PERSIST* variation (rollback journal): the 100 deletes survive in the
+    `-journal` page images (header zeroed post-commit, bodies intact, all 100
+    confirmed present). **Recovering them is a pending capability** — the carver
+    reads only the main db today (0/100). Rollback-journal carving is designed in
+    [`design/journal-recovery.md`](design/journal-recovery.md). This is the
+    Doer-Checker payoff: real NIST ground truth surfaced a real recovery-substrate
+    gap our synthetic fixtures never exercised.
+- **SFT-05** (BLOB): **not committed** — each db is ~206 MB (gitignored/env-gated
+  class). Re-download from the SFT-05 dataset link in `tests/data/cfreds/README.md`.
+
+`tests/data/sharifctf/db0.db` — a real damaged-header SQLite db from SharifCTF 8
+("crashed db"); the 100-byte header is overwritten so `Database::open` returns
+`Err(BadMagic)`. Robustness artifact (`corrupted_header_fails_typed_not_panicking`).
+Upstream write-ups repo has no licence; retained as an 8 KB CTF artifact under
+fair-use with attribution (see `tests/data/sharifctf/README.md`).
+
 ## §H MD5 manifest
 
 Committed fixtures (under `tests/data/`, `tests/data/`):

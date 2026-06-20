@@ -3520,4 +3520,119 @@ mod tests {
         }
         assert!(media, "a live image BLOB must embed under xl/media/*.png");
     }
+
+    // ---- combined workbook planner (db → sheets + extra + drops) ------------
+
+    /// Mint a tiny valid db with a `people(id, name)` live table holding one live
+    /// row, so the planner can be driven against a real `Database`.
+    fn minted_people_db() -> Database {
+        use sqlite_core::rebuild::{build_recovered_db_tables, RecoveredTable as RT};
+        let seed = vec![RT {
+            name: "people".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::Integer(1), Value::Text("live".into())]],
+        }];
+        Database::open(build_recovered_db_tables(&seed)).expect("minted db opens")
+    }
+
+    /// The planner produces one combined sheet per live table with the recovered
+    /// rows folded in; an inferred match folds into the guessed table's sheet and
+    /// reads is_guessed=1. Tier-3 / fragments become separate extra tables, and
+    /// there is no `recovered_inferred` table.
+    #[test]
+    fn plan_combined_workbook_folds_recovered_into_live_sheets() {
+        let db = minted_people_db();
+        // A freelist record shaped (INTEGER, TEXT) → inferred match to `people`.
+        let records = vec![rec(
+            2,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Integer(2), Value::Text("deleted".into())],
+        )];
+        let plan = plan_combined_workbook(&db, &records, None, EXCEL_MAX_ROWS);
+
+        let people = plan
+            .sheets
+            .iter()
+            .find(|s| s.name == "people")
+            .expect("people combined sheet");
+        // Real header + the three flag columns.
+        assert_eq!(
+            people.columns,
+            [
+                "id",
+                "name",
+                "is_deleted",
+                "is_guessed",
+                "table_match_ambiguous"
+            ]
+            .map(String::from)
+        );
+        // Live row (rowid 1) + recovered row (rowid 2) interleaved.
+        assert_eq!(people.rows.len(), 2);
+        assert!(!people.rows[0].is_deleted, "live row first");
+        assert!(people.rows[1].is_deleted, "recovered row second");
+        // Folded as inferred → is_guessed column (index 3) is 1.
+        assert_eq!(people.rows[1].cells[3], Value::Integer(1));
+        // No recovered_inferred table anywhere.
+        assert!(
+            !plan.extra.iter().any(|t| t.name == "recovered_inferred"),
+            "inferred folds into the table sheet, not a separate table"
+        );
+        assert!(plan.dropped.is_empty(), "no truncation under the full cap");
+    }
+
+    /// A Tier-3 (dropped-table) record with no shape match becomes a row in the
+    /// separate `recovered_unattributed` extra table, never a live sheet.
+    #[test]
+    fn plan_combined_workbook_unattributed_goes_to_extra_table() {
+        let db = minted_people_db();
+        let records = vec![rec(
+            0,
+            0.5,
+            RecoverySource::DroppedTable,
+            vec![Value::Integer(9), Value::Text("ghost".into())],
+        )];
+        let plan = plan_combined_workbook(&db, &records, None, EXCEL_MAX_ROWS);
+        assert!(
+            plan.extra
+                .iter()
+                .any(|t| t.name == "recovered_unattributed"),
+            "Tier-3 lands in recovered_unattributed: {:?}",
+            plan.extra.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        // The people sheet has only its live row (no recovered fold).
+        let people = plan.sheets.iter().find(|s| s.name == "people").unwrap();
+        assert_eq!(people.rows.len(), 1);
+        assert!(!people.rows[0].is_deleted);
+    }
+
+    /// A row_cap below a table's row count truncates the sheet and records the
+    /// drop as `(table, dropped_count)` so the shell can warn.
+    #[test]
+    fn plan_combined_workbook_reports_row_cap_drops() {
+        let db = minted_people_db();
+        // Two recovered rows + one live row = 3 data rows; cap at 1 → 2 dropped.
+        let records = vec![
+            rec(
+                2,
+                0.9,
+                RecoverySource::FreelistPage,
+                vec![Value::Integer(2), Value::Text("a".into())],
+            ),
+            rec(
+                3,
+                0.9,
+                RecoverySource::FreelistPage,
+                vec![Value::Integer(3), Value::Text("b".into())],
+            ),
+        ];
+        let plan = plan_combined_workbook(&db, &records, None, 1);
+        let drop = plan
+            .dropped
+            .iter()
+            .find(|(name, _)| name == "people")
+            .expect("people drop recorded");
+        assert_eq!(drop.1, 2, "two data rows dropped past the cap of 1");
+    }
 }

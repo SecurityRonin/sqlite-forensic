@@ -61,13 +61,32 @@ fn writer_sql(bin: &str, db: &Path, sql: &str) {
 /// Query a snapshot db with `sqlite3` and return the oracle rows
 /// `(id, name, quote(big))` in id order.
 pub fn oracle_rows(bin: &str, db: &Path) -> Vec<(i64, String, String)> {
+    // Query a DISPOSABLE copy of the snapshot pair. A plain sqlite3 open of a WAL
+    // database checkpoints-and-truncates the `-wal` when the connection closes;
+    // running that against the original would destroy the fixture our
+    // snapshot-aware reader still needs. So copy `snapN.db` + `snapN.db-wal` to a
+    // throwaway pair, let sqlite3 mutate THAT, and leave the original intact.
+    let wal_src = db.with_file_name(format!("{}-wal", db.file_name().unwrap().to_string_lossy()));
+    let tmp_db = db.with_file_name(format!(
+        "oracle_{}",
+        db.file_name().unwrap().to_string_lossy()
+    ));
+    let tmp_wal = tmp_db.with_file_name(format!(
+        "{}-wal",
+        tmp_db.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::copy(db, &tmp_db).unwrap();
+    std::fs::copy(&wal_src, &tmp_wal).unwrap();
+
     let out = Command::new(bin)
         .arg("-separator")
         .arg("\u{1f}")
-        .arg(db)
+        .arg(&tmp_db)
         .arg("SELECT id, name, quote(big) FROM t ORDER BY id")
         .output()
         .unwrap();
+    let _ = std::fs::remove_file(&tmp_db);
+    let _ = std::fs::remove_file(&tmp_wal);
     assert!(
         out.status.success(),
         "sqlite3 oracle failed: {}",
@@ -185,6 +204,85 @@ pub fn quote_blob(v: &Value) -> String {
         }
         other => panic!("unexpected non-blob big value: {other:?}"),
     }
+}
+
+/// Read the rows of table `t` AS OF the last commit of a snapshot's timeline,
+/// returning `(id, name, quote(big))` in id order — the snapshot-aware path under
+/// test, mirroring the oracle's `SELECT id, name, quote(big)` projection.
+fn snapshot_rows(snap: &Snap) -> Vec<(i64, String, String)> {
+    let main = std::fs::read(&snap.db).unwrap();
+    let walb = std::fs::read(&snap.wal).expect("snapshot -wal present");
+    assert!(!walb.is_empty(), "the -wal must be retained (non-empty)");
+    let db = Database::open_with_wal(main, &walb).expect("open with wal");
+    let tl = db.wal_timeline().expect("timeline present");
+    let snapshot = tl
+        .commit_snapshots()
+        .last()
+        .expect("at least one commit snapshot");
+
+    // Resolve table `t`'s rootpage from the snapshot's OWN schema (page 1 as of
+    // this commit), then read its rows via the snapshot-scoped path.
+    let t = snapshot
+        .tables()
+        .into_iter()
+        .find(|t| t.name == "t")
+        .expect("table t present in snapshot schema");
+    let mut rows: Vec<(i64, String, String)> = snapshot
+        .read_table(t.rootpage, t.columns.len())
+        .expect("snapshot-scoped read")
+        .into_iter()
+        .map(|(rowid, values)| {
+            // Columns: (id INTEGER PRIMARY KEY, name TEXT, big BLOB).
+            let id = match values.first() {
+                Some(Value::Integer(i)) => *i,
+                _ => rowid,
+            };
+            let name = match values.get(1) {
+                Some(Value::Text(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let big = values.get(2).map_or_else(|| "NULL".to_string(), quote_blob);
+            (id, name, big)
+        })
+        .collect();
+    rows.sort_by_key(|r| r.0);
+    rows
+}
+
+#[test]
+fn snapshot_reads_match_sqlite3_oracle_per_commit() {
+    let Some(bin) = sqlite3_bin() else {
+        eprintln!(
+            "SKIP snapshot_reads_match_sqlite3_oracle_per_commit: no sqlite3 (set SQLITE3_BIN)"
+        );
+        return;
+    };
+    let dir = scratch("oracle");
+    let (reader, snaps) = build_incremental_fixture(&bin, &dir);
+
+    for (n, snap) in snaps.iter().enumerate() {
+        let expected = oracle_rows(&bin, &snap.db);
+        let got = snapshot_rows(snap);
+        assert_eq!(
+            got,
+            expected,
+            "snapshot {} table state must match the sqlite3 oracle",
+            n + 1
+        );
+    }
+
+    // The second snapshot's row 1 carries the 12000-byte overflow blob; the quote
+    // string length confirms the overflow reassembly matched the oracle exactly.
+    let last = oracle_rows(&bin, &snaps[1].db);
+    let row1 = last.iter().find(|r| r.0 == 1).expect("row 1 at commit 2");
+    // X'…' wraps 2 hex chars per byte → 12000 bytes = 24000 hex + 3 framing chars.
+    assert_eq!(
+        row1.2.len(),
+        24000 + 3,
+        "row 1 big blob is the 12000-byte overflow value"
+    );
+
+    teardown(reader, &dir);
 }
 
 #[test]

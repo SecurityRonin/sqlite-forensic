@@ -1048,7 +1048,13 @@ pub fn carve_rollback_journal(db: &Database, journal: &[u8]) -> JournalRecovery 
     // Header state + checksum status are uniform across a single journal; carry
     // them on every recovered row's provenance.
     let Some(header_state) = prior_header_state(journal, db) else {
-        return empty_recovery(); // cov:unreachable: rollback_prior already parsed it
+        // cov:unreachable: rollback_prior above already parsed the same journal,
+        // so a re-parse here cannot fail; the arm degrades to an empty recovery.
+        return JournalRecovery {
+            deleted,
+            modified,
+            counts: JournalCounts::default(),
+        };
     };
     // Per-row checksum status is not threaded through PriorSnapshot in v1, so the
     // verifiable fact recorded here is the journal-level one: Tier A could verify
@@ -1112,16 +1118,6 @@ pub fn carve_rollback_journal(db: &Database, journal: &[u8]) -> JournalRecovery 
         deleted,
         modified,
         counts,
-    }
-}
-
-/// An empty recovery (no deletions/modifications) — the graceful degradation for
-/// a malformed/unbound journal.
-fn empty_recovery() -> JournalRecovery {
-    JournalRecovery {
-        deleted: Vec::new(),
-        modified: Vec::new(),
-        counts: JournalCounts::default(),
     }
 }
 

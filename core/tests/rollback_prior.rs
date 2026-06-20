@@ -60,7 +60,48 @@ fn prior_snapshot_holds_pre_delete_invoice_items() {
             2240,
             "{platform}: the prior snapshot holds all 2240 pre-delete rows"
         );
+        // The last transaction DELETED rows (it did not grow the file), so no
+        // journal page number exceeds the current main-db page count.
+        assert!(
+            !prior.grew_db(),
+            "{platform}: a delete-only transaction does not grow the database"
+        );
     }
+}
+
+/// A `notes` table fixture whose one ~12 KB row spills onto an overflow chain
+/// (see `core/tests/overflow.rs`). Reading it THROUGH a PriorSnapshot exercises
+/// the snapshot's overflow path (usable-size + page-bound + chain reassembly).
+const OVERFLOW_DB: &[u8] = include_bytes!("../../tests/data/overflow.db");
+const NOTES_ROOT: u32 = 2;
+const NOTES_COLS: usize = 2;
+
+#[test]
+fn prior_snapshot_reassembles_overflow_rows() {
+    // An empty (zeroed) journal means prior == live: the snapshot overlays no
+    // pages, so reading through it must still reassemble the spilled row exactly
+    // as the live read does — covering PriorSnapshot's overflow page-source path.
+    let db = Database::open(OVERFLOW_DB.to_vec()).expect("open overflow.db");
+    let prior = db
+        .rollback_prior(&[0u8; 512])
+        .expect("empty journal → prior == live");
+
+    let via_pages = prior
+        .read_table_with_pages(NOTES_ROOT, NOTES_COLS)
+        .expect("walk notes with pages");
+    assert_eq!(via_pages.len(), 2, "two rows including the spilled one");
+    let spilled = via_pages.iter().find(|(rowid, _, _)| *rowid == 1).unwrap();
+    if let sqlite_core::Value::Text(body) = &spilled.1[1] {
+        assert_eq!(body.len(), 12017, "the spilled body reassembles fully");
+    } else {
+        panic!("expected a TEXT body");
+    }
+
+    // The plain read_table must agree (same overflow path, no per-page leaf).
+    let plain = prior
+        .read_table(NOTES_ROOT, NOTES_COLS)
+        .expect("walk notes");
+    assert_eq!(plain.len(), 2);
 }
 
 #[test]

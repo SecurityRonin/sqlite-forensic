@@ -356,6 +356,57 @@ const WAL_MAGIC_BE: u32 = 0x377f_0682;
 /// WAL magic, little-endian-checksum variant.
 const WAL_MAGIC_LE: u32 = 0x377f_0683;
 
+/// Byte order in which the WAL checksum reads its 32-bit words (file-format
+/// §4.2). NOT the same as the constant names above: per the spec, magic
+/// `0x377f0683` selects **big-endian** words and `0x377f0682` **little-endian**
+/// words. (The legacy `WAL_MAGIC_*` constant names predate this checksum work
+/// and are used only as a "valid magic" set; this enum is the spec-faithful
+/// source of truth for checksum endianness.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalChecksumEndian {
+    Big,
+    Little,
+}
+
+impl WalChecksumEndian {
+    /// The checksum word order selected by the WAL header magic (offset 0), or
+    /// `None` for a magic that is neither WAL variant (file-format §4.2).
+    fn from_magic(magic: u32) -> Option<Self> {
+        match magic {
+            0x377f_0683 => Some(Self::Big),
+            0x377f_0682 => Some(Self::Little),
+            _ => None,
+        }
+    }
+
+    /// Read one 32-bit word from `b` (exactly 4 bytes) in this endianness.
+    fn read_word(self, b: [u8; 4]) -> u32 {
+        match self {
+            Self::Big => u32::from_be_bytes(b),
+            Self::Little => u32::from_le_bytes(b),
+        }
+    }
+}
+
+/// Advance the cumulative WAL checksum `(s0, s1)` over `data` (file-format
+/// §4.2). `data` is interpreted as 32-bit words in the given endianness and
+/// consumed 8 bytes (two words) at a time via the Fibonacci-weighted recurrence
+///   `s0 += x[i] + s1;  s1 += x[i+1] + s0;`
+/// using wrapping (u32) arithmetic. A trailing partial group (< 8 bytes) is
+/// ignored — the spec defines the checksum only over an even number of words,
+/// and every real WAL input (24-byte header prefix, 8-byte frame-header prefix,
+/// page data) is a multiple of 8 bytes.
+fn wal_checksum(endian: WalChecksumEndian, mut s0: u32, mut s1: u32, data: &[u8]) -> (u32, u32) {
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let x0 = endian.read_word([c[0], c[1], c[2], c[3]]);
+        let x1 = endian.read_word([c[4], c[5], c[6], c[7]]);
+        s0 = s0.wrapping_add(x0).wrapping_add(s1);
+        s1 = s1.wrapping_add(x1).wrapping_add(s0);
+    }
+    (s0, s1)
+}
+
 impl Database {
     /// Parse the file header and validate magic + page size. No WAL overlay.
     pub fn open(bytes: Vec<u8>) -> Result<Self, Error> {
@@ -1939,6 +1990,19 @@ pub struct CommitSnapshot {
     /// committed frame up to and including this commit (newest version per page),
     /// capped to `db_size_after_commit` pages. `page_version` reads from this map.
     overlaid: std::collections::BTreeMap<u32, Vec<u8>>,
+    /// Whether the whole frame chain up to and including this commit's COMMIT frame
+    /// passed the WAL cumulative checksum (file-format §4.2). `false` marks a commit
+    /// the salt+commit-marker admission would otherwise accept but whose checksum
+    /// chain is broken (post-reset residue, tampering, or corruption) — kept, not
+    /// dropped, so the forensic layer can label it.
+    checksum_valid: bool,
+    /// Page size (bytes), retained so the snapshot can drive a snapshot-scoped
+    /// table/overflow read without a back-reference to the owning database.
+    page_size: u32,
+    /// Usable bytes per page (`page_size` − reserved), parsed from the snapshot's
+    /// OWN page-1 header, so a snapshot-scoped read uses the reserved-space value
+    /// as of this commit rather than the live database's.
+    usable: u32,
 }
 
 impl CommitSnapshot {
@@ -1952,6 +2016,22 @@ impl CommitSnapshot {
     #[must_use]
     pub fn db_size_after_commit(&self) -> u32 {
         self.id.db_size_after_commit
+    }
+
+    /// Whether the WAL frame chain up to and including this commit's COMMIT frame
+    /// validated against the cumulative WAL checksum (file-format §4.2).
+    ///
+    /// `true` is the spec-conformant case: every frame's stored `(checksum1,
+    /// checksum2)` equalled the running checksum advanced over the frame's first
+    /// 8 header bytes plus its full page data, seeded from the WAL header
+    /// checksum. `false` means the chain broke at or before this commit — the
+    /// salt + commit-marker admission accepted it, but it is residue (post-reset
+    /// leftover, tampering, or corruption). Such a commit is deliberately KEPT
+    /// (not dropped) so the forensic layer can mark it; a consumer that wants only
+    /// trustworthy state filters on this flag.
+    #[must_use]
+    pub fn checksum_valid(&self) -> bool {
+        self.checksum_valid
     }
 
     /// The salt-qualified [`WalLsn`] of this commit (the `[H]` adapter seam).
@@ -2100,6 +2180,19 @@ impl WalTimeline {
         let mut salt1 = be_u32(hdr, 16);
         let mut salt2 = be_u32(hdr, 20);
 
+        // Checksum chain seed (file-format §4.2): the running (s0, s1) starts from
+        // the WAL header's stored checksum (bytes 24..32, always big-endian),
+        // which is itself the checksum over the first 24 header bytes. The word
+        // endianness for advancing over frames comes from the magic. `from_magic`
+        // cannot return None here — the magic was admitted above.
+        let endian = WalChecksumEndian::from_magic(magic).unwrap_or(WalChecksumEndian::Big);
+        let header_s0 = be_u32(hdr, 24);
+        let header_s1 = be_u32(hdr, 28);
+        // Per-segment running checksum state and whether the chain is still valid.
+        let mut run_s0 = header_s0;
+        let mut run_s1 = header_s1;
+        let mut chain_valid = true;
+
         let ps = page_size as usize;
         let frame_stride = SQLITE_WAL_FRAME_HEADER_SIZE + ps;
 
@@ -2176,6 +2269,12 @@ impl WalTimeline {
                 uncommitted_tail_start = None;
                 // The post-reset frames replay onto the latest committed view.
                 // committed_pages carries forward.
+                // The checksum chain for a post-reset segment threads from a WAL
+                // header we do NOT hold (the new generation's own 32-byte header
+                // was overwritten), so its frames cannot be validated against our
+                // seed. Mark the chain broken for this segment: its commits are
+                // checksum-residue, surfaced for forensics but not trusted.
+                chain_valid = false;
             }
 
             if page_no == 0 {
@@ -2185,6 +2284,25 @@ impl WalTimeline {
                 Some(d) => d.to_vec(),
                 None => break, // cov:unreachable: frame slice is exactly frame_stride
             };
+
+            // Advance the cumulative checksum over this frame (file-format §4.2):
+            // the first 8 bytes of the frame header (page-no ++ db-size) followed
+            // by the full page data — NOT the salt/checksum bytes (frame[8..24]).
+            // Then compare against the frame's stored checksum (frame[16..24], big-
+            // endian). A mismatch breaks the chain for the rest of the segment.
+            // Only advance while the chain is still intact (a post-reset segment is
+            // pre-marked broken and is not re-seedable from our header).
+            if chain_valid {
+                let (n0, n1) = wal_checksum(endian, run_s0, run_s1, &frame[0..8]);
+                let (n0, n1) = wal_checksum(endian, n0, n1, &data);
+                run_s0 = n0;
+                run_s1 = n1;
+                let stored0 = be_u32(frame, 16);
+                let stored1 = be_u32(frame, 20);
+                if stored0 != run_s0 || stored1 != run_s1 {
+                    chain_valid = false;
+                }
+            }
 
             let frame_index_in_seg = seg_frame_count;
             seg_frame_count += 1;
@@ -2204,11 +2322,24 @@ impl WalTimeline {
                     commit_frame_index: frame_index_in_seg,
                     db_size_after_commit: db_size,
                 };
+                let overlaid = committed_pages.clone();
+                // Usable bytes per page from the snapshot's OWN page-1 header
+                // (reserved-space byte at offset 20), so a snapshot-scoped read
+                // honors the reserved value as of this commit. Page 1 is always
+                // materialized; a missing/short page-1 image degrades to 0 reserved.
+                let reserved = overlaid
+                    .get(&1)
+                    .and_then(|p| p.get(RESERVED_SPACE_OFFSET).copied())
+                    .unwrap_or(0);
+                let usable = page_size.saturating_sub(u32::from(reserved));
                 snapshots.push(CommitSnapshot {
                     id,
-                    overlaid: committed_pages.clone(),
+                    overlaid,
                     salt1,
                     salt2,
+                    checksum_valid: chain_valid,
+                    page_size,
+                    usable,
                 });
                 last_commit_global_frame = Some(frame_no);
                 uncommitted_tail_start = None;

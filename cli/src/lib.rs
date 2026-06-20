@@ -13,7 +13,7 @@ use sqlite_core::rebuild::{FragmentRow, RebuildRow, RecoveredTable};
 use sqlite_core::{Database, Value, WalTimeline};
 use sqlite_forensic::{
     attribute_records, carve_all_deleted_records, carve_at_commit, Anomaly, Attribution,
-    CarvedFragment, CarvedRecord, RecoverySource,
+    CarvedFragment, CarvedRecord, JournalRecovery, RecoverySource,
 };
 
 /// Output rendering format, shared by `carve` and `audit`.
@@ -72,6 +72,7 @@ pub fn recovery_source_token(source: RecoverySource) -> &'static str {
         RecoverySource::FreeblockReconstructed => "freeblock-reconstructed",
         RecoverySource::WalFrame => "wal-frame",
         RecoverySource::CommitSnapshot => "commit-snapshot",
+        RecoverySource::RollbackJournal(_) => "rollback-journal",
         // `RecoverySource` is #[non_exhaustive]: a future class renders as its
         // Debug form rather than panicking or mislabelling.
         _ => "other", // cov:unreachable: all RecoverySource variants known at build time are matched above
@@ -226,6 +227,11 @@ pub fn snapshot_label(rec: &CarvedRecord) -> String {
         (RecoverySource::WalFrame, Some(w)) => {
             format!("wal-frame:({},{},{})", w.salt1, w.salt2, w.frame_index)
         }
+        // A rollback-journal prior row is the immediately-preceding state captured
+        // in the `-journal`; its provenance is the segment + restored page number.
+        (RecoverySource::RollbackJournal(s), _) => {
+            format!("rollback-journal:({},{})", s.segment, s.pgno)
+        }
         // Every on-disk class (and any WAL record missing provenance) is the
         // on-disk base-image view.
         _ => "on-disk".to_string(),
@@ -262,10 +268,13 @@ pub fn carve_wal_snapshots(db: &Database, timeline: &WalTimeline) -> Vec<CarvedR
 /// within that, the highest confidence — so a deleted row carries the LSN of the
 /// earliest state it is recoverable in.
 fn dedup_keep_earliest_label(mut records: Vec<CarvedRecord>) -> Vec<CarvedRecord> {
-    // Rank: commit snapshot (earliest) < wal-frame < on-disk; tie-break high conf.
+    // Rank: a full-fidelity prior state (commit snapshot / rollback-journal,
+    // earliest) < wal-frame < on-disk free-space carve; tie-break high conf. A
+    // journal prior row is the full-fidelity copy of a deleted row, so it is
+    // preferred over a free-space carve of the same (rowid, values).
     fn rank(rec: &CarvedRecord) -> u8 {
         match rec.source {
-            RecoverySource::CommitSnapshot => 0,
+            RecoverySource::CommitSnapshot | RecoverySource::RollbackJournal(_) => 0,
             RecoverySource::WalFrame => 1,
             _ => 2,
         }
@@ -1674,6 +1683,161 @@ pub struct CombinedWorkbook {
     pub dropped: Vec<(String, usize)>,
 }
 
+/// Project a [`JournalRecovery`] into stand-alone [`CarvedRecord`]s for the stdout
+/// text surfaces (table / CSV / JSONL), each tagged
+/// [`RecoverySource::RollbackJournal`] so [`recovery_source_token`] reads
+/// `rollback-journal` and [`snapshot_label`] resolves its `(segment, pgno)`
+/// provenance.
+///
+/// Both classes surface as recovered content: a **deleted** prior row carries its
+/// full prior `values`; a **modified** row carries its PRIOR (pre-edit)
+/// `prior_values` — the edit history the live row replaced. The journal restores
+/// whole pages, so the per-record `offset` within the prior page is not tracked at
+/// the API boundary and is reported as `0`; `page` is the restored page number.
+#[must_use]
+pub fn journal_carved_records(recovery: &JournalRecovery) -> Vec<CarvedRecord> {
+    let source_of = |source: &RecoverySource| -> RecoverySource {
+        // The prior image's journal provenance is carried on the source variant.
+        match source {
+            RecoverySource::RollbackJournal(s) => RecoverySource::RollbackJournal(*s),
+            // cov:unreachable: carve_rollback_journal only ever tags rows RollbackJournal
+            other => *other,
+        }
+    };
+    let page_of = |source: &RecoverySource| -> u32 {
+        match source {
+            RecoverySource::RollbackJournal(s) => s.pgno,
+            _ => 0, // cov:unreachable: see source_of
+        }
+    };
+    let mut out = Vec::with_capacity(recovery.deleted.len() + recovery.modified.len());
+    for row in &recovery.deleted {
+        out.push(CarvedRecord {
+            page: page_of(&row.source),
+            offset: 0,
+            rowid: row.rowid,
+            values: row.values.clone(),
+            confidence: 1.0,
+            allocated: false,
+            source: source_of(&row.source),
+            wal: None,
+            overflow: None,
+        });
+    }
+    for rec in &recovery.modified {
+        out.push(CarvedRecord {
+            page: page_of(&rec.source),
+            offset: 0,
+            rowid: rec.rowid,
+            values: rec.prior_values.clone(),
+            confidence: 1.0,
+            allocated: false,
+            source: source_of(&rec.source),
+            wal: None,
+            overflow: None,
+        });
+    }
+    out
+}
+
+/// Fold a [`JournalRecovery`] into the per-table version histories, in place.
+///
+/// The rollback `-journal` captures exactly the prior state, so each recovered
+/// row slots as the immediately-preceding version of its KNOWN table+rowid (the
+/// journal carries the prior schema, so attribution is CERTAIN — Tier-1,
+/// `is_guessed=false`):
+///
+/// - a **deleted** [`PriorRow`](sqlite_forensic::PriorRow) → an `is_deleted`
+///   `CarvedResidue` version (red), the full-fidelity copy of the row the last
+///   transaction removed;
+/// - a **modified** [`PriorVersionRecord`](sqlite_forensic::PriorVersionRecord) →
+///   the PRIOR value as a `ValueChangedLater` superseded version (blue), while the
+///   live current row stays present (we do not touch it).
+///
+/// A recovered version byte-identical to one already in the history (same rowid +
+/// values + deletion state) is skipped — the same de-dup the residue fold uses, so
+/// a journal copy never double-lists a row already carried at equal fidelity. A
+/// recovered row whose table has no live history sheet is dropped here (no
+/// fabricated home), exactly as the residue fold drops `Unattributed` records.
+/// Each touched history is re-sorted into the canonical version order.
+fn fold_journal_into_histories(
+    histories: &mut [sqlite_core::row_history::TableHistory],
+    recovery: &JournalRecovery,
+) {
+    use sqlite_core::row_history::{sort_table_versions, RowVersion, VersionOrigin, ViewState};
+
+    // A (rowid, is_deleted, values) identity, so a journal version identical to one
+    // already present is not double-listed (the residue fold's de-dup key shape).
+    fn version_key(rowid: Option<i64>, is_deleted: bool, values: &[Value]) -> String {
+        format!("{rowid:?}:{is_deleted}:{values:?}")
+    }
+
+    // Map each live table name to its history index, once.
+    let index: std::collections::HashMap<&str, usize> = histories
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h.table.as_str(), i))
+        .collect();
+
+    // The candidate new versions, grouped by target history index. A recovered row
+    // whose table has no live history is dropped here (no fabricated home).
+    let mut to_add: std::collections::BTreeMap<usize, Vec<RowVersion>> =
+        std::collections::BTreeMap::new();
+
+    // Deleted prior rows → is_deleted CarvedResidue versions (red), full fidelity.
+    for row in &recovery.deleted {
+        if let Some(&i) = index.get(row.table.as_str()) {
+            to_add.entry(i).or_default().push(RowVersion {
+                rowid: Some(row.rowid),
+                values: row.values.clone(),
+                origin: VersionOrigin::CarvedResidue,
+                commit_seq: None,
+                view_state: ViewState::CarvedResidue,
+                is_deleted: true,
+                // The journal carries the prior schema, so attribution is CERTAIN.
+                is_guessed: false,
+                rowid_reused: false,
+                attribution_uncertain: false,
+            });
+        }
+    }
+
+    // Modified rows → the PRIOR value as a ValueChangedLater superseded version
+    // (blue); the live current row is left untouched (it stays present/current).
+    for rec in &recovery.modified {
+        if let Some(&i) = index.get(rec.table.as_str()) {
+            to_add.entry(i).or_default().push(RowVersion {
+                rowid: Some(rec.rowid),
+                values: rec.prior_values.clone(),
+                origin: VersionOrigin::CarvedResidue,
+                commit_seq: None,
+                view_state: ViewState::ValueChangedLater,
+                is_deleted: false,
+                is_guessed: false,
+                rowid_reused: false,
+                attribution_uncertain: false,
+            });
+        }
+    }
+
+    for (i, extra) in to_add {
+        let Some(history) = histories.get_mut(i) else {
+            continue; // cov:unreachable: `i` is an index built from `histories` above
+        };
+        let mut seen: std::collections::HashSet<String> = history
+            .versions
+            .iter()
+            .map(|v| version_key(v.rowid, v.is_deleted, &v.values))
+            .collect();
+        for v in extra {
+            if seen.insert(version_key(v.rowid, v.is_deleted, &v.values)) {
+                history.versions.push(v);
+            }
+        }
+        sort_table_versions(&mut history.versions);
+    }
+}
+
 /// Plan the combined TEMPORAL workbook from the open evidence database, the carved
 /// records (for the unattributed extra split), and the optional fragments.
 ///
@@ -1687,15 +1851,28 @@ pub struct CombinedWorkbook {
 /// table's sheet as a `carved_residue` / `absent_final` version — never twice. A
 /// `Commit` version's `wal_commit` label is resolved through the WAL timeline. A
 /// sheet exceeding `row_cap` is truncated and the drop recorded in `dropped`.
+///
+/// `journal` is the optional rollback-`-journal` recovery (mutually exclusive with
+/// a WAL — the caller passes `None` under a WAL): its deleted prior rows fold in as
+/// red `is_deleted` versions and its modified rows' prior values as blue superseded
+/// versions, under their KNOWN table+rowid, via [`fold_journal_into_histories`].
 #[must_use]
 pub fn plan_combined_workbook(
     db: &Database,
     records: &[CarvedRecord],
     fragments: Option<&[CarvedFragment]>,
+    journal: Option<&JournalRecovery>,
     row_cap: usize,
 ) -> CombinedWorkbook {
     // The per-table version histories (live + WAL-historical + attributed residue).
-    let histories = sqlite_forensic::row_histories_with_residue(db);
+    let mut histories = sqlite_forensic::row_histories_with_residue(db);
+
+    // Fold the rollback-journal recovery (when present) into the histories: deleted
+    // prior rows → red is_deleted versions, modified rows → blue superseded prior
+    // versions, both under their KNOWN table+rowid (Tier-1 certain).
+    if let Some(recovery) = journal {
+        fold_journal_into_histories(&mut histories, recovery);
+    }
 
     // Resolve a Commit's salt-qualified LSN through the WAL timeline so a commit
     // version renders `commit:(salt1,salt2,frame_index)`. No timeline → no salts.
@@ -1764,10 +1941,11 @@ pub fn combined_xlsx_bytes(
     db: &Database,
     records: &[CarvedRecord],
     fragments: Option<&[CarvedFragment]>,
+    journal: Option<&JournalRecovery>,
     path: &Path,
     row_cap: usize,
 ) -> Result<Vec<u8>, String> {
-    let plan = plan_combined_workbook(db, records, fragments, row_cap);
+    let plan = plan_combined_workbook(db, records, fragments, journal, row_cap);
     for (table, count) in &plan.dropped {
         eprintln!("{}", row_cap_warning(table, *count, row_cap));
     }
@@ -2039,6 +2217,31 @@ mod tests {
         }
     }
 
+    use sqlite_forensic::{
+        JournalCounts, JournalHeaderState, JournalRecovery, PriorRow, PriorVersionRecord,
+        RollbackJournalSource,
+    };
+
+    /// A rollback-journal provenance with a Tier-A intact, checksum-valid image.
+    fn rollback_src(segment: usize, pgno: u32) -> RollbackJournalSource {
+        RollbackJournalSource {
+            segment,
+            pgno,
+            header_state: JournalHeaderState::Valid,
+            checksum_valid: Some(true),
+        }
+    }
+
+    /// A carved record sourced from a rollback-journal prior image.
+    fn journal_rec(rowid: i64, segment: usize, pgno: u32, values: Vec<Value>) -> CarvedRecord {
+        rec(
+            rowid,
+            1.0,
+            RecoverySource::RollbackJournal(rollback_src(segment, pgno)),
+            values,
+        )
+    }
+
     use sqlite_core::attribution::{Affinity, LiveTable};
 
     fn live(name: &str, cols: &[&str], affs: Vec<Affinity>) -> LiveTable {
@@ -2305,6 +2508,10 @@ mod tests {
         assert_eq!(
             recovery_source_token(RecoverySource::DroppedTable),
             "dropped-table"
+        );
+        assert_eq!(
+            recovery_source_token(RecoverySource::RollbackJournal(rollback_src(0, 5))),
+            "rollback-journal"
         );
     }
 
@@ -2606,6 +2813,259 @@ mod tests {
         let b = wal_rec(RecoverySource::CommitSnapshot, 0); // rowid 130
         let kept = dedup_keep_earliest_label(vec![a, b]);
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_label_names_rollback_journal_segment_and_page() {
+        // A rollback-journal prior row labels with its (segment, restored-page).
+        let jr = journal_rec(42, 1, 7, vec![Value::Integer(42)]);
+        assert_eq!(snapshot_label(&jr), "rollback-journal:(1,7)");
+    }
+
+    #[test]
+    fn dedup_prefers_rollback_journal_over_free_space_carve() {
+        // The SAME deleted row recovered from BOTH the rollback journal (full
+        // fidelity) and a free-space carve collapses to ONE copy — the journal's,
+        // because its rank ties with a commit snapshot (earliest) and beats the
+        // on-disk free-space carve.
+        let values = vec![Value::Text("deleted invoice row".into())];
+        let on_disk = rec(900, 0.95, RecoverySource::FreelistPage, values.clone());
+        let journal = journal_rec(900, 0, 12, values.clone());
+        let kept = dedup_keep_earliest_label(vec![on_disk, journal]);
+        assert_eq!(kept.len(), 1, "the duplicate collapses to one copy");
+        assert!(
+            matches!(kept[0].source, RecoverySource::RollbackJournal(_)),
+            "the full-fidelity journal copy is preferred: {:?}",
+            kept[0].source
+        );
+    }
+
+    /// A minimal one-table history (a single live, present row) to fold into.
+    fn history_with_live_row(
+        table: &str,
+        columns: &[&str],
+        rowid: i64,
+        values: Vec<Value>,
+    ) -> sqlite_core::row_history::TableHistory {
+        use sqlite_core::row_history::{RowVersion, TableHistory, VersionOrigin, ViewState};
+        TableHistory {
+            table: table.to_string(),
+            columns: columns.iter().map(|s| (*s).to_string()).collect(),
+            without_rowid: false,
+            versions: vec![RowVersion {
+                rowid: Some(rowid),
+                values,
+                origin: VersionOrigin::Live,
+                commit_seq: None,
+                view_state: ViewState::PresentInFinalView,
+                is_deleted: false,
+                is_guessed: false,
+                rowid_reused: false,
+                attribution_uncertain: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn fold_journal_adds_deleted_red_and_modified_blue_versions() {
+        use sqlite_core::row_history::ViewState;
+        let mut histories = vec![history_with_live_row(
+            "t",
+            &["id", "q"],
+            5,
+            vec![Value::Integer(5), Value::Integer(200)],
+        )];
+        let recovery = JournalRecovery {
+            deleted: vec![PriorRow {
+                table: "t".into(),
+                rowid: 9,
+                values: vec![Value::Integer(9), Value::Integer(3)],
+                source: RecoverySource::RollbackJournal(rollback_src(0, 2)),
+            }],
+            modified: vec![PriorVersionRecord {
+                table: "t".into(),
+                rowid: 5,
+                prior_values: vec![Value::Integer(5), Value::Integer(7)],
+                current_values: vec![Value::Integer(5), Value::Integer(200)],
+                replaced_rowid: true,
+                source: RecoverySource::RollbackJournal(rollback_src(0, 2)),
+            }],
+            counts: JournalCounts {
+                deleted: 1,
+                modified: 1,
+            },
+        };
+        fold_journal_into_histories(&mut histories, &recovery);
+
+        let t = &histories[0];
+        // The live row stays present; a deleted version and a superseded prior
+        // version are folded in.
+        let deleted = t
+            .versions
+            .iter()
+            .find(|v| v.is_deleted)
+            .expect("a deleted version folded in");
+        assert_eq!(deleted.rowid, Some(9));
+        assert_eq!(deleted.view_state, ViewState::CarvedResidue);
+        assert!(
+            !deleted.is_guessed,
+            "a known-table delete is Tier-1 certain"
+        );
+
+        let superseded = t
+            .versions
+            .iter()
+            .find(|v| v.view_state == ViewState::ValueChangedLater)
+            .expect("a superseded prior version folded in");
+        assert_eq!(superseded.rowid, Some(5));
+        assert!(!superseded.is_deleted, "a modification is not a deletion");
+        assert_eq!(
+            superseded.values,
+            vec![Value::Integer(5), Value::Integer(7)]
+        );
+
+        // The original live row is untouched (still present, not deleted).
+        assert!(t
+            .versions
+            .iter()
+            .any(|v| v.view_state == ViewState::PresentInFinalView && !v.is_deleted));
+    }
+
+    #[test]
+    fn fold_journal_skips_byte_identical_and_unknown_tables() {
+        use sqlite_core::row_history::ViewState;
+        // A history that ALREADY carries the deleted row as residue, plus a recovery
+        // whose delete is byte-identical (must not double-list) and another whose
+        // table has no history (must be dropped, never invented).
+        let mut histories = vec![history_with_live_row(
+            "t",
+            &["id"],
+            1,
+            vec![Value::Integer(1)],
+        )];
+        // Pre-seed the byte-identical deleted residue version.
+        {
+            use sqlite_core::row_history::{RowVersion, VersionOrigin};
+            histories[0].versions.push(RowVersion {
+                rowid: Some(2),
+                values: vec![Value::Integer(2)],
+                origin: VersionOrigin::CarvedResidue,
+                commit_seq: None,
+                view_state: ViewState::CarvedResidue,
+                is_deleted: true,
+                is_guessed: false,
+                rowid_reused: false,
+                attribution_uncertain: false,
+            });
+        }
+        let before = histories[0].versions.len();
+        let recovery = JournalRecovery {
+            deleted: vec![
+                PriorRow {
+                    table: "t".into(),
+                    rowid: 2,
+                    values: vec![Value::Integer(2)],
+                    source: RecoverySource::RollbackJournal(rollback_src(0, 1)),
+                },
+                PriorRow {
+                    table: "ghost".into(), // no history sheet → dropped
+                    rowid: 3,
+                    values: vec![Value::Integer(3)],
+                    source: RecoverySource::RollbackJournal(rollback_src(0, 1)),
+                },
+            ],
+            modified: vec![],
+            counts: JournalCounts {
+                deleted: 2,
+                modified: 0,
+            },
+        };
+        fold_journal_into_histories(&mut histories, &recovery);
+        assert_eq!(
+            histories[0].versions.len(),
+            before,
+            "the byte-identical delete is not double-listed"
+        );
+        assert_eq!(
+            histories.len(),
+            1,
+            "no fabricated history for the ghost table"
+        );
+    }
+
+    #[test]
+    fn journal_carved_records_projects_deleted_and_modified_prior_rows() {
+        let recovery = JournalRecovery {
+            deleted: vec![PriorRow {
+                table: "t".into(),
+                rowid: 9,
+                values: vec![Value::Integer(9)],
+                source: RecoverySource::RollbackJournal(rollback_src(0, 4)),
+            }],
+            modified: vec![PriorVersionRecord {
+                table: "t".into(),
+                rowid: 5,
+                prior_values: vec![Value::Integer(5), Value::Text("OLD".into())],
+                current_values: vec![Value::Integer(5), Value::Text("new".into())],
+                replaced_rowid: true,
+                source: RecoverySource::RollbackJournal(rollback_src(0, 6)),
+            }],
+            counts: JournalCounts {
+                deleted: 1,
+                modified: 1,
+            },
+        };
+        let records = journal_carved_records(&recovery);
+        assert_eq!(records.len(), 2, "one per deleted + one per modified");
+        // Deleted prior row: full values, RollbackJournal source, page = pgno.
+        assert_eq!(records[0].rowid, 9);
+        assert_eq!(records[0].page, 4);
+        assert_eq!(recovery_source_token(records[0].source), "rollback-journal");
+        assert_eq!(snapshot_label(&records[0]), "rollback-journal:(0,4)");
+        // Modified row: the PRIOR (pre-edit) values, not the current ones.
+        assert_eq!(records[1].rowid, 5);
+        assert_eq!(
+            records[1].values,
+            vec![Value::Integer(5), Value::Text("OLD".into())]
+        );
+        assert_eq!(snapshot_label(&records[1]), "rollback-journal:(0,6)");
+    }
+
+    #[test]
+    fn plan_combined_workbook_folds_journal_recovery() {
+        // End to end through the planner: a deleted prior row tints red (is_deleted)
+        // and a modified prior value tints blue (superseded) under the live table.
+        let db = minted_people_db();
+        let recovery = JournalRecovery {
+            deleted: vec![PriorRow {
+                table: "people".into(),
+                rowid: 99,
+                values: vec![Value::Integer(99), Value::Text("ghost".into())],
+                source: RecoverySource::RollbackJournal(rollback_src(0, 2)),
+            }],
+            modified: vec![PriorVersionRecord {
+                table: "people".into(),
+                rowid: 1,
+                prior_values: vec![Value::Integer(1), Value::Text("OLD".into())],
+                current_values: vec![Value::Integer(1), Value::Text("alice".into())],
+                replaced_rowid: true,
+                source: RecoverySource::RollbackJournal(rollback_src(0, 2)),
+            }],
+            counts: JournalCounts {
+                deleted: 1,
+                modified: 1,
+            },
+        };
+        let plan = plan_combined_workbook(&db, &[], None, Some(&recovery), EXCEL_MAX_ROWS);
+        let people = plan.sheets.iter().find(|s| s.name == "people").unwrap();
+        assert!(
+            people.rows.iter().any(|r| r.is_deleted),
+            "the journal delete folds in as a red is_deleted version"
+        );
+        assert!(
+            people.rows.iter().any(|r| r.superseded && !r.is_deleted),
+            "the journal modification folds in as a blue superseded version"
+        );
     }
 
     #[test]
@@ -3991,7 +4451,7 @@ mod tests {
     #[test]
     fn plan_combined_workbook_builds_temporal_sheet_per_table() {
         let db = minted_people_db();
-        let plan = plan_combined_workbook(&db, &[], None, EXCEL_MAX_ROWS);
+        let plan = plan_combined_workbook(&db, &[], None, None, EXCEL_MAX_ROWS);
 
         let people = plan
             .sheets
@@ -4030,7 +4490,7 @@ mod tests {
                 Value::Text("d".into()),
             ],
         )];
-        let plan = plan_combined_workbook(&db, &records, None, EXCEL_MAX_ROWS);
+        let plan = plan_combined_workbook(&db, &records, None, None, EXCEL_MAX_ROWS);
         let extra_names: Vec<&String> = plan.extra.iter().map(|t| &t.name).collect();
         assert!(
             extra_names.iter().any(|n| *n == "recovered_unattributed"),
@@ -4048,7 +4508,7 @@ mod tests {
     fn plan_combined_workbook_reports_row_cap_drops() {
         // Three live rows → three present versions; cap at 1 → 2 dropped.
         let db = minted_people_db_n(3);
-        let plan = plan_combined_workbook(&db, &[], None, 1);
+        let plan = plan_combined_workbook(&db, &[], None, None, 1);
         let drop = plan
             .dropped
             .iter()
@@ -4077,8 +4537,8 @@ mod tests {
         // Two live rows → two present versions; cap of 1 truncates the people
         // version-history sheet, exercising the dropped-row warning loop.
         let db = minted_people_db_n(2);
-        let buf =
-            combined_xlsx_bytes(&db, &[], None, Path::new("/out/x.recovered.xlsx"), 1).unwrap();
+        let buf = combined_xlsx_bytes(&db, &[], None, None, Path::new("/out/x.recovered.xlsx"), 1)
+            .unwrap();
         assert!(!buf.is_empty());
         let _ = open_xlsx(&buf);
     }
@@ -4097,6 +4557,7 @@ mod tests {
         let err = combined_xlsx_bytes(
             &db,
             &records,
+            None,
             None,
             Path::new("/out/wide.recovered.xlsx"),
             EXCEL_MAX_ROWS,

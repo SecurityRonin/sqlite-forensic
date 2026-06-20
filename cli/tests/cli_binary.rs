@@ -1439,7 +1439,7 @@ fn xlsx_temporal_workbook_has_version_history_from_wal() {
     teardown_reader(reader);
 }
 
-/// The CFReDS SFT-03 PERSIST pair: a `-journal` sits beside the main db with the
+/// The `CFReDS` SFT-03 PERSIST pair: a `-journal` sits beside the main db with the
 /// pre-images of the last transaction (100 `invoice_items` deletions + 100
 /// modifications). The default `carve` must auto-discover the `<db>-journal`,
 /// fold its recovery into the combined workbook, and surface in the
@@ -1500,19 +1500,34 @@ fn xlsx_combined_folds_rollback_journal_recovery() {
     }
     let i_del = header.iter().position(|h| h == "is_deleted").unwrap();
     let i_view = header.iter().position(|h| h == "view_state").unwrap();
+    let i_rowid = header.iter().position(|h| h == "_rowid").unwrap();
 
-    // Deleted prior rows: is_deleted=1 carved_residue versions folded under the
-    // KNOWN table at their rowid → red tint.
-    let deleted = sheet
+    // The journal's 100 deletions fold in as is_deleted=1 versions under the KNOWN
+    // table at their RECOVERED rowid (red tint). Count only the journal's
+    // contribution — is_deleted rows carrying a known integer rowid in the original
+    // 1..=2240 range — so an additional free-space residue carve (destroyed rowid,
+    // blank `_rowid`) does not inflate the count.
+    let journal_deleted: std::collections::BTreeSet<i64> = sheet
         .rows()
         .skip(1)
         .filter(|r| matches!(&r[i_del], Data::Float(d) if *d == 1.0))
-        .count();
+        .filter_map(|r| match &r[i_rowid] {
+            Data::Float(f) if f.fract() == 0.0 => Some(*f as i64),
+            Data::Int(i) => Some(*i),
+            _ => None,
+        })
+        .filter(|id| (1..=2240).contains(id))
+        .collect();
     assert!(
-        deleted >= 99,
-        "the journal's 100 deletions fold in as is_deleted=1 versions (got {deleted})"
+        journal_deleted.len() >= 99,
+        "the journal's 100 deletions fold in as is_deleted=1 versions at their rowid (got {})",
+        journal_deleted.len()
     );
-    assert_eq!(deleted, 100, "target is the full 100/100 deletions");
+    assert_eq!(
+        journal_deleted.len(),
+        100,
+        "target is the full 100/100 deletions"
+    );
 
     // Modified rows: the PRIOR value surfaces as a `changed_later` superseded
     // version (blue), is_deleted=0 (the live row stays current).
@@ -1527,4 +1542,63 @@ fn xlsx_combined_folds_rollback_journal_recovery() {
         "the journal's 100 modifications fold in as changed_later superseded versions (got {superseded})"
     );
     assert_eq!(superseded, 100, "target is the full 100/100 modifications");
+}
+
+/// The stdout text surfaces (here `--format jsonl`) also surface the rollback
+/// journal's recovered prior rows, tagged `rollback-journal`, when a `<db>-journal`
+/// is in play. Drives the stdout journal-records path end to end against the
+/// committed `CFReDS` SFT-03 PERSIST pair (copied to a scratch dir).
+#[test]
+fn stdout_carve_surfaces_rollback_journal_records() {
+    let dir = Scratch::new("journal_stdout");
+    let src = data_dir().join("cfreds");
+    std::fs::copy(
+        src.join("SFT-03_PERSIST_ios.sqlite"),
+        dir.join("SFT-03_PERSIST_ios.sqlite"),
+    )
+    .unwrap();
+    std::fs::copy(
+        src.join("SFT-03_PERSIST_ios.sqlite-journal"),
+        dir.join("SFT-03_PERSIST_ios.sqlite-journal"),
+    )
+    .unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "SFT-03_PERSIST_ios.sqlite", "--format", "jsonl"])
+        .output()
+        .expect("run carve");
+    assert!(
+        out.status.success(),
+        "carve --format jsonl must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let journal_lines = stdout
+        .lines()
+        .filter(|l| l.contains("rollback-journal"))
+        .count();
+    assert!(
+        journal_lines >= 99,
+        "the recovered journal prior rows surface tagged rollback-journal (got {journal_lines})"
+    );
+
+    // `--no-journal` suppresses them: no rollback-journal rows in the stdout.
+    let out2 = bin()
+        .current_dir(&dir.0)
+        .args([
+            "carve",
+            "SFT-03_PERSIST_ios.sqlite",
+            "--format",
+            "jsonl",
+            "--no-journal",
+        ])
+        .output()
+        .expect("run carve --no-journal");
+    assert!(out2.status.success(), "carve --no-journal must exit 0");
+    let stdout2 = String::from_utf8(out2.stdout).unwrap();
+    assert!(
+        !stdout2.contains("rollback-journal"),
+        "--no-journal omits the rollback-journal rows"
+    );
 }

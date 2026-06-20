@@ -1574,6 +1574,157 @@ pub fn wal_commit_token(
     }
 }
 
+/// The eight temporal/flag columns appended to every per-table version-history
+/// sheet, after the table's real columns, in order: the rowid, the WAL commit
+/// label, the logical commit sequence, the evidence-based view state, then the
+/// four 0/1 flag columns.
+pub const TEMPORAL_FLAG_COLS: [&str; 8] = [
+    "_rowid",
+    "wal_commit",
+    "commit_seq",
+    "view_state",
+    "is_deleted",
+    "is_guessed",
+    "rowid_reused",
+    "attribution_uncertain",
+];
+
+/// The annotation note a `WITHOUT ROWID` table's sheet carries instead of versions:
+/// such a table has no rowid to key a history on, so it is not version-tracked.
+const WITHOUT_ROWID_NOTE: &str = "WITHOUT ROWID — not version-tracked";
+
+/// One rendered version row of a per-table temporal sheet: the real-column cells
+/// followed by the eight temporal/flag cells, plus the four tint inputs the
+/// renderer feeds to [`fill_for`] (so the fill decision is made once, here).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemporalRow {
+    /// Real-column cells followed by the eight temporal/flag cells.
+    pub cells: Vec<Value>,
+    /// Whether this rowid was reused (delete+reinsert) — pale-purple tint.
+    pub rowid_reused: bool,
+    /// Whether this version's attribution was inferred/guessed — pale-yellow tint.
+    pub is_guessed: bool,
+    /// Whether this version is deleted / carved residue — pale-red tint.
+    pub is_deleted: bool,
+    /// Whether this version was superseded by a later value (`ValueChangedLater`)
+    /// — pale-blue tint.
+    pub superseded: bool,
+}
+
+/// A per-table VERSION-HISTORY sheet: the table name, the header (real columns +
+/// [`TEMPORAL_FLAG_COLS`]), and one [`TemporalRow`] per row version.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemporalSheet {
+    /// Table name (later run through [`sanitize_sheet_name`] for the worksheet).
+    pub name: String,
+    /// Real columns followed by [`TEMPORAL_FLAG_COLS`].
+    pub columns: Vec<String>,
+    /// One row per [`RowVersion`](sqlite_core::row_history::RowVersion), capped at
+    /// `row_cap`.
+    pub rows: Vec<TemporalRow>,
+}
+
+/// Build one table's VERSION-HISTORY sheet from its
+/// [`TableHistory`](sqlite_core::row_history::TableHistory).
+///
+/// The header is the table's real `columns` followed by [`TEMPORAL_FLAG_COLS`].
+/// Each [`RowVersion`](sqlite_core::row_history::RowVersion) becomes one row: its
+/// `values` aligned to the real columns (padded with NULL / truncated), then the
+/// temporal cells (`_rowid`, `wal_commit`, `commit_seq`, `view_state`) and the four
+/// 0/1 flags. A `Commit` origin's `wal_commit` label is resolved to
+/// `commit:(salt1,salt2,frame_index)` via `resolve_lsn` (the timeline lookup the
+/// caller supplies); `Live` → `live`, `CarvedResidue` → `residue`.
+///
+/// A `WITHOUT ROWID` table (no rowid to track) emits a single annotation row
+/// noting it is not version-tracked rather than a blank or fabricated body. A sheet
+/// exceeding `row_cap` data rows is truncated and the surplus returned so the
+/// caller can warn (never a silent drop).
+///
+/// Pure (no I/O beyond the supplied resolver), so it is directly unit-testable.
+#[must_use]
+pub fn temporal_sheet(
+    history: &sqlite_core::row_history::TableHistory,
+    resolve_lsn: impl Fn(&sqlite_core::CommitId) -> Option<sqlite_core::WalLsn>,
+    row_cap: usize,
+) -> (TemporalSheet, usize) {
+    use sqlite_core::row_history::VersionOrigin;
+
+    let width = history.columns.len();
+    let mut columns: Vec<String> = history.columns.clone();
+    columns.extend(TEMPORAL_FLAG_COLS.iter().map(|s| (*s).to_string()));
+
+    // WITHOUT ROWID: no rowid to key a history on → a single annotation row. The
+    // note sits in the first cell; the remaining cells are blank.
+    if history.without_rowid {
+        let mut cells = vec![Value::Text(WITHOUT_ROWID_NOTE.to_string())];
+        cells.resize(columns.len(), Value::Null);
+        let rows = vec![TemporalRow {
+            cells,
+            rowid_reused: false,
+            is_guessed: false,
+            is_deleted: false,
+            superseded: false,
+        }];
+        return (
+            TemporalSheet {
+                name: history.table.clone(),
+                columns,
+                rows,
+            },
+            0,
+        );
+    }
+
+    let mut rows: Vec<TemporalRow> = Vec::with_capacity(history.versions.len());
+    for v in &history.versions {
+        let mut cells = align_cells(&v.values, width);
+        // _rowid
+        cells.push(match v.rowid {
+            Some(id) => Value::Integer(id),
+            None => Value::Null,
+        });
+        // wal_commit — resolve a Commit's LSN through the caller's lookup.
+        let lsn = match &v.origin {
+            VersionOrigin::Commit(id) => resolve_lsn(id),
+            _ => None,
+        };
+        cells.push(Value::Text(wal_commit_token(&v.origin, lsn)));
+        // commit_seq — blank when None.
+        cells.push(match v.commit_seq {
+            Some(seq) => Value::Integer(i64::from(seq)),
+            None => Value::Null,
+        });
+        // view_state
+        cells.push(Value::Text(view_state_token(v.view_state).to_string()));
+        // the four 0/1 flags
+        cells.push(Value::Integer(i64::from(v.is_deleted)));
+        cells.push(Value::Integer(i64::from(v.is_guessed)));
+        cells.push(Value::Integer(i64::from(v.rowid_reused)));
+        cells.push(Value::Integer(i64::from(v.attribution_uncertain)));
+
+        let superseded = v.view_state == sqlite_core::row_history::ViewState::ValueChangedLater;
+        rows.push(TemporalRow {
+            cells,
+            rowid_reused: v.rowid_reused,
+            is_guessed: v.is_guessed,
+            is_deleted: v.is_deleted,
+            superseded,
+        });
+    }
+
+    let dropped = rows.len().saturating_sub(row_cap);
+    rows.truncate(row_cap);
+
+    (
+        TemporalSheet {
+            name: history.table.clone(),
+            columns,
+            rows,
+        },
+        dropped,
+    )
+}
+
 /// Render the **combined** live + recovered workbook to in-memory bytes.
 ///
 /// One sheet per [`MergedSheet`] (a live table with its recovered rows folded in

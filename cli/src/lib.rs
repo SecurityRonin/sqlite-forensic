@@ -1079,18 +1079,14 @@ fn fragments_table(frags: &[CarvedFragment]) -> RecoveredTable {
 /// silently swallowed.
 pub const EXCEL_MAX_ROWS: usize = 1_048_576;
 
-/// The three trailing flag columns appended to every combined table sheet, in
-/// order: recovered-vs-live, inferred-vs-certain, and shape-ambiguity.
-const FLAG_COLS: [&str; 3] = ["is_deleted", "is_guessed", "table_match_ambiguous"];
-
-/// One recovered (deleted) row folded into a live table's sheet. Its `cells`
-/// align to the table's real columns by position (padded/truncated by
-/// [`merge_table_sheet`]); `rowid` is `None` when the rowid was destroyed (it
-/// then sinks to the bottom of the sheet). `is_guessed` marks a Tier-2 inferred
-/// row, `ambiguous` that its shape matched more than one table.
+/// One recovered (deleted) row routed to a live table by [`route_recovered`].
+/// `rowid` is `None` when the rowid was destroyed. `is_guessed` marks a Tier-2
+/// inferred row, `ambiguous` that its shape matched more than one table. (The
+/// temporal workbook folds residue via the row-history layer; this type is the
+/// carried payload of [`RoutedRecovered::by_table`].)
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecoveredRow {
-    /// Recovered rowid, or `None` when destroyed/unknown (→ bottom of sheet).
+    /// Recovered rowid, or `None` when destroyed/unknown.
     pub rowid: Option<i64>,
     /// Recovered cells, aligned to the real columns by position.
     pub cells: Vec<Value>,
@@ -1098,135 +1094,6 @@ pub struct RecoveredRow {
     pub is_guessed: bool,
     /// `true` when the inferred shape matched more than one table.
     pub ambiguous: bool,
-}
-
-/// One row of a merged sheet: its cells (real columns padded/truncated, then the
-/// three flag values) and whether it is a recovered/deleted row (drives the pale
-/// red tint).
-#[derive(Debug, Clone, PartialEq)]
-pub struct MergedRow {
-    /// Real-column cells followed by the three flag cells.
-    pub cells: Vec<Value>,
-    /// `true` for a recovered row — the renderer tints the whole row.
-    pub is_deleted: bool,
-    /// `true` for a Tier-2 inferred row — tinted pale yellow instead of red.
-    pub is_guessed: bool,
-}
-
-/// A live table's combined sheet: its name, the header (real columns + the three
-/// flag columns), and the merged rows (live + recovered, interleaved by rowid).
-#[derive(Debug, Clone, PartialEq)]
-pub struct MergedSheet {
-    /// Table name (later run through [`sanitize_sheet_name`] for the worksheet).
-    pub name: String,
-    /// Real columns followed by `is_deleted, is_guessed, table_match_ambiguous`.
-    pub columns: Vec<String>,
-    /// The interleaved rows, capped at the Excel row limit.
-    pub rows: Vec<MergedRow>,
-}
-
-/// Build one live table's combined sheet: every live row (rowid order) with the
-/// attributed recovered rows folded in, sorted by rowid, unknown-rowid recovered
-/// rows appended at the bottom. Returns the sheet plus the number of data rows
-/// dropped to honor `row_cap`.
-///
-/// The header is `real_columns` followed by the three flag columns. Each row's
-/// cells are padded with NULL / truncated to `real_columns.len()`, then the flag
-/// triple is appended: a live row is `0,0,0`; a certain recovered row `1,0,0`; an
-/// inferred recovered row `1,1,{ambiguous}`. `is_deleted` on [`MergedRow`] mirrors
-/// the first flag so the renderer can tint without re-reading the cell.
-///
-/// `row_cap` bounds the **data** rows (the +1 header is the caller's concern). A
-/// sheet exceeding it is truncated to `row_cap` rows and the surplus is returned
-/// as the dropped count so the caller can warn — truncation is never silent.
-#[must_use]
-pub fn merge_table_sheet(
-    name: &str,
-    real_columns: &[String],
-    live_rows: &[sqlite_core::Row],
-    recovered: Vec<RecoveredRow>,
-    row_cap: usize,
-) -> (MergedSheet, usize) {
-    let width = real_columns.len();
-    let mut columns: Vec<String> = real_columns.to_vec();
-    columns.extend(FLAG_COLS.iter().map(|s| (*s).to_string()));
-
-    // Split recovered rows into rowid-bearing (interleave) and rowid-destroyed
-    // (sink to the bottom), preserving input order within each group.
-    let mut known: Vec<(i64, RecoveredRow)> = Vec::new();
-    let mut unknown: Vec<RecoveredRow> = Vec::new();
-    for r in recovered {
-        match r.rowid {
-            Some(id) => known.push((id, r)),
-            None => unknown.push(r),
-        }
-    }
-
-    // A sortable key per rowid-bearing row: live (false) before recovered (true)
-    // on a rowid tie, so a recovered prior version sits just after its live row.
-    enum Pending<'a> {
-        Live(&'a sqlite_core::Row),
-        Recovered(RecoveredRow),
-    }
-    let mut pending: Vec<(i64, bool, Pending)> = Vec::new();
-    for row in live_rows {
-        pending.push((row.rowid, false, Pending::Live(row)));
-    }
-    for (id, r) in known {
-        pending.push((id, true, Pending::Recovered(r)));
-    }
-    // Stable sort by (rowid, live-before-recovered) keeps same-key input order.
-    pending.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-    let mut rows: Vec<MergedRow> = Vec::with_capacity(pending.len() + unknown.len());
-    for (_, _, item) in pending {
-        match item {
-            Pending::Live(row) => rows.push(live_merged_row(&row.values, width)),
-            Pending::Recovered(r) => rows.push(recovered_merged_row(&r, width)),
-        }
-    }
-    // Unknown-rowid recovered rows go last, in input order.
-    for r in &unknown {
-        rows.push(recovered_merged_row(r, width));
-    }
-
-    let dropped = rows.len().saturating_sub(row_cap);
-    rows.truncate(row_cap);
-
-    (
-        MergedSheet {
-            name: name.to_string(),
-            columns,
-            rows,
-        },
-        dropped,
-    )
-}
-
-/// A live row's merged cells: its values padded/truncated to `width`, then the
-/// flag triple `0,0,0`. Not tinted.
-fn live_merged_row(values: &[Value], width: usize) -> MergedRow {
-    let mut cells = align_cells(values, width);
-    cells.extend([Value::Integer(0), Value::Integer(0), Value::Integer(0)]);
-    MergedRow {
-        cells,
-        is_deleted: false,
-        is_guessed: false,
-    }
-}
-
-/// A recovered row's merged cells: its cells padded/truncated to `width`, then
-/// the flag triple `1, is_guessed, ambiguous`. Tinted (`is_deleted = true`).
-fn recovered_merged_row(r: &RecoveredRow, width: usize) -> MergedRow {
-    let mut cells = align_cells(&r.cells, width);
-    cells.push(Value::Integer(1));
-    cells.push(Value::Integer(i64::from(r.is_guessed)));
-    cells.push(Value::Integer(i64::from(r.ambiguous)));
-    MergedRow {
-        cells,
-        is_deleted: true,
-        is_guessed: r.is_guessed,
-    }
 }
 
 /// Align `values` to exactly `width` cells: pad missing trailing cells with NULL,
@@ -1725,23 +1592,25 @@ pub fn temporal_sheet(
     )
 }
 
-/// Render the **combined** live + recovered workbook to in-memory bytes.
+/// Render the **combined** TEMPORAL workbook to in-memory bytes.
 ///
-/// One sheet per [`MergedSheet`] (a live table with its recovered rows folded in
-/// by rowid), followed by the `extra` tables (`recovered_unattributed`,
-/// `recovered_fragments`) as separate sheets. Sheet names are sanitized and
-/// de-duplicated via [`sanitize_sheet_name`]. The header row is bold; a recovered
-/// row (`MergedRow::is_deleted`) carries the pale-red fill while a live row is
-/// unfilled. Every cell follows its storage class — a `Blob` image (live OR
-/// recovered) is thumbnailed and embedded in-cell exactly as the recovered-only
-/// export does.
+/// One sheet per [`TemporalSheet`] (a live user table's per-rowid VERSION HISTORY),
+/// followed by the `extra` tables (`recovered_unattributed`, `recovered_fragments`)
+/// as separate sheets. Sheet names are sanitized and de-duplicated via
+/// [`sanitize_sheet_name`]. The header row is bold; each version row is tinted by
+/// the 5-level [`fill_for`] precedence (reused → purple, guessed → yellow, deleted
+/// → red, superseded → blue, present/live → none). Every cell follows its storage
+/// class — a `Blob` image (live, historical, OR carved) is thumbnailed and embedded
+/// in-cell exactly as the separate recovered tables do.
 pub fn render_combined_xlsx(
-    sheets: &[MergedSheet],
+    sheets: &[TemporalSheet],
     extra: &[RecoveredTable],
 ) -> Result<Vec<u8>, XlsxError> {
     let header_fmt = Format::new().set_bold();
     let recovered_fmt = Format::new().set_background_color(RECOVERED_FILL);
     let guessed_fmt = Format::new().set_background_color(GUESSED_FILL);
+    let reused_fmt = Format::new().set_background_color(REUSED_FILL);
+    let superseded_fmt = Format::new().set_background_color(SUPERSEDED_FILL);
     let plain_fmt = Format::new();
     let mut workbook = Workbook::new();
     let mut taken: Vec<String> = Vec::new();
@@ -1751,15 +1620,22 @@ pub fn render_combined_xlsx(
         taken.push(sheet_name.clone());
         let ws = workbook.add_worksheet().set_name(&sheet_name)?;
         write_header(ws, &sheet.columns, &header_fmt)?;
-        for (r, mrow) in sheet.rows.iter().enumerate() {
+        for (r, trow) in sheet.rows.iter().enumerate() {
             let row = r as u32 + 1;
-            // Live → unfilled; certain recovered → pale red; guessed → pale yellow.
-            let fmt = match fill_for(false, mrow.is_guessed, mrow.is_deleted, false) {
+            // 5-level precedence: purple > yellow > red > blue > none.
+            let fmt = match fill_for(
+                trow.rowid_reused,
+                trow.is_guessed,
+                trow.is_deleted,
+                trow.superseded,
+            ) {
                 None => &plain_fmt,
-                Some(c) if c == GUESSED_FILL => &guessed_fmt,
+                Some(REUSED_FILL) => &reused_fmt,
+                Some(GUESSED_FILL) => &guessed_fmt,
+                Some(SUPERSEDED_FILL) => &superseded_fmt,
                 Some(_) => &recovered_fmt,
             };
-            for (c, value) in mrow.cells.iter().enumerate() {
+            for (c, value) in trow.cells.iter().enumerate() {
                 write_value_cell(ws, row, c as u16, value, fmt)?;
             }
         }
@@ -1777,31 +1653,33 @@ pub fn render_combined_xlsx(
     workbook.save_to_buffer()
 }
 
-/// A planned combined workbook: the per-table combined `sheets` (live + recovered
-/// folded by rowid), the separate `extra` tables (`recovered_unattributed`,
-/// `recovered_fragments`), and the `dropped` `(table, count)` pairs for any sheet
-/// truncated to the Excel row cap (empty when nothing was dropped).
+/// A planned combined TEMPORAL workbook: the per-table version-history `sheets`,
+/// the separate `extra` tables (`recovered_unattributed`, `recovered_fragments`
+/// — only the residue NOT folded into a table history), and the `dropped`
+/// `(table, count)` pairs for any sheet truncated to the Excel row cap.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CombinedWorkbook {
-    /// One combined sheet per live user table, in live-table order.
-    pub sheets: Vec<MergedSheet>,
+    /// One version-history sheet per live user table, in `row_histories` order.
+    pub sheets: Vec<TemporalSheet>,
     /// The separate Tier-3 / fragment tables (each a whole-recovered sheet).
     pub extra: Vec<RecoveredTable>,
     /// `(table, dropped_row_count)` for each sheet truncated to `row_cap`.
     pub dropped: Vec<(String, usize)>,
 }
 
-/// Plan the combined live + recovered workbook from the open evidence database,
-/// the carved records, and the optional fragments.
+/// Plan the combined TEMPORAL workbook from the open evidence database, the carved
+/// records (for the unattributed extra split), and the optional fragments.
 ///
-/// Each live user table ([`Database::live_table_rows`]) becomes one combined
-/// sheet: its live rows with the attributed recovered rows folded in by rowid
-/// ([`route_recovered`] + [`merge_table_sheet`]). Tier-1 `Known` and Tier-2
-/// `Inferred` rows fold into their (guessed) table's sheet; Tier-3 rows and any
-/// inferred guess to a non-existent table go to a separate `recovered_unattributed`
-/// table, and `fragments` (when `Some`) to `recovered_fragments` — both built by
-/// the existing [`group_into_tables`] writer. A sheet exceeding `row_cap` is
-/// truncated and the drop recorded in `dropped` (the shell warns; never silent).
+/// Each live user table becomes one VERSION-HISTORY sheet from
+/// [`sqlite_forensic::row_histories_with_residue`], which already folds ATTRIBUTED
+/// carved residue into its table's history. The separate `extra` tables therefore
+/// carry ONLY what is NOT in a table history: Tier-3 `recovered_unattributed`
+/// residue (attributed to no live table) and the `recovered_fragments`. The
+/// unattributed split is computed by [`route_recovered`] (the same attribution the
+/// histories use), so an attributed deleted row appears EXACTLY once — in its
+/// table's sheet as a `carved_residue` / `absent_final` version — never twice. A
+/// `Commit` version's `wal_commit` label is resolved through the WAL timeline. A
+/// sheet exceeding `row_cap` is truncated and the drop recorded in `dropped`.
 #[must_use]
 pub fn plan_combined_workbook(
     db: &Database,
@@ -1809,31 +1687,34 @@ pub fn plan_combined_workbook(
     fragments: Option<&[CarvedFragment]>,
     row_cap: usize,
 ) -> CombinedWorkbook {
-    let dumps = db.live_table_rows();
-    let live_names: Vec<String> = dumps.iter().map(|d| d.name.clone()).collect();
-    let attributions = attribute_records(db, records);
-    let mut routed = route_recovered(&live_names, records, &attributions);
+    // The per-table version histories (live + WAL-historical + attributed residue).
+    let histories = sqlite_forensic::row_histories_with_residue(db);
 
-    let mut sheets = Vec::with_capacity(dumps.len());
+    // Resolve a Commit's salt-qualified LSN through the WAL timeline so a commit
+    // version renders `commit:(salt1,salt2,frame_index)`. No timeline → no salts.
+    let timeline = db.wal_timeline();
+    let resolve_lsn = |id: &sqlite_core::CommitId| -> Option<sqlite_core::WalLsn> {
+        timeline.as_ref()?.snapshot_at(*id).map(|s| s.lsn())
+    };
+
+    let mut sheets = Vec::with_capacity(histories.len());
     let mut dropped = Vec::new();
-    for dump in &dumps {
-        let recovered = routed.by_table.remove(&dump.name).unwrap_or_default();
-        let (sheet, n) = merge_table_sheet(
-            &dump.name,
-            &dump.column_names,
-            &dump.rows,
-            recovered,
-            row_cap,
-        );
+    for h in &histories {
+        let (sheet, n) = temporal_sheet(h, &resolve_lsn, row_cap);
         if n > 0 {
-            dropped.push((dump.name.clone(), n));
+            dropped.push((h.table.clone(), n));
         }
         sheets.push(sheet);
     }
 
-    // Tier-3 (+ unrouteable inferred) records and fragments become the separate
-    // extra tables, reusing the existing grouping writer with every record marked
-    // Unattributed (so it emits exactly recovered_unattributed + fragments).
+    // The separate extra tables carry ONLY the residue NOT folded into a table
+    // history: the Tier-3 unattributed records (+ any inferred guess to a
+    // non-existent table) and the fragments. route_recovered's `unattributed`
+    // bucket is exactly that set, so the attributed residue (already in its table's
+    // version history) is never double-listed.
+    let live_names: Vec<String> = histories.iter().map(|h| h.table.clone()).collect();
+    let attributions = attribute_records(db, records);
+    let routed = route_recovered(&live_names, records, &attributions);
     let unattr_records: Vec<CarvedRecord> = routed
         .unattributed
         .iter()
@@ -3533,181 +3414,6 @@ mod tests {
         );
     }
 
-    // ---- combined live + recovered merge helper ----------------------------
-
-    use sqlite_core::Row;
-
-    fn row(rowid: i64, vals: Vec<Value>) -> Row {
-        Row {
-            rowid,
-            values: vals,
-        }
-    }
-
-    /// The merged sheet header is the real columns followed by the three trailing
-    /// flag columns, in order.
-    #[test]
-    fn merged_sheet_appends_three_flag_columns() {
-        let cols = vec!["id".to_string(), "name".to_string()];
-        let (sheet, dropped) = merge_table_sheet("people", &cols, &[], Vec::new(), 1_048_576);
-        assert_eq!(dropped, 0);
-        assert_eq!(
-            sheet.columns,
-            vec![
-                "id",
-                "name",
-                "is_deleted",
-                "is_guessed",
-                "table_match_ambiguous"
-            ]
-        );
-    }
-
-    /// Live rows and recovered rows interleave by rowid; the trailing flags read
-    /// live = 0,0,0 and certain-recovered = 1,0,0. Cells pad/truncate to the real
-    /// column count.
-    #[test]
-    fn merged_sheet_interleaves_recovered_by_rowid() {
-        let cols = vec!["id".to_string(), "name".to_string()];
-        let live = vec![
-            row(1, vec![Value::Integer(1), Value::Text("live-a".into())]),
-            row(3, vec![Value::Integer(3), Value::Text("live-c".into())]),
-        ];
-        // A certain recovered row at rowid 2 lands between the two live rows.
-        let recovered = vec![RecoveredRow {
-            rowid: Some(2),
-            cells: vec![Value::Integer(2), Value::Text("del-b".into())],
-            is_guessed: false,
-            ambiguous: false,
-        }];
-        let (sheet, _) = merge_table_sheet("people", &cols, &live, recovered, 1_048_576);
-        // Order by rowid: live(1), recovered(2), live(3).
-        let names: Vec<&str> = sheet
-            .rows
-            .iter()
-            .map(|r| match &r.cells[1] {
-                Value::Text(t) => t.as_str(),
-                _ => "?",
-            })
-            .collect();
-        assert_eq!(names, vec!["live-a", "del-b", "live-c"]);
-        // Flag triple lives in the last 3 cells (after the 2 real columns).
-        let flags = |r: &MergedRow| {
-            (
-                r.cells[2].clone(),
-                r.cells[3].clone(),
-                r.cells[4].clone(),
-                r.is_deleted,
-            )
-        };
-        assert_eq!(
-            flags(&sheet.rows[0]),
-            (
-                Value::Integer(0),
-                Value::Integer(0),
-                Value::Integer(0),
-                false
-            ),
-            "live row = 0,0,0 untinted"
-        );
-        assert_eq!(
-            flags(&sheet.rows[1]),
-            (
-                Value::Integer(1),
-                Value::Integer(0),
-                Value::Integer(0),
-                true
-            ),
-            "certain-recovered = 1,0,0 tinted"
-        );
-    }
-
-    /// A Tier-2 inferred row reads `is_guessed = 1` and carries its ambiguity
-    /// flag; an unknown-rowid recovered row is appended at the bottom, after the
-    /// rowid-sorted rows.
-    #[test]
-    fn merged_sheet_inferred_flags_and_unknown_rowid_at_bottom() {
-        let cols = vec!["id".to_string()];
-        let live = vec![row(5, vec![Value::Integer(5)])];
-        let recovered = vec![
-            // Unknown rowid → bottom, even though "2" would sort first.
-            RecoveredRow {
-                rowid: None,
-                cells: vec![Value::Integer(99)],
-                is_guessed: true,
-                ambiguous: true,
-            },
-            // Inferred, known rowid 2 → sorts before live rowid 5.
-            RecoveredRow {
-                rowid: Some(2),
-                cells: vec![Value::Integer(2)],
-                is_guessed: true,
-                ambiguous: false,
-            },
-        ];
-        let (sheet, _) = merge_table_sheet("t", &cols, &live, recovered, 1_048_576);
-        // Order: recovered(2, inferred), live(5), then unknown-rowid at bottom.
-        let ids: Vec<Value> = sheet.rows.iter().map(|r| r.cells[0].clone()).collect();
-        assert_eq!(
-            ids,
-            vec![Value::Integer(2), Value::Integer(5), Value::Integer(99)]
-        );
-        // Inferred row: is_deleted=1, is_guessed=1, ambiguous=0.
-        assert_eq!(sheet.rows[0].cells[1], Value::Integer(1));
-        assert_eq!(sheet.rows[0].cells[2], Value::Integer(1));
-        assert_eq!(sheet.rows[0].cells[3], Value::Integer(0));
-        // Bottom row: inferred + ambiguous.
-        let last = sheet.rows.last().unwrap();
-        assert_eq!(last.cells[2], Value::Integer(1), "is_guessed");
-        assert_eq!(last.cells[3], Value::Integer(1), "table_match_ambiguous");
-    }
-
-    /// A recovered row's cells pad with NULL / truncate to the real column count
-    /// before the flag columns are appended.
-    #[test]
-    fn merged_sheet_pads_and_truncates_recovered_cells() {
-        let cols = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let recovered = vec![
-            // Too few cells → padded with NULL.
-            RecoveredRow {
-                rowid: Some(1),
-                cells: vec![Value::Integer(1)],
-                is_guessed: false,
-                ambiguous: false,
-            },
-            // Too many cells → truncated to 3.
-            RecoveredRow {
-                rowid: Some(2),
-                cells: vec![
-                    Value::Integer(2),
-                    Value::Integer(2),
-                    Value::Integer(2),
-                    Value::Integer(2),
-                ],
-                is_guessed: false,
-                ambiguous: false,
-            },
-        ];
-        let (sheet, _) = merge_table_sheet("t", &cols, &[], recovered, 1_048_576);
-        // 3 real columns + 3 flag columns = 6 cells per row.
-        assert!(sheet.rows.iter().all(|r| r.cells.len() == 6));
-        // Padded row: cell[1], cell[2] are NULL.
-        assert_eq!(sheet.rows[0].cells[1], Value::Null);
-        assert_eq!(sheet.rows[0].cells[2], Value::Null);
-    }
-
-    /// The Excel row cap truncates the sheet and reports the dropped count; the
-    /// cap counts live + recovered data rows together.
-    #[test]
-    fn merged_sheet_respects_row_cap_and_reports_dropped() {
-        let cols = vec!["id".to_string()];
-        let live: Vec<Row> = (1..=5).map(|i| row(i, vec![Value::Integer(i)])).collect();
-        // Cap data rows at 3 → 2 dropped.
-        let (sheet, dropped) = merge_table_sheet("t", &cols, &live, Vec::new(), 3);
-        assert_eq!(sheet.rows.len(), 3, "truncated to the cap");
-        assert_eq!(dropped, 2, "two rows dropped past the cap");
-    }
-
     // ---- routing recovered records into live-table buckets -----------------
 
     /// Tier-1 Known routes to its table (certain: `is_guessed=0`); Tier-2
@@ -4075,50 +3781,63 @@ mod tests {
         assert_eq!(dropped, 3);
     }
 
-    fn merged_row(cells: Vec<Value>, is_deleted: bool) -> MergedRow {
-        MergedRow {
+    /// A [`TemporalRow`] with the given cells and tint inputs (all false unless set).
+    fn temporal_row(cells: Vec<Value>, is_deleted: bool, superseded: bool) -> TemporalRow {
+        TemporalRow {
             cells,
-            is_deleted,
+            rowid_reused: false,
             is_guessed: false,
+            is_deleted,
+            superseded,
         }
     }
 
-    /// The combined renderer writes one sheet per [`MergedSheet`] plus the extra
-    /// (unattributed / fragments) tables, with the real header + the three flag
-    /// columns, and the live and recovered rows interleaved as given.
+    /// The temporal renderer writes one sheet per [`TemporalSheet`] plus the extra
+    /// (unattributed / fragments) tables, carrying the real header + the eight
+    /// temporal/flag columns.
     #[test]
-    fn combined_renderer_writes_merged_and_extra_sheets() {
-        let people = MergedSheet {
+    fn combined_renderer_writes_temporal_and_extra_sheets() {
+        let people = TemporalSheet {
             name: "people".to_string(),
-            columns: [
-                "id",
-                "name",
-                "is_deleted",
-                "is_guessed",
-                "table_match_ambiguous",
-            ]
-            .map(String::from)
-            .to_vec(),
+            columns: {
+                let mut c = vec!["id".to_string(), "name".to_string()];
+                c.extend(TEMPORAL_FLAG_COLS.iter().map(|s| (*s).to_string()));
+                c
+            },
             rows: vec![
-                merged_row(
+                // A present (live) row, untinted.
+                temporal_row(
                     vec![
                         Value::Integer(1),
                         Value::Text("live".into()),
+                        Value::Integer(1),
+                        Value::Text("live".into()),
+                        Value::Null,
+                        Value::Text("present".into()),
+                        Value::Integer(0),
                         Value::Integer(0),
                         Value::Integer(0),
                         Value::Integer(0),
                     ],
                     false,
+                    false,
                 ),
-                merged_row(
+                // A deleted (absent_final) row, tinted red.
+                temporal_row(
                     vec![
                         Value::Integer(2),
-                        Value::Text("deleted".into()),
+                        Value::Text("gone".into()),
+                        Value::Integer(2),
+                        Value::Text("commit:(1,2,0)".into()),
+                        Value::Integer(0),
+                        Value::Text("absent_final".into()),
                         Value::Integer(1),
+                        Value::Integer(0),
                         Value::Integer(0),
                         Value::Integer(0),
                     ],
                     true,
+                    false,
                 ),
             ],
         };
@@ -4135,10 +3854,6 @@ mod tests {
             names.iter().any(|n| n == "recovered_unattributed"),
             "{names:?}"
         );
-        assert!(
-            !names.iter().any(|n| n == "recovered_inferred"),
-            "no inferred sheet: {names:?}"
-        );
 
         let sheet = wb.worksheet_range("people").unwrap();
         let header: Vec<String> = sheet
@@ -4148,44 +3863,41 @@ mod tests {
             .iter()
             .map(std::string::ToString::to_string)
             .collect();
+        assert!(header.iter().any(|h| h == "wal_commit"), "{header:?}");
+        assert!(header.iter().any(|h| h == "view_state"), "{header:?}");
+        assert!(header.iter().any(|h| h == "rowid_reused"), "{header:?}");
+        // The deleted row's view_state cell reads absent_final.
         assert_eq!(
-            header,
-            vec![
-                "id",
-                "name",
-                "is_deleted",
-                "is_guessed",
-                "table_match_ambiguous"
-            ]
-        );
-        // Row 1 (live) is_deleted=0; row 2 (recovered) is_deleted=1.
-        assert_eq!(sheet.rows().nth(1).unwrap()[2], Data::Float(0.0));
-        assert_eq!(sheet.rows().nth(2).unwrap()[2], Data::Float(1.0));
-        assert_eq!(
-            sheet.rows().nth(2).unwrap()[1],
-            Data::String("deleted".into())
+            sheet.rows().nth(2).unwrap()[5],
+            Data::String("absent_final".into())
         );
     }
 
-    /// A live image BLOB in a merged sheet is embedded as media (the base dump
-    /// embeds images, not only recovered rows).
+    /// A BLOB image in a temporal version row is embedded as media (a live,
+    /// historical, OR carved image embeds in-cell).
     #[test]
-    fn combined_renderer_embeds_live_image_blob() {
+    fn combined_renderer_embeds_image_blob() {
         let png = rgb_png(40, 40);
-        let sheet = MergedSheet {
+        let mut cells = vec![Value::Blob(png)];
+        // The eight temporal/flag cells after the one real column.
+        cells.extend([
+            Value::Integer(1),
+            Value::Text("live".into()),
+            Value::Null,
+            Value::Text("present".into()),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+        ]);
+        let sheet = TemporalSheet {
             name: "photos".to_string(),
-            columns: ["img", "is_deleted", "is_guessed", "table_match_ambiguous"]
-                .map(String::from)
-                .to_vec(),
-            rows: vec![merged_row(
-                vec![
-                    Value::Blob(png),
-                    Value::Integer(0),
-                    Value::Integer(0),
-                    Value::Integer(0),
-                ],
-                false,
-            )],
+            columns: {
+                let mut c = vec!["img".to_string()];
+                c.extend(TEMPORAL_FLAG_COLS.iter().map(|s| (*s).to_string()));
+                c
+            },
+            rows: vec![temporal_row(cells, false, false)],
         };
         let buf = render_combined_xlsx(&[sheet], &[]).unwrap();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
@@ -4199,7 +3911,7 @@ mod tests {
                 media = true;
             }
         }
-        assert!(media, "a live image BLOB must embed under xl/media/*.png");
+        assert!(media, "an image BLOB must embed under xl/media/*.png");
     }
 
     // ---- combined workbook planner (db → sheets + extra + drops) ------------
@@ -4216,64 +3928,66 @@ mod tests {
         Database::open(build_recovered_db_tables(&seed)).expect("minted db opens")
     }
 
-    /// The planner produces one combined sheet per live table with the recovered
-    /// rows folded in; an inferred match folds into the guessed table's sheet and
-    /// reads `is_guessed=1`. Tier-3 / fragments become separate extra tables, and
-    /// there is no `recovered_inferred` table.
+    /// Mint a `people(id, name)` db with `n` live rows, so the temporal planner has
+    /// a history of `n` present versions to plan against.
+    fn minted_people_db_n(n: i64) -> Database {
+        use sqlite_core::rebuild::{build_recovered_db_tables, RecoveredTable as RT};
+        let rows = (1..=n)
+            .map(|i| vec![Value::Integer(i), Value::Text(format!("p{i}"))])
+            .collect();
+        let seed = vec![RT {
+            name: "people".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows,
+        }];
+        Database::open(build_recovered_db_tables(&seed)).expect("minted db opens")
+    }
+
+    /// The temporal planner produces one VERSION-HISTORY sheet per live table whose
+    /// header carries the real columns plus the eight temporal/flag columns, and
+    /// one row per live version (the minted db has no deletions, so each row is a
+    /// present/live version).
     #[test]
-    fn plan_combined_workbook_folds_recovered_into_live_sheets() {
+    fn plan_combined_workbook_builds_temporal_sheet_per_table() {
         let db = minted_people_db();
-        // A freelist record shaped (INTEGER, TEXT) → inferred match to `people`.
-        let records = vec![rec(
-            2,
-            0.9,
-            RecoverySource::FreelistPage,
-            vec![Value::Integer(2), Value::Text("deleted".into())],
-        )];
-        let plan = plan_combined_workbook(&db, &records, None, EXCEL_MAX_ROWS);
+        let plan = plan_combined_workbook(&db, &[], None, EXCEL_MAX_ROWS);
 
         let people = plan
             .sheets
             .iter()
             .find(|s| s.name == "people")
-            .expect("people combined sheet");
-        // Real header + the three flag columns.
-        assert_eq!(
-            people.columns,
-            [
-                "id",
-                "name",
-                "is_deleted",
-                "is_guessed",
-                "table_match_ambiguous"
-            ]
-            .map(String::from)
-        );
-        // Live row (rowid 1) + recovered row (rowid 2) interleaved.
-        assert_eq!(people.rows.len(), 2);
-        assert!(!people.rows[0].is_deleted, "live row first");
-        assert!(people.rows[1].is_deleted, "recovered row second");
-        // Folded as inferred → is_guessed column (index 3) is 1.
-        assert_eq!(people.rows[1].cells[3], Value::Integer(1));
-        // The inferred row folded into `people`, so there are no extra tables at
-        // all here (no Tier-3, no fragments) — and thus no recovered_inferred tab.
+            .expect("people version-history sheet");
+        // Real header + the eight temporal/flag columns.
+        assert_eq!(people.columns[0], "id");
+        assert_eq!(people.columns[1], "name");
+        assert_eq!(&people.columns[2..], &TEMPORAL_FLAG_COLS);
+        // One live (present) version, untinted.
+        assert_eq!(people.rows.len(), 1);
+        let r = &people.rows[0];
+        assert!(!r.is_deleted && !r.is_guessed && !r.rowid_reused && !r.superseded);
         assert!(
             plan.extra.is_empty(),
-            "inferred folds into the table sheet; no separate extra table"
+            "no residue, no fragments → no extra tables"
         );
         assert!(plan.dropped.is_empty(), "no truncation under the full cap");
     }
 
     /// A Tier-3 (dropped-table) record with no shape match becomes a row in the
-    /// separate `recovered_unattributed` extra table, never a live sheet.
+    /// separate `recovered_unattributed` extra table, never folded into a history.
     #[test]
     fn plan_combined_workbook_unattributed_goes_to_extra_table() {
         let db = minted_people_db();
+        // A 4-column dropped-table record matches no surviving table → Tier-3.
         let records = vec![rec(
             0,
             0.5,
             RecoverySource::DroppedTable,
-            vec![Value::Integer(9), Value::Text("ghost".into())],
+            vec![
+                Value::Text("a".into()),
+                Value::Text("b".into()),
+                Value::Text("c".into()),
+                Value::Text("d".into()),
+            ],
         )];
         let plan = plan_combined_workbook(&db, &records, None, EXCEL_MAX_ROWS);
         let extra_names: Vec<&String> = plan.extra.iter().map(|t| &t.name).collect();
@@ -4281,33 +3995,19 @@ mod tests {
             extra_names.iter().any(|n| *n == "recovered_unattributed"),
             "Tier-3 lands in recovered_unattributed: {extra_names:?}"
         );
-        // The people sheet has only its live row (no recovered fold).
+        // The people sheet has only its one live version (no fold of the Tier-3).
         let people = plan.sheets.iter().find(|s| s.name == "people").unwrap();
         assert_eq!(people.rows.len(), 1);
         assert!(!people.rows[0].is_deleted);
     }
 
-    /// A `row_cap` below a table's row count truncates the sheet and records the
-    /// drop as `(table, dropped_count)` so the shell can warn.
+    /// A `row_cap` below a table's version count truncates the sheet and records
+    /// the drop as `(table, dropped_count)` so the shell can warn.
     #[test]
     fn plan_combined_workbook_reports_row_cap_drops() {
-        let db = minted_people_db();
-        // Two recovered rows + one live row = 3 data rows; cap at 1 → 2 dropped.
-        let records = vec![
-            rec(
-                2,
-                0.9,
-                RecoverySource::FreelistPage,
-                vec![Value::Integer(2), Value::Text("a".into())],
-            ),
-            rec(
-                3,
-                0.9,
-                RecoverySource::FreelistPage,
-                vec![Value::Integer(3), Value::Text("b".into())],
-            ),
-        ];
-        let plan = plan_combined_workbook(&db, &records, None, 1);
+        // Three live rows → three present versions; cap at 1 → 2 dropped.
+        let db = minted_people_db_n(3);
+        let plan = plan_combined_workbook(&db, &[], None, 1);
         let drop = plan
             .dropped
             .iter()
@@ -4333,17 +4033,11 @@ mod tests {
     /// carve. The produced bytes still open in calamine.
     #[test]
     fn combined_xlsx_bytes_builds_and_warns_at_small_cap() {
-        let db = minted_people_db();
-        let records = vec![rec(
-            2,
-            0.9,
-            RecoverySource::FreelistPage,
-            vec![Value::Integer(2), Value::Text("deleted".into())],
-        )];
-        // Cap of 1: the people sheet (1 live + 1 recovered = 2 rows) is truncated,
-        // exercising the dropped-row warning loop.
-        let buf = combined_xlsx_bytes(&db, &records, None, Path::new("/out/x.recovered.xlsx"), 1)
-            .unwrap();
+        // Two live rows → two present versions; cap of 1 truncates the people
+        // version-history sheet, exercising the dropped-row warning loop.
+        let db = minted_people_db_n(2);
+        let buf =
+            combined_xlsx_bytes(&db, &[], None, Path::new("/out/x.recovered.xlsx"), 1).unwrap();
         assert!(!buf.is_empty());
         let _ = open_xlsx(&buf);
     }

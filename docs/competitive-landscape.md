@@ -11,8 +11,10 @@ schema** (residue from a dropped table mis-attributed to a recreated same-name
 table).
 
 We replicated the survey's scenario *construction* with the real `sqlite3` engine
-and measured our carver against two of the survey's tools on **identical bytes**:
-`bring2lite` and the SQLite Deleted Records Parser (SQL-DRP, Mari DeGrazia).
+and measured our carver against three of the survey's tools on **identical bytes**:
+`bring2lite`, `Undark` (v0.7.1), and the SQLite Deleted Records Parser (SQL-DRP,
+Mari DeGrazia). FQLite is cited from the paper (its headless tap was not set up in
+this run).
 
 - **On the B-tree rebalancing scenario, `bring2lite` produced 13 false positives
   (live rows reported as deleted; precision 0.705); our carver produced 0
@@ -68,14 +70,20 @@ ground-truth live/deleted sets. `precision = TP / (TP + FP)`,
 |---|---:|---:|---:|---:|---|
 | **sqlite4n6 (ours)** | 33 | **0** | **1.000** | 0.660 | measured (this repo, identical bytes) |
 | bring2lite | 31 | **13** | 0.705 | 0.620 | measured (this repo, identical bytes) |
+| Undark | 0 | **1** | 0.000 | 0.000 | measured (this repo, identical bytes) |
 | SQL-DRP | 5 | 0 | 1.000 | 0.100 | measured (this repo, identical bytes) |
-| Undark / Bring2Lite / FQLite | — | ~10 each | — | — | reported by the paper (its corpus) |
+| Bring2Lite / FQLite | — | ~10 each | — | — | reported by the paper (its corpus) |
 | SQLite Deleted Record Parser | — | 0 | — | (lower) | reported by the paper (its corpus) |
 
 The headline: on identical bytes, the freed-page carver (`bring2lite`) re-surfaces
 **13 live rows** as deleted; our live-rowid exclusion yields **0**. SQL-DRP, a
 metadata-only freeblock scanner, also avoids the live-row false positives but
 recovers far fewer truly-deleted rows (it does not chase whole freed pages).
+**Undark** recovers nothing truly-deleted from the freelist pages here and emits a
+single freespace fragment — whose id-tag (`ROW-56-…`) is a **live** row (id 56,
+range 51..80) surfaced as recovered: **1 false positive, 0 true positives**.
+Undark dumps a flat CSV with no live/deleted bucketing, so its lone recovery is a
+live-row fragment, exactly the survey's Type-\*\* weakness.
 
 ### 0B — overwritten table, same schema (residue denom = 10 OLD rows; 5 live NEW rows)
 
@@ -101,13 +109,16 @@ as schema-less unallocated blobs. (See "Ideas to steal" → rowid→table infere
 |---|---:|---:|---:|---:|---|
 | **sqlite4n6 (ours)** | 20 | 0 | 1.000 | 1.000 | measured (this repo, identical bytes) |
 | bring2lite | 20 | 0 | 1.000 | 1.000 | measured (this repo, identical bytes) |
+| Undark | 0 | 0 | n/a | 0.000 | measured (this repo, identical bytes) |
 | SQL-DRP | 0 | 0 | n/a | 0.000 | measured (this repo, identical bytes) |
 | Bring2Lite / FQLite | — | — | — | recover | reported by the paper (its corpus) |
-| Undark / SQLite-DRP | — | — | — | do not recover | reported by the paper (its corpus) |
+| SQLite-DRP | — | — | — | do not recover | reported by the paper (its corpus) |
 
 With `secure_delete=ON` the main image holds none of the message bodies; the only
 residue is in the uncheckpointed `-wal`. We and `bring2lite` (both WAL-aware)
-recover all 20; SQL-DRP (main-image only) recovers none — matching the survey.
+recover all 20; SQL-DRP and **Undark** (both main-image only — Undark has no `-wal`
+awareness) recover none, confirming the survey's main-image-vs-WAL split on
+identical bytes.
 
 > **One honest WAL artifact.** Our carve of `wcase.db` emits 21 records for 20
 > distinct deleted rowids: rowid 14 also appears once as a lower-confidence
@@ -130,9 +141,29 @@ recover all 20; SQL-DRP (main-image only) recovers none — matching the survey.
   It is Python 2; converted with `2to3` plus two minor bytes-vs-str fixes (the
   `b"SQLite"` header check and a bytes-aware `remove_ascii_non_printable`). TSV
   (`-f`/`-o`) mode; it reads the main image only and does not consult a `-wal`.
-- **Undark** and **FQLite** — **CITED, not run** here (no `UNDARK_BIN` / `FQLITE_TAP`
-  available in this run). Their false-positive figures here are the survey's reported
-  numbers on its corpus.
+- **Undark** (v0.7.1, Paul L. Daniels, C) — **RAN** on all three files.
+  [Repo](https://github.com/inflex/undark). Built from the master tarball (sha256
+  `c0a9ee7ebd180727deef52fbafe0ef0e2b7c9b43c5604761bfeb86bc9306912a`) with two
+  behavior-preserving clang/macOS patches (hoist the nested `swap64`/`ntohll` out
+  of `decode_row`; rename `ntohll` → `u_ntohll` to dodge the macOS
+  `<sys/_endian.h>` macro), then `make`. Gated on `UNDARK_BIN`; recipe in
+  `docs/validation.md` and `docs/corpus-catalog.md` §F.1. Undark emits a flat CSV
+  (`rowid,cols…`) with **no live/deleted bucketing** — it dumps every record it can
+  decode, including live b-tree rows — so on 0B it surfaces the 5 live NEW rows as
+  recovered, and on 0F its lone freespace fragment is a live row (id 56). It reads
+  the main image only (no `-wal`), so it recovers nothing from scenario 10 —
+  confirmed (0 records).
+- **FQLite** — **CITED, not run** in this pass. The tap is **not set up** here: this
+  worktree has no `tools/fqlite/` source-instrumentation tap, and FQLite's GUI
+  installer ships no runnable CLI (its command-line mode was removed at v2.0), so
+  driving it headlessly needs the source tap (clone at commit
+  `26922bd…`, null-guard the JavaFX `gui.add_table` calls in `Job.java`, stub the
+  `rag`/`erm` LLM packages, and compile the engine + `HeadlessTap.java` against
+  JavaFX 22 + commons-codec/jspecify/antlr/sqlite-jdbc). That build was out of
+  scope for this run, so **no FQLite number is fabricated** — its false-positive
+  figures here remain the survey's reported numbers on its corpus. The tap recipe
+  (gated on `FQLITE_TAP`) is documented in `docs/validation.md` and
+  `docs/corpus-catalog.md` §F.2 for a future run.
 
 > **Companion comparison — the Nemetz head-to-head.** `bring2lite` and SQL-DRP are
 > also wired as standing, env-gated oracles into the repo's third-party-ground-truth
@@ -149,14 +180,52 @@ recover all 20; SQL-DRP (main-image only) recovers none — matching the survey.
 - **Replicated corpus, not the survey's bytes.** The survey's official corpus is
   not yet public; these are real-engine replications of its construction. When the
   corpus is released, swap it in and re-measure (tracked in the fixtures README).
-- **Throughput unmeasured here.** The survey reports execution time on a 100 MB DB
-  (Undark 2.94 s, SQLite-DRP 3.97 s, FQLite 13.62 s, Bring2Lite 21.89 s,
-  reported by the paper). Our fixtures are small; we report no throughput number
-  rather than an apples-to-oranges one.
+- **Throughput is now measured (see "Throughput" below).** On a locally-generated
+  ~100 MB image our `carve --format jsonl` runs in a median **15.3 s** (release,
+  Apple M4 Pro); the survey's numbers are on *its own* 100 MB DB on a *different*
+  machine and are not directly comparable, but anchor the order of magnitude.
 - **Recall is not the headline.** The identical-bytes recall numbers differ by
   scenario and tool, but the survey's contribution — and ours here — is about
   **false positives** and **substrate coverage** (WAL vs main-image), not a recall
   leaderboard across different corpora.
+
+## Throughput
+
+The survey reports execution time on a 100 MB database. We measured our carver on
+a **locally-generated ~100 MB** messages-like image (210k → 178k rows, an 80k-row
+contiguous middle subset DELETEd, `secure_delete=OFF`, `auto_vacuum=NONE`;
+generator `tests/data/paper_fp/gen_large.py`, gitignored DB). Methodology:
+**wall-clock over 5 runs, median reported**, release build, on the local machine
+noted below. The carve recovers 79,904 of the 80,000 deleted rows (0.9988) with
+**0** live false positives — correctness holds at scale, pinned by the env-gated
+perf-smoke `forensic/tests/perf_large_carve.rs` (`SQLITE_FORENSIC_PERF_DB`).
+
+**Measured here (this repo, local machine — Apple M4 Pro, macOS):**
+
+| Tool / mode | Median wall-clock | Records emitted | Notes |
+|---|---:|---:|---|
+| `sqlite4n6 carve --format jsonl` | **15.3 s** | 79,904 deleted | streams JSONL; deleted-only, 0 live FP |
+| `sqlite4n6 carve --db` | **39.7 s** | 79,904 deleted | also rebuilds a 45 MB carved `.db` + 8.5 MB `.xlsx` |
+| Undark (`-i`) | **1.45 s** | 177,906 (flat dump) | dumps the **whole b-tree** (live + freespace), no live/deleted split |
+
+**Reported by the paper (its own 100 MB DB, a different machine — NOT directly
+comparable; an order-of-magnitude anchor only):**
+
+| Tool | Reported time |
+|---|---:|
+| Undark | 2.94 s |
+| SQLite-DRP | 3.97 s |
+| FQLite | 13.62 s |
+| Bring2Lite | 21.89 s |
+
+The two tables measure different things. Our `jsonl` figure is the cost of
+recovering **only deleted** records with live-rowid exclusion and per-record
+attribution; Undark's 1.45 s is a single linear b-tree dump with no live/deleted
+separation (it emits ~178k rows, almost all live). The cross-machine paper numbers
+are not an apples-to-apples leaderboard — the apples-to-apples cell is the
+local Undark row, run on the **same** bytes as our carve. As with recall,
+throughput is not the headline: the survey's contribution and ours is **false
+positives** and **substrate coverage**, not raw speed.
 
 ## Ideas to steal (survey → our backlog)
 

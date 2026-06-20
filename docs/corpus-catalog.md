@@ -475,6 +475,33 @@ third-party content); full provenance + recipes + md5s in
   (`ALTER TABLE … ADD COLUMN`). Live schema cookie (2) advanced past the journal's
   prior page-1 image cookie (1), so SCHEMA-CHANGE fires with both values shown.
 
+## §M `tests/data/paper_fp/large_messages.db`  (throughput benchmark, generated, **not committed**)
+
+A ~100 MB messages-like database for the throughput benchmark that sits alongside
+the survey's reported 100 MB timings (see `docs/competitive-landscape.md`
+"Throughput"). Real-engine / minted-input tier: built by the committed generator
+`tests/data/paper_fp/gen_large.py` via Python's stdlib `sqlite3`, deterministic on
+the same engine. The **DB is large and gitignored** — documented here, downloaded
+on demand, read in place by an env-gated test — exactly like §G and the other
+large artifacts.
+
+- Classification: `REAL-engine` (minted with the public-domain SQLite engine, no
+  third-party content), confidence `✓` (generated and carved).
+- Construction: one `messages(id INTEGER PRIMARY KEY, ts, sender, body)` table,
+  178,000 rows with ~512-byte id-tagged bodies (`MSG-<id>-…`), `secure_delete=OFF`,
+  `auto_vacuum=NONE`; then `DELETE WHERE id BETWEEN 40001 AND 120000` (an 80k-row
+  contiguous middle subset, leaving live rows on both sides). Lands at ~100 MB
+  on disk (freed pages retained). The deleted range is written to a sidecar
+  `<db>.deleted.json` manifest so the test reads ground truth without hardcoding.
+- Test gate: `SQLITE_FORENSIC_PERF_DB` (absolute path to the generated `.db`). The
+  perf-smoke `forensic/tests/perf_large_carve.rs` carves it, asserts the deleted
+  subset is recovered with zero live false positives, and enforces a generous
+  120 s wall-clock ceiling so a catastrophic perf regression fails CI. It **skips
+  cleanly** when the var is unset or the file is absent — a plain `cargo test`
+  stays green and fast.
+- Generate: `python3 tests/data/paper_fp/gen_large.py [out.db]` (defaults to
+  `$SQLITE_FORENSIC_PERF_DB` or `large_messages.db` beside the script).
+
 ## §H MD5 manifest
 
 Committed fixtures (under `tests/data/`, `tests/data/`):

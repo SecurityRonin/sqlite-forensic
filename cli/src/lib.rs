@@ -1519,6 +1519,103 @@ pub fn render_combined_xlsx(
     workbook.save_to_buffer()
 }
 
+/// A planned combined workbook: the per-table combined `sheets` (live + recovered
+/// folded by rowid), the separate `extra` tables (`recovered_unattributed`,
+/// `recovered_fragments`), and the `dropped` `(table, count)` pairs for any sheet
+/// truncated to the Excel row cap (empty when nothing was dropped).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CombinedWorkbook {
+    /// One combined sheet per live user table, in live-table order.
+    pub sheets: Vec<MergedSheet>,
+    /// The separate Tier-3 / fragment tables (each a whole-recovered sheet).
+    pub extra: Vec<RecoveredTable>,
+    /// `(table, dropped_row_count)` for each sheet truncated to `row_cap`.
+    pub dropped: Vec<(String, usize)>,
+}
+
+/// Plan the combined live + recovered workbook from the open evidence database,
+/// the carved records, and the optional fragments.
+///
+/// Each live user table ([`Database::live_table_rows`]) becomes one combined
+/// sheet: its live rows with the attributed recovered rows folded in by rowid
+/// ([`route_recovered`] + [`merge_table_sheet`]). Tier-1 `Known` and Tier-2
+/// `Inferred` rows fold into their (guessed) table's sheet; Tier-3 rows and any
+/// inferred guess to a non-existent table go to a separate `recovered_unattributed`
+/// table, and `fragments` (when `Some`) to `recovered_fragments` — both built by
+/// the existing [`group_into_tables`] writer. A sheet exceeding `row_cap` is
+/// truncated and the drop recorded in `dropped` (the shell warns; never silent).
+#[must_use]
+pub fn plan_combined_workbook(
+    db: &Database,
+    records: &[CarvedRecord],
+    fragments: Option<&[CarvedFragment]>,
+    row_cap: usize,
+) -> CombinedWorkbook {
+    let dumps = db.live_table_rows();
+    let live_names: Vec<String> = dumps.iter().map(|d| d.name.clone()).collect();
+    let attributions = attribute_records(db, records);
+    let mut routed = route_recovered(&live_names, records, &attributions);
+
+    let mut sheets = Vec::with_capacity(dumps.len());
+    let mut dropped = Vec::new();
+    for dump in &dumps {
+        let recovered = routed.by_table.remove(&dump.name).unwrap_or_default();
+        let (sheet, n) = merge_table_sheet(
+            &dump.name,
+            &dump.column_names,
+            &dump.rows,
+            recovered,
+            row_cap,
+        );
+        if n > 0 {
+            dropped.push((dump.name.clone(), n));
+        }
+        sheets.push(sheet);
+    }
+
+    // Tier-3 (+ unrouteable inferred) records and fragments become the separate
+    // extra tables, reusing the existing grouping writer with every record marked
+    // Unattributed (so it emits exactly recovered_unattributed + fragments).
+    let unattr_records: Vec<CarvedRecord> = routed
+        .unattributed
+        .iter()
+        .map(|&i| records[i].clone())
+        .collect();
+    let unattr_attrs = vec![Attribution::Unattributed; unattr_records.len()];
+    let extra = group_into_tables(&unattr_records, &unattr_attrs, &[], fragments);
+
+    CombinedWorkbook {
+        sheets,
+        extra,
+        dropped,
+    }
+}
+
+/// Build the combined live + recovered `.xlsx` bytes, warning on stderr for any
+/// sheet truncated to the Excel row cap, and mapping any [`XlsxError`] to an
+/// actionable string keyed by `path`.
+///
+/// This is the String-returning façade the binary shell calls: it plans the
+/// workbook ([`plan_combined_workbook`] at the [`EXCEL_MAX_ROWS`] cap), emits one
+/// `eprintln!` per dropped-row warning (naming the table and the count, so a
+/// truncation is never silent), and renders the bytes via [`render_combined_xlsx`].
+pub fn combined_xlsx_bytes(
+    db: &Database,
+    records: &[CarvedRecord],
+    fragments: Option<&[CarvedFragment]>,
+    path: &Path,
+) -> Result<Vec<u8>, String> {
+    let plan = plan_combined_workbook(db, records, fragments, EXCEL_MAX_ROWS);
+    for (table, count) in &plan.dropped {
+        eprintln!(
+            "warning: table {table} exceeds Excel's {EXCEL_MAX_ROWS}-row limit; \
+             dropped {count} row(s) from the {table} sheet"
+        );
+    }
+    render_combined_xlsx(&plan.sheets, &plan.extra)
+        .map_err(|e| format!("cannot build recovered xlsx {}: {e}", path.display()))
+}
+
 /// Write one [`RecoveredTable`] to a worksheet: bold header from `columns`, then
 /// one recovered-marked row per row, each cell by storage class.
 fn write_table_sheet(
@@ -3537,7 +3634,7 @@ mod tests {
 
     /// The planner produces one combined sheet per live table with the recovered
     /// rows folded in; an inferred match folds into the guessed table's sheet and
-    /// reads is_guessed=1. Tier-3 / fragments become separate extra tables, and
+    /// reads `is_guessed=1`. Tier-3 / fragments become separate extra tables, and
     /// there is no `recovered_inferred` table.
     #[test]
     fn plan_combined_workbook_folds_recovered_into_live_sheets() {
@@ -3607,7 +3704,7 @@ mod tests {
         assert!(!people.rows[0].is_deleted);
     }
 
-    /// A row_cap below a table's row count truncates the sheet and records the
+    /// A `row_cap` below a table's row count truncates the sheet and records the
     /// drop as `(table, dropped_count)` so the shell can warn.
     #[test]
     fn plan_combined_workbook_reports_row_cap_drops() {

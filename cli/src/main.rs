@@ -16,9 +16,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlite4n6::{
-    carve_wal_snapshots, filter_by_confidence, group_attributed_tables, recovered_output_path,
-    recovered_tables_xlsx_bytes, recovered_xlsx_path, render_audit, render_carve,
-    render_carve_tiered, render_carve_with_snapshot, render_fragments, MinConfidence, OutputFormat,
+    carve_wal_snapshots, combined_xlsx_bytes, filter_by_confidence, group_attributed_tables,
+    recovered_output_path, recovered_xlsx_path, render_audit, render_carve, render_carve_tiered,
+    render_carve_with_snapshot, render_fragments, MinConfidence, OutputFormat,
 };
 use sqlite_core::rebuild::build_recovered_db_tables;
 use sqlite_core::Database;
@@ -248,12 +248,15 @@ fn run_carve_rebuild(args: &CarveArgs) -> Result<(), String> {
     std::fs::write(&out_path, &bytes)
         .map_err(|e| format!("cannot write recovered db {}: {e}", out_path.display()))?;
 
-    // `--xlsx`: additionally write the spreadsheet companion beside the db,
-    // honoring the db's stem. One sheet per recovered table (sanitized name),
-    // built to an in-memory buffer by the library; this shell only writes bytes.
+    // `--xlsx`: additionally write the COMBINED workbook companion beside the db,
+    // honoring the db's stem. The source DB is dumped one sheet per live table
+    // with the recovered (deleted) rows folded back in by rowid (marked
+    // is_deleted / is_guessed, tinted), unattributed rows + fragments in separate
+    // tabs. Built to an in-memory buffer by the library; this shell only writes
+    // bytes (and the library warns on stderr for any >1M-row sheet truncation).
     let xlsx_path = if args.xlsx {
         let path = recovered_xlsx_path(&out_path);
-        let xlsx_bytes = recovered_tables_xlsx_bytes(&tables, &path)?;
+        let xlsx_bytes = combined_xlsx_bytes(&db, &records, fragments.as_deref(), &path)?;
         std::fs::write(&path, &xlsx_bytes)
             .map_err(|e| format!("cannot write recovered xlsx {}: {e}", path.display()))?;
         Some(path)

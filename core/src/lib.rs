@@ -4970,4 +4970,105 @@ mod tests {
         );
         assert_eq!(WalChecksumEndian::from_magic(0xdead_beef), None);
     }
+
+    // --- per-commit schema (CommitSnapshot::tables) -------------------------
+
+    /// Wrap a minted main-db image into a `(main, wal)` pair whose WAL commits a
+    /// full rewrite of every page in ONE commit, with correct §4.2 checksums (so
+    /// the snapshot is checksum-valid). The snapshot then materializes exactly the
+    /// minted db, with its real page-1 sqlite_master b-tree — the no-sqlite3 way to
+    /// drive `CommitSnapshot::tables` / snapshot reads against a genuine schema.
+    fn wrap_db_in_wal(main: &[u8], page_size: u32) -> Vec<u8> {
+        let ps = page_size as usize;
+        let n_pages = main.len() / ps;
+        let endian = WalChecksumEndian::Little; // arbitrary; matches magic below.
+        let (salt1, salt2) = (0x1234_5678u32, 0x9abc_def0u32);
+
+        let mut wal = vec![0u8; 32];
+        wal[0..4].copy_from_slice(&0x377f_0682u32.to_be_bytes()); // little-endian magic
+        wal[4..8].copy_from_slice(&3_007_000u32.to_be_bytes());
+        wal[8..12].copy_from_slice(&page_size.to_be_bytes());
+        wal[12..16].copy_from_slice(&1u32.to_be_bytes());
+        wal[16..20].copy_from_slice(&salt1.to_be_bytes());
+        wal[20..24].copy_from_slice(&salt2.to_be_bytes());
+        // Header checksum over the first 24 bytes (the seed for the frame chain).
+        let (mut s0, mut s1) = wal_checksum(endian, 0, 0, &wal[0..24]);
+        wal[24..28].copy_from_slice(&s0.to_be_bytes());
+        wal[28..32].copy_from_slice(&s1.to_be_bytes());
+
+        for i in 0..n_pages {
+            let page_no = (i + 1) as u32;
+            let db_size = if i + 1 == n_pages { n_pages as u32 } else { 0 };
+            let mut fh = [0u8; 24];
+            fh[0..4].copy_from_slice(&page_no.to_be_bytes());
+            fh[4..8].copy_from_slice(&db_size.to_be_bytes());
+            fh[8..12].copy_from_slice(&salt1.to_be_bytes());
+            fh[12..16].copy_from_slice(&salt2.to_be_bytes());
+            let data = &main[i * ps..(i + 1) * ps];
+            let (n0, n1) = wal_checksum(endian, s0, s1, &fh[0..8]);
+            let (n0, n1) = wal_checksum(endian, n0, n1, data);
+            s0 = n0;
+            s1 = n1;
+            fh[16..20].copy_from_slice(&s0.to_be_bytes());
+            fh[20..24].copy_from_slice(&s1.to_be_bytes());
+            wal.extend_from_slice(&fh);
+            wal.extend_from_slice(data);
+        }
+        wal
+    }
+
+    #[test]
+    fn snapshot_tables_reads_schema_from_its_own_page_one() {
+        use crate::rebuild::{build_recovered_db_tables, RecoveredTable as RT};
+        let seed = vec![RT {
+            name: "people".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![
+                vec![Value::Integer(1), Value::Text("alice".into())],
+                vec![Value::Integer(2), Value::Text("bob".into())],
+            ],
+        }];
+        let main = build_recovered_db_tables(&seed);
+        let ps = parse_header(&main).unwrap().page_size;
+        let wal = wrap_db_in_wal(&main, ps);
+
+        let db = Database::open_with_wal(main, &wal).unwrap();
+        let tl = db.wal_timeline().unwrap();
+        let snap = tl.commit_snapshots().last().unwrap();
+        assert!(snap.checksum_valid(), "minted WAL must be checksum-valid");
+
+        let tables = snap.tables();
+        let people = tables
+            .iter()
+            .find(|t| t.name == "people")
+            .expect("table 'people' present in snapshot schema");
+        assert!(people.rootpage >= 2, "rootpage points past page 1");
+        assert_eq!(people.columns, vec!["id".to_string(), "name".to_string()]);
+        assert!(!people.without_rowid, "an ordinary rowid table");
+        // Internal sqlite_* tables are excluded.
+        assert!(tables.iter().all(|t| !t.name.starts_with("sqlite_")));
+    }
+
+    #[test]
+    fn without_rowid_sql_detects_the_clause() {
+        // The WITHOUT ROWID detector keys off the CREATE TABLE tail, tolerant of
+        // case and whitespace, and does NOT misfire on the literal appearing inside
+        // a quoted string / column name (file-format §2.4). A WITHOUT ROWID b-tree
+        // has no rowid key, so this flag gates the snapshot-scoped rowid read.
+        assert!(without_rowid_sql(
+            "CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID"
+        ));
+        assert!(without_rowid_sql(
+            "CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT)  without   rowid"
+        ));
+        // Ordinary tables are NOT flagged.
+        assert!(!without_rowid_sql(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)"
+        ));
+        // A column literally named with the words, but not the trailing clause, is
+        // not a false positive.
+        assert!(!without_rowid_sql(
+            "CREATE TABLE t(\"without rowid\" TEXT, x INT)"
+        ));
+    }
 }

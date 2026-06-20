@@ -26,7 +26,7 @@ use sqlite_core::rebuild::build_recovered_db_tables;
 use sqlite_core::Database;
 use sqlite_forensic::{
     attribute_records, audit, audit_journal, carve_all_deleted_records, carve_rollback_journal,
-    carve_with_fragments, table_instance_risks, Anomaly, CarvedFragment, CarvedRecord,
+    carve_with_fragments, table_instance_risks_with_sidecar, Anomaly, CarvedFragment, CarvedRecord,
     JournalRecovery,
 };
 
@@ -276,6 +276,55 @@ fn recover_journal(args: &CarveArgs, db: &Database) -> Result<Option<JournalReco
     Ok(Some(carve_rollback_journal(db, &journal_bytes)))
 }
 
+/// The sidecar's PRIOR `sqlite_master` as `name -> CREATE SQL`, for Detector B
+/// (`docs/design/drop-recreate-attribution.md`). Resolves whichever sidecar is in
+/// play under the same policy as the carve:
+///
+/// - **`-wal`:** the OLD state is the main db file BEFORE the WAL is applied, so
+///   the prior schema is the base bytes opened WITHOUT the WAL ([`Database::open`]
+///   → [`Database::schema_sql`]). The WAL-applied current schema is read by the
+///   detector from the supplied `db`.
+/// - **`-journal`:** the prior snapshot the journal preserves
+///   ([`Database::rollback_prior`] → `PriorSnapshot::schema_sql`).
+///
+/// Returns an EMPTY map when no sidecar applies, so Detector B stays silent (the
+/// detector runs A only). Reads the evidence + sidecars as owned bytes; never
+/// opens them read-write. A read/parse failure degrades to an empty prior schema
+/// (Detector B silent) rather than failing the carve — the sidecar's own
+/// loud-error path is the carve/journal recovery above; Detector B is an additive
+/// hint and never the reason a carve aborts.
+fn sidecar_prior_schema(args: &CarveArgs) -> std::collections::BTreeMap<String, String> {
+    let empty = std::collections::BTreeMap::new();
+    if let Some(wal_path) = resolve_wal_path(args) {
+        // -wal: the prior state is the base db file WITHOUT the WAL overlay.
+        let _ = &wal_path; // presence is the signal; the base bytes carry the schema.
+        let Ok(base_bytes) = std::fs::read(&args.db) else {
+            return empty;
+        };
+        let Ok(base) = Database::open(base_bytes) else {
+            return empty;
+        };
+        return base.schema_sql();
+    }
+    if let Some(journal_path) = resolve_journal_path(args) {
+        // -journal: the prior snapshot's own sqlite_master.
+        let Ok(db_bytes) = std::fs::read(&args.db) else {
+            return empty;
+        };
+        let Ok(db) = Database::open(db_bytes) else {
+            return empty;
+        };
+        let Ok(journal_bytes) = std::fs::read(&journal_path) else {
+            return empty;
+        };
+        let Ok(prior) = db.rollback_prior(&journal_bytes) else {
+            return empty;
+        };
+        return prior.schema_sql();
+    }
+    empty
+}
+
 fn run_carve(args: &CarveArgs) -> Result<(), String> {
     if args.writes_xlsx() {
         return run_carve_files(args);
@@ -307,13 +356,17 @@ fn run_carve_files(args: &CarveArgs) -> Result<(), String> {
     // combined workbook below; `None` when no journal applies.
     let journal = recover_journal(args, &db)?;
 
+    // The sidecar's PRIOR schema (`name -> CREATE SQL`) drives Detector B's
+    // `sidecar_schema_changed(table)` hint; empty when no `-wal`/`-journal` applies.
+    let prior_schema = sidecar_prior_schema(args);
+
     // `--db`: ALSO write the rebuilt carved database. Group every carved record
     // into its attribution tier — recovered_<table> (CERTAIN, real column names),
     // recovered_inferred (consistent-with + an ambiguity flag),
     // recovered_unattributed (unknown), plus recovered_fragments. Written first so
     // an unwritable db path fails before the (larger) xlsx work.
     if let Some(path) = &db_path {
-        let tables = group_attributed_tables(&db, &records, fragments.as_deref());
+        let tables = group_attributed_tables(&db, &records, fragments.as_deref(), &prior_schema);
         let bytes = build_recovered_db_tables(&tables);
         std::fs::write(path, &bytes)
             .map_err(|e| format!("cannot write carved db {}: {e}", path.display()))?;
@@ -329,6 +382,7 @@ fn run_carve_files(args: &CarveArgs) -> Result<(), String> {
         &records,
         fragments.as_deref(),
         journal.as_ref(),
+        &prior_schema,
         &xlsx_path,
         EXCEL_MAX_ROWS,
     )?;
@@ -427,6 +481,10 @@ fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
     let db_bytes = std::fs::read(&args.db)
         .map_err(|e| format!("cannot read database {}: {e}", args.db.display()))?;
 
+    // The sidecar PRIOR schema for Detector B's `_table_instance_risk` token;
+    // empty when no `-wal`/`-journal` applies (Detector A only).
+    let prior_schema = sidecar_prior_schema(args);
+
     // A WAL is in play: open the WAL-applied view, enumerate every materializable
     // state (on-disk base image, each commit snapshot, WAL-frame residue), and
     // render with the snapshot (LSN) column.
@@ -444,7 +502,7 @@ fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
         };
         let records = filter_by_confidence(records, args.min_confidence.into());
         let attrs = attribute_records(&db, &records);
-        let risks = table_instance_risks(&db, &records, &attrs);
+        let risks = table_instance_risks_with_sidecar(&db, &records, &attrs, &prior_schema);
         for line in render_carve_with_snapshot(&records, &risks, fmt, args.rowid_only) {
             println!("{line}");
         }
@@ -472,7 +530,7 @@ fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
             let mut full = filter_by_confidence(tiers.full, args.min_confidence.into());
             full.extend(journal_records);
             let attrs = attribute_records(&db, &full);
-            let risks = table_instance_risks(&db, &full, &attrs);
+            let risks = table_instance_risks_with_sidecar(&db, &full, &attrs, &prior_schema);
             for line in render_carve_tiered(&full, &risks, &tiers.fragments, fmt, args.rowid_only) {
                 println!("{line}");
             }
@@ -481,7 +539,7 @@ fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
                 filter_by_confidence(carve_all_deleted_records(&db), args.min_confidence.into());
             records.extend(journal_records);
             let attrs = attribute_records(&db, &records);
-            let risks = table_instance_risks(&db, &records, &attrs);
+            let risks = table_instance_risks_with_sidecar(&db, &records, &attrs, &prior_schema);
             for line in render_carve(&records, &risks, fmt, args.rowid_only) {
                 println!("{line}");
             }

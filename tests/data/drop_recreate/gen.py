@@ -123,6 +123,68 @@ def gen_upd_autoinc():
     return path
 
 
+def _connect_persist(path):
+    """Like `_connect` but in PERSIST journal mode, so the rollback `-journal`
+    SURVIVES the commit (header zeroed, page images intact) — the prior schema
+    the Detector-B sidecar read recovers."""
+    con = _connect(path)
+    con.execute("PRAGMA journal_mode=PERSIST")
+    return con
+
+
+def gen_b_journal_altered():
+    """`b_journal_altered.db` + `-journal` — Detector B FIRES (sidecar schema change).
+
+    `students` (id, name): INSERT 10, DELETE id>=4 (leaving recoverable residue in
+    its pages), then — as the LAST, journaled transaction — `ALTER TABLE students
+    ADD COLUMN extra`. The PERSIST `-journal` preserves the prior page-1 schema,
+    whose CREATE SQL has NO `extra` column while the current schema does, so the
+    prior-vs-current CREATE SQL differ → Detector B fires for `students` on the
+    residue attributed to it. Ground truth: an unambiguous table-level schema
+    change captured in the sidecar (a CREATE/ALTER within the window).
+    """
+    path = os.path.join(HERE, "b_journal_altered.db")
+    con = _connect_persist(path)
+    con.execute("CREATE TABLE students(id INTEGER PRIMARY KEY, name TEXT)")
+    con.executemany(
+        "INSERT INTO students(id, name) VALUES (?, ?)",
+        [(i, "DEL-NAME-%d" % i) for i in range(1, 11)],
+    )
+    con.commit()
+    con.execute("DELETE FROM students WHERE id >= 4")
+    con.commit()
+    con.execute("ALTER TABLE students ADD COLUMN extra TEXT")
+    con.commit()
+    con.close()
+    return path
+
+
+def gen_b_journal_dml():
+    """`b_journal_dml.db` + `-journal` — Detector B does NOT fire (anti-FP case).
+
+    Identical setup to `b_journal_altered` through the DELETE, but the LAST
+    (journaled) transaction is DML only — `INSERT INTO students VALUES(99,...)`.
+    The PERSIST `-journal`'s prior page-1 carries the SAME CREATE SQL as current,
+    so Detector B stays silent — the false-predecessor hint the design refuses to
+    raise on a no-schema-change transaction. Ground truth: a DML-only boundary,
+    not a schema change.
+    """
+    path = os.path.join(HERE, "b_journal_dml.db")
+    con = _connect_persist(path)
+    con.execute("CREATE TABLE students(id INTEGER PRIMARY KEY, name TEXT)")
+    con.executemany(
+        "INSERT INTO students(id, name) VALUES (?, ?)",
+        [(i, "DEL-NAME-%d" % i) for i in range(1, 11)],
+    )
+    con.commit()
+    con.execute("DELETE FROM students WHERE id >= 4")
+    con.commit()
+    con.execute("INSERT INTO students(id, name) VALUES (99, 'LATER')")
+    con.commit()
+    con.close()
+    return path
+
+
 def md5(path):
     import hashlib
 
@@ -137,12 +199,26 @@ def main():
     a = gen_b_autoinc()
     p = gen_b_plainpk()
     u = gen_upd_autoinc()
-    for label, path in (
+    alt = gen_b_journal_altered()
+    dml = gen_b_journal_dml()
+    files = [
         ("b_autoinc.db", a),
         ("b_plainpk.db", p),
         ("upd_autoinc.db", u),
-    ):
-        print("%-16s %s  %d bytes" % (label, md5(path), os.path.getsize(path)))
+        ("b_journal_altered.db", alt),
+        ("b_journal_dml.db", dml),
+    ]
+    # The `-journal` sidecars (Detector B) carry their own provenance line; their
+    # md5 varies per run (the journal embeds a random checksum nonce), so they are
+    # listed for completeness but the `.db` files are the deterministic anchors.
+    for label, path in files:
+        print("%-24s %s  %d bytes" % (label, md5(path), os.path.getsize(path)))
+        jrnl = path + "-journal"
+        if os.path.exists(jrnl):
+            print(
+                "%-24s %s  %d bytes"
+                % (os.path.basename(jrnl), md5(jrnl), os.path.getsize(jrnl))
+            )
 
 
 if __name__ == "__main__":

@@ -1435,6 +1435,27 @@ impl Database {
         tables
     }
 
+    /// The live `sqlite_master` as a `name -> CREATE SQL` map for every **user**
+    /// table (internal `sqlite_*` tables excluded) — the CURRENT-schema half of
+    /// the Detector-B sidecar schema-change comparison
+    /// (`docs/design/drop-recreate-attribution.md`).
+    ///
+    /// Reads the same page-1 schema b-tree as [`Self::live_tables`] but keeps the
+    /// raw CREATE SQL text (not just parsed columns), so a caller can compare the
+    /// verbatim schema against a sidecar's prior `sqlite_master`. Best-effort,
+    /// bounded, panic-free: an unreadable schema yields an empty map.
+    #[must_use]
+    pub fn schema_sql(&self) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        let Ok(schema) = self.read_table(1, 5) else {
+            return out; // cov:unreachable: a validly-opened DB has a readable page-1 schema
+        };
+        for row in schema {
+            schema_sql_insert(&mut out, &row.values);
+        }
+        out
+    }
+
     /// Per-table, per-rowid VERSION HISTORY reconstructed from this database's WAL
     /// temporal model (or just the live view when no `-wal` is present).
     ///
@@ -1911,6 +1932,30 @@ impl PageSource for CommitSnapshot {
 /// Walk a single table b-tree rooted at `root_page` over any [`PageSource`],
 /// collecting every leaf row as typed values. The one implementation shared by
 /// the live and snapshot-scoped reads.
+/// Insert a `sqlite_master` row's `name -> CREATE SQL` into `out` when the row is
+/// a **user** table (`type='table'`, name not `sqlite_*`). Shared by
+/// [`Database::schema_sql`] and [`PriorSnapshot::schema_sql`] so the live and
+/// prior reads classify schema rows identically. A row that is not a user-table
+/// row (an index/view/trigger, an internal table, or a malformed row) is skipped.
+fn schema_sql_insert(out: &mut std::collections::BTreeMap<String, String>, values: &[Value]) {
+    // sqlite_master row: (type, name, tbl_name, rootpage, sql).
+    let is_table = matches!(values.first(), Some(Value::Text(t)) if t == "table");
+    if !is_table {
+        return;
+    }
+    let Some(Value::Text(name)) = values.get(1) else {
+        return; // cov:unreachable: a 'table' schema row has a TEXT name
+    };
+    if name.starts_with("sqlite_") {
+        return;
+    }
+    let sql = match values.get(4) {
+        Some(Value::Text(s)) => s.clone(),
+        _ => String::new(), // cov:unreachable: a 'table' schema row carries its CREATE TABLE sql
+    };
+    out.insert(name.clone(), sql);
+}
+
 fn read_table_via(
     src: &dyn PageSource,
     root_page: u32,
@@ -4473,6 +4518,27 @@ impl PriorSnapshot {
                 columns,
                 without_rowid: without_rowid_sql(sql),
             });
+        }
+        out
+    }
+
+    /// The PRIOR `sqlite_master` as a `name -> CREATE SQL` map for every **user**
+    /// table, parsed from the snapshot's OWN page 1 — the prior-schema half of the
+    /// Detector-B sidecar schema-change comparison
+    /// (`docs/design/drop-recreate-attribution.md`).
+    ///
+    /// The counterpart to [`Database::schema_sql`] read against the pre-transaction
+    /// state the `-journal` preserves, so a DROP/CREATE/ALTER in the last
+    /// transaction is interpreted against the prior schema. Best-effort and
+    /// panic-free: an unreadable prior page-1 schema yields an empty map.
+    #[must_use]
+    pub fn schema_sql(&self) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        let Ok(schema) = read_table_via(self, 1, 5) else {
+            return out; // cov:unreachable: the prior snapshot has a readable page 1
+        };
+        for row in schema {
+            schema_sql_insert(&mut out, &row.values);
         }
         out
     }

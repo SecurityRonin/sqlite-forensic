@@ -1,22 +1,33 @@
 # Drop-recreate residue fixtures — `tests/data/drop_recreate/`
 
-Three small SQLite databases that exercise the `table_instance_risk` diagnostic
-HINT flag (Detector A — AUTOINCREMENT high-water reconciliation) specified in
+Small SQLite databases that exercise the `table_instance_risk` diagnostic HINT
+flag — **Detector A** (AUTOINCREMENT high-water reconciliation) and **Detector B**
+(sidecar `-wal`/`-journal` schema-change) — specified in
 [`../../../docs/design/drop-recreate-attribution.md`](../../../docs/design/drop-recreate-attribution.md).
 
-The flag fires only when a residue record attributed to an AUTOINCREMENT table
-has `rowid > sqlite_sequence`. The design REJECTS treating that as proof of a
-dropped predecessor — `r > seq` is also reachable by an `UPDATE` of the rowid or
-a manual `sqlite_sequence` edit — so the flag is surfaced as a hint that names
-its evidence (the rowid and the seq), never as an assertion.
+**Detector A** fires only when a residue record attributed to an AUTOINCREMENT
+table has `rowid > sqlite_sequence`. The design REJECTS treating that as proof of
+a dropped predecessor — `r > seq` is also reachable by an `UPDATE` of the rowid or
+a manual `sqlite_sequence` edit — so the flag is surfaced as a hint that names its
+evidence (the rowid and the seq), never as an assertion.
+
+**Detector B** is a TABLE-LEVEL boundary hint: it fires only when a `-wal`/
+`-journal` sidecar's PRIOR `sqlite_master` shows a table `T` **absent** OR with a
+**different CREATE SQL text** than the current schema (an unambiguous CREATE/ALTER
+or drop+recreate within the captured window). It does NOT fire on a DML-only
+transaction, a rootpage move with identical SQL (VACUUM), or a same-schema
+drop+recreate — and is NOT row-level provenance. The `b_journal_*` pair carries a
+PERSIST `-journal` so the prior schema survives the commit for the sidecar read.
 
 ## The fixtures
 
-| File | Construction | sqlite_sequence | Flag |
+| File | Construction | Signal | Flag |
 |---|---|---|---|
-| `b_autoinc.db` | AUTOINCREMENT `students`, INSERT 10, DROP, CREATE same schema, INSERT 5 | `students=5` | **fires** on residue rowids 6..10 |
-| `b_plainpk.db` | same, but plain `INTEGER PRIMARY KEY` (no AUTOINCREMENT) | absent | **never fires** (honest limit) |
-| `upd_autoinc.db` | AUTOINCREMENT `t`, INSERT id=5, `UPDATE id->1000`, DELETE | `t=5` | **fires** on residue rowid 1000 — Codex BLOCKER-1: the row was a *current* instance row, proving the flag is a HINT not a predecessor assertion |
+| `b_autoinc.db` | AUTOINCREMENT `students`, INSERT 10, DROP, CREATE same schema, INSERT 5 | `sqlite_sequence(students)=5` | Detector A **fires** on residue rowids 6..10 |
+| `b_plainpk.db` | same, but plain `INTEGER PRIMARY KEY` (no AUTOINCREMENT) | no `sqlite_sequence` | **never fires** (honest limit) |
+| `upd_autoinc.db` | AUTOINCREMENT `t`, INSERT id=5, `UPDATE id->1000`, DELETE | `sqlite_sequence(t)=5` | Detector A **fires** on residue rowid 1000 — Codex BLOCKER-1: the row was a *current* instance row, proving the flag is a HINT not a predecessor assertion |
+| `b_journal_altered.db` + `-journal` | `students(id,name)`, INSERT 10, DELETE id>=4, then `ALTER TABLE students ADD COLUMN extra` (last, journaled txn) | prior CREATE SQL ≠ current (no `extra`) | Detector B **fires** for `students` |
+| `b_journal_dml.db` + `-journal` | same through the DELETE, then a DML-only `INSERT` (last, journaled txn) | prior CREATE SQL = current | **never fires** (anti-FP) |
 
 Ground-truth quick reference (verified with the `sqlite3` CLI oracle):
 
@@ -27,13 +38,27 @@ Ground-truth quick reference (verified with the `sqlite3` CLI oracle):
   undecidable, so the flag stays silent.
 - `upd_autoinc.db`: live 0, residue rowid 1000 — a current-instance row an
   `UPDATE` moved past the INSERT high-water mark, then deleted.
+- `b_journal_altered.db`: live `students(id,name,extra)` ids 1..3, residue ids
+  4..10 (deleted); prior (`-journal`) schema `students(id,name)` — the CREATE SQL
+  differs (the ALTER), so Detector B fires for `students`.
+- `b_journal_dml.db`: live `students(id,name)` ids 1..3 + 99, residue ids 4..10
+  (deleted); prior (`-journal`) schema equals current — Detector B stays silent.
 
 ## md5 manifest
+
+The `.db` files are deterministic (byte-identical on re-running `gen.py`). The
+`-journal` sidecars embed a random checksum nonce, so their md5 varies per run —
+the consuming tests read the journal's content, not its hash, so this is
+immaterial. The md5s below are the committed bytes.
 
 ```
 b5f380a6376a8701e73514eb09a4ef27  b_autoinc.db
 042ab37d307951db79df011a9eb0deec  b_plainpk.db
 6225cdb9cd88973bcad4a4325830c0a1  upd_autoinc.db
+3a77f03ea3ac1ef40f8e9b284af98a59  b_journal_altered.db
+bfea5a212aee6772c398d6fe91d80094  b_journal_altered.db-journal
+2c1a405f4cc27856b367059554b319bf  b_journal_dml.db
+9b3855005a04e49405a3a3894574ff18  b_journal_dml.db-journal
 ```
 
 ## Provenance
@@ -42,9 +67,14 @@ b5f380a6376a8701e73514eb09a4ef27  b_autoinc.db
   stdlib `sqlite3`). The generator [`gen.py`](gen.py) IS the provenance and
   reproduces byte-identical files on the same engine.
 - **Construction reference:** `docs/design/drop-recreate-attribution.md`
-  (Detector A; the Codex soundness correction that motivates `upd_autoinc.db`).
+  (Detectors A and B; the Codex soundness correction that motivates
+  `upd_autoinc.db` and the Detector-B sound-scope boundary).
 - **License:** CC0 / public-domain (generated by us, no third-party data
   embedded), redistributable with the repo.
-- **Use case:** consumed by `forensic/tests/drop_recreate_risk.rs` (the flag
-  fires on the AUTOINCREMENT residue, never on the plain-PK residue) and by the
-  CLI provenance-column test.
+- **Use case:** the `b_autoinc`/`b_plainpk`/`upd_autoinc` trio is consumed by
+  `forensic/tests/drop_recreate_risk.rs` (Detector A fires on the AUTOINCREMENT
+  residue, never on the plain-PK residue) and the CLI provenance-column test; the
+  `b_journal_altered`/`b_journal_dml` pair is consumed by
+  `forensic/tests/detector_b.rs` (Detector B fires on the altered-schema sidecar,
+  never on the DML-only one) and the `core` prior-schema unit tests
+  (`schema_sql`).

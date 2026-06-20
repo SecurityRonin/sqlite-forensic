@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use sqlite_core::rebuild::{FragmentRow, RebuildRow, RecoveredTable};
 use sqlite_core::{Database, Value, WalTimeline};
 use sqlite_forensic::{
-    attribute_records, carve_all_deleted_records, carve_at_commit, table_instance_risks, Anomaly,
-    Attribution, CarvedFragment, CarvedRecord, JournalRecovery, RecoverySource, TableInstanceRisk,
+    attribute_records, carve_all_deleted_records, carve_at_commit,
+    table_instance_risks_with_sidecar, Anomaly, Attribution, CarvedFragment, CarvedRecord,
+    JournalRecovery, RecoverySource, TableInstanceRisk,
 };
 
 /// Output rendering format, shared by `carve` and `audit`.
@@ -322,13 +323,13 @@ pub fn render_carve(
 
 /// The JSONL `table_instance_risk` field value for a record's risk: the quoted
 /// evidence token, or the literal `null` for [`TableInstanceRisk::None`] / a risk
-/// slice that does not cover this index. Kept null/empty for the overwhelming
-/// majority of records (only an AUTOINCREMENT `rowid > seq` trips it).
+/// slice that does not cover this index. Kept null for the overwhelming majority
+/// of records — only Detector A (AUTOINCREMENT `rowid > seq`) or Detector B
+/// (sidecar schema change) populates a token. Keyed off the non-empty
+/// [`TableInstanceRisk::token`] so every firing variant surfaces, not just A.
 fn table_instance_risk_json(risks: &[TableInstanceRisk], idx: usize) -> String {
-    match risks.get(idx) {
-        Some(risk @ TableInstanceRisk::RowidExceedsAutoincHighwater { .. }) => {
-            format!("\"{}\"", json_escape(&risk.token()))
-        }
+    match risks.get(idx).map(TableInstanceRisk::token) {
+        Some(token) if !token.is_empty() => format!("\"{}\"", json_escape(&token)),
         _ => "null".to_string(),
     }
 }
@@ -895,14 +896,21 @@ const PROVENANCE_COLS: [&str; 6] = [
 /// `fragments`, when `Some`, is appended as the existing `recovered_fragments`
 /// table (schema unchanged: `_page,_offset,_missing,_confidence,c0..cM`). Empty
 /// tiers are omitted; the row order within each table follows `records`.
+///
+/// `prior_schema` is the sidecar's PRIOR `sqlite_master` (`name -> CREATE SQL`),
+/// threaded so the `_table_instance_risk` provenance column also carries Detector
+/// B's `sidecar_schema_changed(table)` where a `-wal`/`-journal` captured an
+/// unambiguous schema change. Pass an EMPTY map for the no-sidecar path (Detector
+/// A only) — see [`sqlite_forensic::table_instance_risks_with_sidecar`].
 #[must_use]
 pub fn group_attributed_tables(
     db: &Database,
     records: &[CarvedRecord],
     fragments: Option<&[CarvedFragment]>,
+    prior_schema: &std::collections::BTreeMap<String, String>,
 ) -> Vec<RecoveredTable> {
     let attributions = attribute_records(db, records);
-    let risks = table_instance_risks(db, records, &attributions);
+    let risks = table_instance_risks_with_sidecar(db, records, &attributions, prior_schema);
     group_into_tables(records, &attributions, &risks, &db.live_tables(), fragments)
 }
 
@@ -1921,12 +1929,18 @@ fn fold_journal_into_histories(
 /// a WAL — the caller passes `None` under a WAL): its deleted prior rows fold in as
 /// red `is_deleted` versions and its modified rows' prior values as blue superseded
 /// versions, under their KNOWN table+rowid, via `fold_journal_into_histories`.
+///
+/// `prior_schema` is the sidecar's PRIOR `sqlite_master` (`name -> CREATE SQL`), so
+/// a residue version in a schema-changed table's sheet carries Detector B's
+/// `sidecar_schema_changed(table)` token in its `_table_instance_risk` column.
+/// Pass an EMPTY map for the no-sidecar path (Detector A only).
 #[must_use]
 pub fn plan_combined_workbook(
     db: &Database,
     records: &[CarvedRecord],
     fragments: Option<&[CarvedFragment]>,
     journal: Option<&JournalRecovery>,
+    prior_schema: &std::collections::BTreeMap<String, String>,
     row_cap: usize,
 ) -> CombinedWorkbook {
     // The per-table version histories (live + WAL-historical + attributed residue).
@@ -1949,17 +1963,27 @@ pub fn plan_combined_workbook(
             .map(sqlite_core::CommitSnapshot::lsn)
     };
 
-    // The Detector-A instance-risk per carved record, keyed by (table, rowid) so a
-    // residue version folded into a table's history carries its evidence token in
-    // the `_table_instance_risk` column. Only an AUTOINCREMENT `rowid > seq` residue
-    // populates the map; everything else is absent (→ NULL column).
+    // The instance-risk per carved record, keyed by (table, rowid) so a residue
+    // version folded into a table's history carries its evidence token in the
+    // `_table_instance_risk` column. Detector A (AUTOINCREMENT `rowid > seq`) AND
+    // Detector B (sidecar schema change) both populate the map; a record with no
+    // risk is absent (→ NULL column).
     let attributions = attribute_records(db, records);
-    let risks = table_instance_risks(db, records, &attributions);
+    let risks = table_instance_risks_with_sidecar(db, records, &attributions, prior_schema);
     let mut risk_by_table_rowid: std::collections::BTreeMap<(String, i64), String> =
         std::collections::BTreeMap::new();
-    for (rec, risk) in records.iter().zip(&risks) {
-        if let TableInstanceRisk::RowidExceedsAutoincHighwater { table, .. } = risk {
-            risk_by_table_rowid.insert((table.clone(), rec.rowid), risk.token());
+    for ((rec, risk), attr) in records.iter().zip(&risks).zip(&attributions) {
+        let table = match risk {
+            TableInstanceRisk::RowidExceedsAutoincHighwater { table, .. }
+            | TableInstanceRisk::SidecarSchemaChanged { table } => Some(table.clone()),
+            // TableInstanceRisk::None and any future #[non_exhaustive] variant carry
+            // no table key here → no token in the risk map (NULL column).
+            _ => None,
+        };
+        // A Known attribution guarantees the residue rides on a real table sheet;
+        // the (table, rowid) key matches how the history lookup later reads it.
+        if let (Some(table), Attribution::Known(_)) = (table, attr) {
+            risk_by_table_rowid.insert((table, rec.rowid), risk.token());
         }
     }
 
@@ -2029,10 +2053,11 @@ pub fn combined_xlsx_bytes(
     records: &[CarvedRecord],
     fragments: Option<&[CarvedFragment]>,
     journal: Option<&JournalRecovery>,
+    prior_schema: &std::collections::BTreeMap<String, String>,
     path: &Path,
     row_cap: usize,
 ) -> Result<Vec<u8>, String> {
-    let plan = plan_combined_workbook(db, records, fragments, journal, row_cap);
+    let plan = plan_combined_workbook(db, records, fragments, journal, prior_schema, row_cap);
     for (table, count) in &plan.dropped {
         eprintln!("{}", row_cap_warning(table, *count, row_cap));
     }
@@ -3148,7 +3173,14 @@ mod tests {
                 modified: 1,
             },
         };
-        let plan = plan_combined_workbook(&db, &[], None, Some(&recovery), EXCEL_MAX_ROWS);
+        let plan = plan_combined_workbook(
+            &db,
+            &[],
+            None,
+            Some(&recovery),
+            &std::collections::BTreeMap::new(),
+            EXCEL_MAX_ROWS,
+        );
         let people = plan.sheets.iter().find(|s| s.name == "people").unwrap();
         assert!(
             people.rows.iter().any(|r| r.is_deleted),
@@ -3738,7 +3770,8 @@ mod tests {
         let attrs = attribute_records(&db, &records);
         assert_eq!(attrs.len(), 1);
 
-        let tables = group_attributed_tables(&db, &records, None);
+        let tables =
+            group_attributed_tables(&db, &records, None, &std::collections::BTreeMap::new());
         // The single record must land in exactly one recovered_* table.
         assert!(tables.iter().all(|t| t.name.starts_with("recovered_")));
         assert_eq!(tables.iter().map(|t| t.rows.len()).sum::<usize>(), 1);
@@ -4550,7 +4583,14 @@ mod tests {
     #[test]
     fn plan_combined_workbook_builds_temporal_sheet_per_table() {
         let db = minted_people_db();
-        let plan = plan_combined_workbook(&db, &[], None, None, EXCEL_MAX_ROWS);
+        let plan = plan_combined_workbook(
+            &db,
+            &[],
+            None,
+            None,
+            &std::collections::BTreeMap::new(),
+            EXCEL_MAX_ROWS,
+        );
 
         let people = plan
             .sheets
@@ -4589,7 +4629,14 @@ mod tests {
                 Value::Text("d".into()),
             ],
         )];
-        let plan = plan_combined_workbook(&db, &records, None, None, EXCEL_MAX_ROWS);
+        let plan = plan_combined_workbook(
+            &db,
+            &records,
+            None,
+            None,
+            &std::collections::BTreeMap::new(),
+            EXCEL_MAX_ROWS,
+        );
         let extra_names: Vec<&String> = plan.extra.iter().map(|t| &t.name).collect();
         assert!(
             extra_names.iter().any(|n| *n == "recovered_unattributed"),
@@ -4607,7 +4654,8 @@ mod tests {
     fn plan_combined_workbook_reports_row_cap_drops() {
         // Three live rows → three present versions; cap at 1 → 2 dropped.
         let db = minted_people_db_n(3);
-        let plan = plan_combined_workbook(&db, &[], None, None, 1);
+        let plan =
+            plan_combined_workbook(&db, &[], None, None, &std::collections::BTreeMap::new(), 1);
         let drop = plan
             .dropped
             .iter()
@@ -4636,8 +4684,16 @@ mod tests {
         // Two live rows → two present versions; cap of 1 truncates the people
         // version-history sheet, exercising the dropped-row warning loop.
         let db = minted_people_db_n(2);
-        let buf = combined_xlsx_bytes(&db, &[], None, None, Path::new("/out/x.recovered.xlsx"), 1)
-            .unwrap();
+        let buf = combined_xlsx_bytes(
+            &db,
+            &[],
+            None,
+            None,
+            &std::collections::BTreeMap::new(),
+            Path::new("/out/x.recovered.xlsx"),
+            1,
+        )
+        .unwrap();
         assert!(!buf.is_empty());
         let _ = open_xlsx(&buf);
     }
@@ -4658,6 +4714,7 @@ mod tests {
             &records,
             None,
             None,
+            &std::collections::BTreeMap::new(),
             Path::new("/out/wide.recovered.xlsx"),
             EXCEL_MAX_ROWS,
         )

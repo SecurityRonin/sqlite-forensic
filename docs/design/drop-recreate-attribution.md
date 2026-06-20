@@ -208,6 +208,8 @@ unattributed blobs (no table claim at all), so our distinct `predecessor` label 
 
 ## 7. Scope
 
+**v1 shipped: Detector A + Detector B (sound table-level sidecar schema-change hint).**
+
 - **v1 — SHIPPED (Detector A).** The `table_instance_risk` HINT flag
   (`TableInstanceRisk::RowidExceedsAutoincHighwater`) for bare AUTOINCREMENT
   residue whose `rowid` exceeds `sqlite_sequence`, surfaced as a `_table_instance_risk`
@@ -218,10 +220,24 @@ unattributed blobs (no table claim at all), so our distinct `predecessor` label 
   on real `sqlite3`-minted fixtures (`tests/data/drop_recreate/`) including the
   Codex BLOCKER-1 `UPDATE`-the-rowid case, with the Nemetz zero-firing
   anti-regression guard (`forensic/tests/drop_recreate_risk.rs`).
-- **Follow-up — Detector B.** A sidecar `-wal`/`-journal` DDL-boundary signal
-  (`TableInstanceRisk::SidecarSchemaChanged`, the reserved `#[non_exhaustive]`
-  variant), reusing the journal/WAL prior-schema machinery — a *table-level*
-  boundary event, still NOT row-level provenance. Not yet implemented.
+- **v1 — SHIPPED (Detector B).** The sidecar `-wal`/`-journal` schema-change HINT
+  (`TableInstanceRisk::SidecarSchemaChanged { table }`, the reserved
+  `#[non_exhaustive]` variant), surfaced through the SAME `_table_instance_risk`
+  provenance column in the rebuilt `.carved.db`, the combined XLSX, and JSONL. It
+  fires ONLY on an UNAMBIGUOUS table-level schema change to a table `T` visible in
+  a sidecar prior snapshot: the prior `sqlite_master` shows `T` **absent** OR with
+  a **different CREATE SQL text** than the current schema. It does NOT fire on a
+  rootpage move with identical CREATE SQL (VACUUM), a schema-cookie advance alone,
+  a DML-only transaction, or a same-schema drop+recreate (indistinguishable from a
+  benign page move — a documented limit). A *table-level* boundary event, NOT
+  row-level provenance. Backed by `sqlite-core` `Database::schema_sql()` +
+  `PriorSnapshot::schema_sql()` (the prior `name -> CREATE SQL` read), composed by
+  `sqlite_forensic::table_instance_risks_with_sidecar()`. Detector A takes
+  precedence where both apply (its rowid+seq evidence is more specific). Validated
+  on real `sqlite3`-minted PERSIST-`-journal` fixtures
+  (`tests/data/drop_recreate/b_journal_altered.db` fires, `b_journal_dml.db` does
+  not), with the no-sidecar / bare-A / Nemetz zero-firing anti-regression guards
+  (`forensic/tests/detector_b.rs`).
 - **Explicit limit (documented, not faked):** bare, non-AUTOINCREMENT, no sidecar →
   drop-recreate is undecidable; residue stays attributed by storage with the
   honesty caveat, and the flag stays silent. This matches the survey's own

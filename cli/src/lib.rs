@@ -2650,56 +2650,103 @@ mod tests {
     // ---- rebuilt-db output: path derivation + safety guard -----------------
 
     #[test]
-    fn default_output_path_is_stem_recovered_db_in_cwd() {
-        // History.db -> History.recovered.db (final extension stripped).
+    fn default_carved_db_path_is_stem_carved_db_in_cwd() {
+        // History.db -> History.carved.db (final extension stripped).
         assert_eq!(
-            recovered_output_path(Path::new("/evidence/History.db"), None).unwrap(),
-            PathBuf::from("History.recovered.db")
+            carved_db_path(Path::new("/evidence/History.db"), None).unwrap(),
+            PathBuf::from("History.carved.db")
         );
-        // ChatStorage.sqlite -> ChatStorage.recovered.db.
+        // ChatStorage.sqlite -> ChatStorage.carved.db.
         assert_eq!(
-            recovered_output_path(Path::new("ChatStorage.sqlite"), None).unwrap(),
-            PathBuf::from("ChatStorage.recovered.db")
+            carved_db_path(Path::new("ChatStorage.sqlite"), None).unwrap(),
+            PathBuf::from("ChatStorage.carved.db")
         );
         // A name with no extension keeps the whole stem.
         assert_eq!(
-            recovered_output_path(Path::new("/data/wal_only"), None).unwrap(),
-            PathBuf::from("wal_only.recovered.db")
+            carved_db_path(Path::new("/data/wal_only"), None).unwrap(),
+            PathBuf::from("wal_only.carved.db")
         );
         // A path with no filename component degrades to a fixed safe name rather
         // than panicking (exercises the no-stem fallback arm).
         assert_eq!(
-            recovered_output_path(Path::new("/"), None).unwrap(),
-            PathBuf::from("recovered.recovered.db")
+            carved_db_path(Path::new("/"), None).unwrap(),
+            PathBuf::from("recovered.carved.db")
         );
     }
 
     #[test]
-    fn explicit_out_overrides_the_derived_path() {
-        let out = PathBuf::from("/tmp/custom.db");
+    fn default_recovered_xlsx_path_is_stem_recovered_xlsx_in_cwd() {
+        // History.db -> History.recovered.xlsx (final extension stripped).
         assert_eq!(
-            recovered_output_path(Path::new("History.db"), Some(&out)).unwrap(),
-            out
+            recovered_xlsx_path(Path::new("/evidence/History.db"), None).unwrap(),
+            PathBuf::from("History.recovered.xlsx")
+        );
+        // ChatStorage.sqlite -> ChatStorage.recovered.xlsx.
+        assert_eq!(
+            recovered_xlsx_path(Path::new("ChatStorage.sqlite"), None).unwrap(),
+            PathBuf::from("ChatStorage.recovered.xlsx")
+        );
+        // No-stem fallback.
+        assert_eq!(
+            recovered_xlsx_path(Path::new("/"), None).unwrap(),
+            PathBuf::from("recovered.recovered.xlsx")
         );
     }
 
     #[test]
-    fn guard_refuses_output_equal_to_evidence_or_sidecars() {
-        let db = Path::new("/evidence/History.db");
-        // Writing back over the evidence file itself is refused.
-        assert!(recovered_output_path(db, Some(Path::new("/evidence/History.db"))).is_err());
-        // Each sidecar is refused too — the whole evidence set is read-only.
-        for sidecar in ["-wal", "-shm", "-journal"] {
-            let mut name = db.as_os_str().to_owned();
-            name.push(sidecar);
-            let p = PathBuf::from(name);
-            assert!(
-                recovered_output_path(db, Some(&p)).is_err(),
-                "must refuse the {sidecar} sidecar"
+    fn out_sets_the_stem_for_both_outputs() {
+        // --out /p/foo (or /p/foo.db) sets the STEM `foo`; the db and xlsx suffixes
+        // are derived independently from it, so the stems differ by suffix only.
+        for out in ["/p/foo", "/p/foo.db"] {
+            assert_eq!(
+                carved_db_path(Path::new("History.db"), Some(Path::new(out))).unwrap(),
+                PathBuf::from("/p/foo.carved.db")
+            );
+            assert_eq!(
+                recovered_xlsx_path(Path::new("History.db"), Some(Path::new(out))).unwrap(),
+                PathBuf::from("/p/foo.recovered.xlsx")
             );
         }
-        // A genuinely different path is allowed.
-        assert!(recovered_output_path(db, Some(Path::new("/out/History.recovered.db"))).is_ok());
+    }
+
+    #[test]
+    fn carved_db_guard_refuses_a_derived_output_onto_the_evidence() {
+        // When the derived `<stem>.carved.db` would land on the evidence db itself
+        // it is refused. Evidence `History.carved.db` + --out stem `/evidence/History`
+        // → `/evidence/History.carved.db`, exactly the evidence file.
+        let db = Path::new("/evidence/History.carved.db");
+        assert!(carved_db_path(db, Some(Path::new("/evidence/History"))).is_err());
+        // A genuinely different stem is allowed.
+        assert!(carved_db_path(db, Some(Path::new("/out/History"))).is_ok());
+    }
+
+    #[test]
+    fn recovered_xlsx_guard_refuses_a_derived_output_onto_the_evidence() {
+        // Evidence `History.recovered.xlsx` + --out stem `/evidence/History` →
+        // `/evidence/History.recovered.xlsx`, exactly the evidence file: refused.
+        let db = Path::new("/evidence/History.recovered.xlsx");
+        assert!(recovered_xlsx_path(db, Some(Path::new("/evidence/History"))).is_err());
+        // A genuinely different stem is allowed.
+        assert!(recovered_xlsx_path(db, Some(Path::new("/out/History"))).is_ok());
+    }
+
+    #[test]
+    fn evidence_path_clash_flags_db_and_each_sidecar() {
+        // The guard predicate, exercised directly so all sidecar arms are covered
+        // (the suffix-fixed derived paths above cannot themselves land on a
+        // `-wal`/`-shm`/`-journal` name).
+        let db = Path::new("/evidence/History.db");
+        assert_eq!(evidence_path_clash(db, db), Some("database"));
+        for (sidecar, label) in [
+            ("-wal", "-wal sidecar"),
+            ("-shm", "-shm sidecar"),
+            ("-journal", "-journal sidecar"),
+        ] {
+            let mut name = db.as_os_str().to_owned();
+            name.push(sidecar);
+            assert_eq!(evidence_path_clash(db, &PathBuf::from(name)), Some(label));
+        }
+        assert_eq!(evidence_path_clash(db, Path::new("/out/x.carved.db")), None);
     }
 
     #[test]
@@ -3228,26 +3275,6 @@ mod tests {
         assert!(
             err.contains("recovered xlsx") && err.contains("wide.xlsx"),
             "the error is path-keyed and actionable: {err}"
-        );
-    }
-
-    #[test]
-    fn xlsx_path_replaces_db_extension_with_xlsx() {
-        // The xlsx path is the recovered-db path with its extension swapped, so
-        // it honors --out's stem: /p/foo.db -> /p/foo.xlsx.
-        assert_eq!(
-            recovered_xlsx_path(Path::new("/p/foo.db")),
-            PathBuf::from("/p/foo.xlsx")
-        );
-        // Default derived db name -> matching xlsx name.
-        assert_eq!(
-            recovered_xlsx_path(Path::new("History.recovered.db")),
-            PathBuf::from("History.recovered.xlsx")
-        );
-        // A path with no extension gains `.xlsx`.
-        assert_eq!(
-            recovered_xlsx_path(Path::new("/p/recovered")),
-            PathBuf::from("/p/recovered.xlsx")
         );
     }
 

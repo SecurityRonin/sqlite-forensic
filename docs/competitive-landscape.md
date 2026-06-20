@@ -293,9 +293,12 @@ positives** and **substrate coverage**, not raw speed.
   residue, but also explainable by an `UPDATE`/`sqlite_sequence` edit/current-instance
   deletion), AUTOINCREMENT-only, never a predecessor assertion, never a reroute or
   tier change. The plain-`INTEGER PRIMARY KEY` case stays unflagged (genuinely
-  undecidable from a bare snapshot). *Backlog (Detector B):* a sidecar `-wal`/`-journal`
-  DDL-boundary signal (`sidecar_schema_changed_for_table`) reusing the prior-schema
-  machinery — a table-level boundary, still not row-level provenance.
+  undecidable from a bare snapshot). *Shipped (Detector B):* Detector B now flags an
+  unambiguous sidecar `-wal`/`-journal` schema change — the prior `sqlite_master`
+  shows a table absent or with a different CREATE SQL than current
+  (`sidecar_schema_changed(table)`) — a table-level boundary hint, still not the
+  same-schema case (a same-schema drop+recreate is indistinguishable from a benign
+  page move) and never row-level provenance.
 - **WAL-checkpoint acquisition warning.** A `-wal` that a checkpoint would have
   reclaimed is forensically load-bearing; surface a warning when an evidence WAL
   is uncheckpointed (residue present) so an examiner copies the `-wal` before any

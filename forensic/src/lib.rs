@@ -1708,6 +1708,20 @@ pub enum TableInstanceRisk {
         /// The table's `AUTOINCREMENT` high-water mark (`sqlite_sequence.seq`).
         seq: i64,
     },
+    /// Detector B (`docs/design/drop-recreate-attribution.md`): the record was
+    /// attributed `Known(table)`, a `-wal`/`-journal` sidecar is in play, and the
+    /// sidecar's PRIOR `sqlite_master` for `table` is **absent** OR carries a
+    /// **different CREATE SQL text** than the current schema — an UNAMBIGUOUS
+    /// table-level schema change within the captured window. It is *consistent
+    /// with* a `CREATE`/`ALTER` or a drop+recreate of `table`, so residue
+    /// attributed to `table` may predate the current schema. It is **table-level**,
+    /// NOT row-level provenance, and deliberately does NOT fire on a rootpage move
+    /// with identical CREATE SQL (a `VACUUM`), a schema-cookie advance alone, or a
+    /// same-schema drop+recreate (indistinguishable from a benign page move).
+    SidecarSchemaChanged {
+        /// The live table whose sidecar prior schema differs from the current.
+        table: String,
+    },
 }
 
 impl TableInstanceRisk {
@@ -1726,6 +1740,14 @@ impl TableInstanceRisk {
                  edit, or a current-instance deletion; the examiner should cross-check the RowID \
                  and any WAL/journal schema history."
             ),
+            Self::SidecarSchemaChanged { table } => format!(
+                "the schema for table {table} differs between the sidecar's (-wal/-journal) prior \
+                 state and the current database (present-with-different-SQL or absent in the prior) \
+                 — consistent with a CREATE/ALTER or drop+recreate within the captured window; \
+                 residue attributed to {table} may predate the current schema, so reconcile against \
+                 the prior schema. (A same-schema drop+recreate is indistinguishable from a benign \
+                 page move and does NOT raise this.)"
+            ),
         }
     }
 
@@ -1738,6 +1760,9 @@ impl TableInstanceRisk {
             Self::None => String::new(),
             Self::RowidExceedsAutoincHighwater { rowid, seq, .. } => {
                 format!("rowid_exceeds_autoinc_highwater(r={rowid},seq={seq})")
+            }
+            Self::SidecarSchemaChanged { table } => {
+                format!("sidecar_schema_changed({table})")
             }
         }
     }
@@ -1788,6 +1813,85 @@ pub fn table_instance_risks(
             }
         })
         .collect()
+}
+
+/// The set of live tables whose CURRENT `CREATE TABLE` SQL differs from a sidecar
+/// PRIOR `sqlite_master` — Detector B's UNAMBIGUOUS schema-change predicate
+/// (`docs/design/drop-recreate-attribution.md`).
+///
+/// A table `T` is schema-changed when it is present in `current` and the prior
+/// snapshot either (a) **lacks** `T` (absent in the prior `sqlite_master`) or
+/// (b) carries `T` with a **different CREATE SQL text**. A table whose prior SQL
+/// is byte-identical (the DML-only case, and the same-schema drop+recreate the
+/// design refuses to claim) is NOT included — that is the anti-false-positive
+/// boundary. An EMPTY `prior_schema` (no sidecar in play) yields the empty set, so
+/// Detector B is silent unless a sidecar genuinely captured a different schema.
+fn sidecar_schema_changed_tables(
+    current: &std::collections::BTreeMap<String, String>,
+    prior_schema: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeSet<String> {
+    // No sidecar (empty prior) ⟹ no Detector-B signal at all. Guarding here keeps
+    // the "when in doubt, do NOT fire" rule explicit rather than implicit.
+    if prior_schema.is_empty() {
+        return std::collections::BTreeSet::new();
+    }
+    current
+        .iter()
+        .filter(|(name, current_sql)| match prior_schema.get(*name) {
+            // Present in the prior with a DIFFERENT CREATE SQL ⟹ schema changed.
+            Some(prior_sql) => prior_sql != *current_sql,
+            // Absent in the prior (the table did not exist) ⟹ created since.
+            None => true,
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Per-record [`TableInstanceRisk`] over BOTH Detector A (bare AUTOINCREMENT
+/// high-water) AND Detector B (sidecar schema-change), the sidecar-aware pass the
+/// CLI composes when a `-wal`/`-journal` is in play
+/// (`docs/design/drop-recreate-attribution.md`).
+///
+/// `prior_schema` is the sidecar's PRIOR `sqlite_master` as `name -> CREATE SQL`
+/// ([`sqlite_core::PriorSnapshot::schema_sql`] for a `-journal`;
+/// [`Database::schema_sql`] of the pre-WAL base bytes for a `-wal`). Pass an EMPTY
+/// map to run Detector A only (the no-sidecar path), so this is a strict superset
+/// of [`table_instance_risks`].
+///
+/// Detector B trips [`TableInstanceRisk::SidecarSchemaChanged`] for a record that
+/// is `Attribution::Known(table)` whose `table` has a sidecar schema change —
+/// prior absent, or prior CREATE SQL differs from current.
+/// **Precedence:** Detector A wins where it fires — its rowid+seq evidence is more
+/// specific than B's table-level boundary — so a record qualifying for both is
+/// surfaced as `RowidExceedsAutoincHighwater`; Detector B fills only records A left
+/// as [`TableInstanceRisk::None`]. Neither alters attribution, tier, or routing.
+#[must_use]
+pub fn table_instance_risks_with_sidecar(
+    db: &Database,
+    records: &[CarvedRecord],
+    attributions: &[Attribution],
+    prior_schema: &std::collections::BTreeMap<String, String>,
+) -> Vec<TableInstanceRisk> {
+    let mut risks = table_instance_risks(db, records, attributions);
+    let changed = sidecar_schema_changed_tables(&db.schema_sql(), prior_schema);
+    if changed.is_empty() {
+        return risks; // no sidecar schema-change signal ⟹ Detector A result unchanged.
+    }
+    for (risk, attr) in risks.iter_mut().zip(attributions) {
+        // Detector A takes precedence: only fill records A left as None.
+        if *risk != TableInstanceRisk::None {
+            continue;
+        }
+        let Attribution::Known(table) = attr else {
+            continue;
+        };
+        if changed.contains(table) {
+            *risk = TableInstanceRisk::SidecarSchemaChanged {
+                table: table.clone(),
+            };
+        }
+    }
+    risks
 }
 
 /// The core per-rowid VERSION HISTORY ([`Database::row_histories`]) augmented with

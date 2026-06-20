@@ -11,17 +11,22 @@ schema** (residue from a dropped table mis-attributed to a recreated same-name
 table).
 
 We replicated the survey's scenario *construction* with the real `sqlite3` engine
-and measured our carver against three of the survey's tools on **identical bytes**:
-`bring2lite`, `Undark` (v0.7.1), and the SQLite Deleted Records Parser (SQL-DRP,
-Mari DeGrazia). FQLite is cited from the paper (its headless tap was not set up in
-this run).
+and measured our carver against four of the survey's tools on **identical bytes**:
+`bring2lite`, `Undark` (v0.7.1), the SQLite Deleted Records Parser (SQL-DRP,
+Mari DeGrazia), and `FQLite` (4.22, driven headlessly via a source tap). FQLite's
+in-page/freelist carve ran on the two non-WAL scenarios (0F/0B); its WAL recovery
+path is GUI-coupled in the current source and was not reachable headlessly, so
+scenario 10 has no FQLite number (the blocker is documented below — no figure is
+fabricated).
 
 - **On the B-tree rebalancing scenario, `bring2lite` produced 13 false positives
   (live rows reported as deleted; precision 0.705); our carver produced 0
   (precision 1.000).** This reproduces the survey's Type-\*\* finding on our
   replication. The difference is structural: we exclude live rowids by
   construction, so a row on a freed page that is still reachable from the live
-  b-tree is never re-surfaced.
+  b-tree is never re-surfaced. `FQLite` likewise produced **0** live false
+  positives here (precision 1.000) — its freelist carve recovers fewer of the
+  truly-deleted rows (11/50) but does not re-surface a live one.
 - **On WAL + `secure_delete=ON`, we recover all 20 deleted rows from the `-wal`**;
   SQL-DRP (a main-image-only carver) recovers 0 because it does not read the
   `-wal`. This matches the survey's observation that only WAL-aware tools recover
@@ -34,7 +39,7 @@ this run).
 > **Scope discipline.** The survey's own corpus + code is "released upon
 > publication" and is not yet public, so we did **not** reproduce its bytes. Every
 > figure below is labelled by source: **measured (this repo, identical bytes)** —
-> our carver and the two oracles run on the *same* replicated files — versus
+> our carver and the oracles run on the *same* replicated files — versus
 > **reported by the paper** — the survey's numbers on *its* corpus, which we cite
 > but did not re-measure. We make **no** head-to-head claim on absolute recall
 > across the two corpora; only the identical-bytes column is apples-to-apples.
@@ -70,16 +75,21 @@ ground-truth live/deleted sets. `precision = TP / (TP + FP)`,
 |---|---:|---:|---:|---:|---|
 | **sqlite4n6 (ours)** | 33 | **0** | **1.000** | 0.660 | measured (this repo, identical bytes) |
 | bring2lite | 31 | **13** | 0.705 | 0.620 | measured (this repo, identical bytes) |
+| FQLite | 11 | **0** | 1.000 | 0.220 | measured (this repo, identical bytes) |
 | Undark | 0 | **1** | 0.000 | 0.000 | measured (this repo, identical bytes) |
 | SQL-DRP | 5 | 0 | 1.000 | 0.100 | measured (this repo, identical bytes) |
-| Bring2Lite / FQLite | — | ~10 each | — | — | reported by the paper (its corpus) |
+| Bring2Lite | — | ~10 | — | — | reported by the paper (its corpus) |
 | SQLite Deleted Record Parser | — | 0 | — | (lower) | reported by the paper (its corpus) |
 
 The headline: on identical bytes, the freed-page carver (`bring2lite`) re-surfaces
 **13 live rows** as deleted; our live-rowid exclusion yields **0**. SQL-DRP, a
 metadata-only freeblock scanner, also avoids the live-row false positives but
 recovers far fewer truly-deleted rows (it does not chase whole freed pages).
-**Undark** recovers nothing truly-deleted from the freelist pages here and emits a
+**FQLite** recovers 11 of the 50 truly-deleted freelist rows (ids 1–9, 18, 27,
+content-scored by the embedded `ROW-<id>-…` tag) with **0** live false positives
+(its 15 output lines also include 1 `sqlite_master` schema row and 2 untagged
+freespace fragments, neither scorable as a live/deleted data row). **Undark**
+recovers nothing truly-deleted from the freelist pages here and emits a
 single freespace fragment — whose id-tag (`ROW-56-…`) is a **live** row (id 56,
 range 51..80) surfaced as recovered: **1 false positive, 0 true positives**.
 Undark dumps a flat CSV with no live/deleted bucketing, so its lone recovery is a
@@ -91,12 +101,16 @@ live-row fragment, exactly the survey's Type-\*\* weakness.
 |---|---:|---:|---:|---:|---|
 | **sqlite4n6 (ours)** | 5 | 0 | 1.000 | 0.500 | measured (this repo, identical bytes) |
 | bring2lite | 5 | 0 | 1.000 | 0.500 | measured (this repo, identical bytes) |
+| FQLite | 5 | 0 | 1.000 | 0.500 | measured (this repo, identical bytes) |
 | SQL-DRP | 5 | 0 | 1.000 | 0.500 | measured (this repo, identical bytes) |
 
-All three recover the 5 surviving OLD residue rows (rowids 6..=10; the other 5 OLD
+All four recover the 5 surviving OLD residue rows (rowids 6..=10; the other 5 OLD
 rows lost their cells to same-rowid reuse by the NEW rows) and none re-surface a
-live NEW row, so the *content* false-positive count is 0 for all three on this
-replication. **Our nuance (the Type-\* caveat):** we attribute the OLD residue by
+live NEW row, so the *content* false-positive count is 0 for all four on this
+replication. `FQLite` carves the OLD residue as a flat list under the recreated
+`students` table (its output is the 5 `OLD-NAME-6..10` rows, plus the
+`sqlite_master` schema row and one malformed fragment, neither a live NEW row), so
+it shares the others' clean 0-false-positive result on this replication. **Our nuance (the Type-\* caveat):** we attribute the OLD residue by
 page ownership to the recreated `recovered_students` table; we do not reroute or
 re-tier it. Where the recreated table is `AUTOINCREMENT`, we now ALSO surface a
 `table_instance_risk` provenance flag on each residue row whose `rowid` exceeds the
@@ -116,14 +130,21 @@ blobs.
 | bring2lite | 20 | 0 | 1.000 | 1.000 | measured (this repo, identical bytes) |
 | Undark | 0 | 0 | n/a | 0.000 | measured (this repo, identical bytes) |
 | SQL-DRP | 0 | 0 | n/a | 0.000 | measured (this repo, identical bytes) |
-| Bring2Lite / FQLite | — | — | — | recover | reported by the paper (its corpus) |
+| FQLite | — | — | — | recover | cited (paper) — WAL path not reachable headlessly (see provenance) |
 | SQLite-DRP | — | — | — | do not recover | reported by the paper (its corpus) |
 
 With `secure_delete=ON` the main image holds none of the message bodies; the only
 residue is in the uncheckpointed `-wal`. We and `bring2lite` (both WAL-aware)
 recover all 20; SQL-DRP and **Undark** (both main-image only — Undark has no `-wal`
 awareness) recover none, confirming the survey's main-image-vs-WAL split on
-identical bytes.
+identical bytes. **FQLite** is WAL-aware in its GUI, and the paper reports it
+recovering this case, but its WAL recovery is structurally GUI-coupled in the
+current source (the `-wal` reader is instantiated by a JavaFX `ImportDBTask`, and
+the WAL table wiring in `Job.processDB()` sits entirely inside `if (gui != null)`
+blocks). The headless tap drives the in-page/freelist engine (`Job.run`), which on
+this file leaves `job.wal == null` and recovers nothing — so scenario 10 keeps
+FQLite's **cited** figure rather than a fabricated measured one (blocker detailed
+in the provenance note).
 
 > **One honest WAL artifact.** Our carve of `wcase.db` emits 21 records for 20
 > distinct deleted rowids: rowid 14 also appears once as a lower-confidence
@@ -158,17 +179,46 @@ identical bytes.
   recovered, and on 0F its lone freespace fragment is a live row (id 56). It reads
   the main image only (no `-wal`), so it recovers nothing from scenario 10 —
   confirmed (0 records).
-- **FQLite** — **CITED, not run** in this pass. The tap is **not set up** here: this
-  worktree has no `tools/fqlite/` source-instrumentation tap, and FQLite's GUI
-  installer ships no runnable CLI (its command-line mode was removed at v2.0), so
-  driving it headlessly needs the source tap (clone at commit
-  `26922bd…`, null-guard the JavaFX `gui.add_table` calls in `Job.java`, stub the
-  `rag`/`erm` LLM packages, and compile the engine + `HeadlessTap.java` against
-  JavaFX 22 + commons-codec/jspecify/antlr/sqlite-jdbc). That build was out of
-  scope for this run, so **no FQLite number is fabricated** — its false-positive
-  figures here remain the survey's reported numbers on its corpus. The tap recipe
-  (gated on `FQLITE_TAP`) is documented in `docs/validation.md` and
-  `docs/corpus-catalog.md` §F.2 for a future run.
+- **FQLite** (4.22, Dirk Pawlaszczyk, Java) — **RAN on 0F and 0B**; its WAL path on
+  scenario 10 was **not reachable headlessly** (genuine blocker, no number
+  fabricated). [Repo](https://github.com/pawlaszczyk/fqlite). FQLite's command-line
+  mode was removed at v2.0 (the GUI installer ships no runnable CLI), so it is
+  driven through a headless source-instrumentation tap of its carving engine
+  (`fqlite.base.Job`). Build recipe (gitignored under `tools/fqlite/`, gated on
+  `FQLITE_TAP`):
+    - clone `pawlaszczyk/fqlite` at commit
+      `26922bd9e3cdc60c93b72dfb1fb2f5972a0af6a6`;
+    - null-guard the unguarded `gui.add_table(...)` calls in `Job.java` so
+      `processDB()` runs to completion with `gui == null`;
+    - stub the `rag`/`erm` LLM packages so the build does not pull
+      langchain4j/llama;
+    - compile the engine + `tap/HeadlessTap.java` with OpenJDK 25, `--release 21`,
+      against **OpenJFX 22.0.2** SDK (`--module-path javafx-sdk-22.0.2/lib
+      --add-modules javafx.base,javafx.graphics,javafx.controls`) plus
+      `commons-codec-1.17.1`, `jspecify-1.0.0`, `antlr4-runtime-4.8`,
+      `sqlite-jdbc-3.51.1.0`;
+    - run: `FQLITE_JAVA=<jdk-25>/bin/java tools/fqlite/run-tap.sh <db>` → CSV
+      `rowid,col1,col2,…` of recovered DELETED records (rowid `-1` when the
+      header rowid is unrecoverable; scored by content). The tap boots the JavaFX
+      *toolkit* headlessly (no window) because the engine's `AppLog` static init
+      and `processDB` cleanup fence still touch JavaFX.
+
+  On 0F it recovers 11 of 50 deleted freelist rows with 0 live false positives; on
+  0B it recovers the 5 surviving OLD residue rows with 0 false positives. **The
+  WAL blocker (scenario 10):** the `-wal` reader (`WALReader`) is instantiated by a
+  JavaFX `ImportDBTask` Task, and the WAL table registration in `Job.processDB()`
+  is entirely inside `if (gui != null)` blocks (`gui.add_table(...).thenAccept(...)`
+  → `setWALPath`/`guiwaltab`). Driving `Job.run()` headlessly therefore never
+  builds the WAL reader (`job.wal == null` after the run), and WAL-recovered rows
+  would in any case land in `WALReader`'s own `resultlist`, not `job.resultlist`.
+  The tap was extended to (a) set `readWAL`/`walpath` and (b) drain
+  `job.wal.resultlist`, but the GUI-coupled instantiation cannot be reached without
+  reconstructing the `ImportDBTask` flow or refactoring `processDB`'s WAL wiring out
+  of its `if (gui != null)` guards — out of scope for this pass. So scenario 10
+  keeps FQLite's **cited** figure; **no FQLite number is fabricated.** Full recipe +
+  engine API map in `tools/fqlite/README.md` and `tools/fqlite/ENGINE_NOTES.md`
+  (both gitignored); also in `docs/validation.md` and `docs/corpus-catalog.md`
+  §F.2.
 
 > **Companion comparison — the Nemetz head-to-head.** `bring2lite` and SQL-DRP are
 > also wired as standing, env-gated oracles into the repo's third-party-ground-truth

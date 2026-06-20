@@ -250,14 +250,15 @@ differential test:
 
 ## §I `tests/data/nemetz/`  (REAL-ext, CC0, **committed**)
 
-The **SQLite Forensic Corpus** (Nemetz, Schmitt & Freiling, DFRWS-EU 2018) — a
-third-party dataset that ships, per database, an `.xml` answer key tagging every
-deleted row with its full decoded content. This is independent deleted-record
-**ground truth**: unlike our `deleted_places.db` fixture (we authored both the
-deleter and the carver), here a third party authored the deletions *and* the
-answer key, so a recall/precision number against it is real. It drives
-`forensic/tests/nemetz_metrics.rs` (the per-DB confusion matrix) and is the basis
-of `docs/recovery-comparison.md`.
+The **SQLite Forensic Corpus** (Nemetz, Schmitt & Freiling, DFRWS-EU 2018, plus
+the anti-forensic extension) — a third-party dataset that ships, per database, an
+`.xml` answer key tagging every deleted row with its full decoded content. This is
+independent deleted-record **ground truth**: unlike our `deleted_places.db`
+fixture (we authored both the deleter and the carver), here a third party authored
+the deletions *and* the answer key, so a recall/precision number against it is
+real. It drives `forensic/tests/nemetz_metrics.rs` (the per-DB confusion matrix),
+the panic-free `forensic/tests/nemetz_robustness.rs` real-data proof, and is the
+basis of `docs/recovery-comparison.md`.
 
 - Classification: `REAL-ext` (externally-authored real artifacts), confidence `✓`
   (downloaded, extracted, SQLite magic + schema + answer-key parse confirmed per
@@ -267,13 +268,26 @@ of `docs/recovery-comparison.md`.
 - Download (v2.0): <https://downloads.digitalcorpora.org/corpora/sql/sqlite_forensic_corpus_v2.0.zip>
   (302 → `digitalcorpora.s3.amazonaws.com`; `curl -L`). Zip md5
   `02aa205efa80757602a2911156db79a6`.
-- Vendored subset (32 databases): deleted/overwritten categories `0A`,`0B`,`0C`,
-  `0D`,`0E` (per-row deleted ground truth) plus anti-forensic category `11`
-  (`*_antifor.db` — manipulated page/cell pointers, a no-phantom robustness test
-  with no deleted ground truth). Per-file md5 manifest, the category table, and
-  the `gen_ground_truth.py` regeneration recipe live in
-  `tests/data/nemetz/README.md` — the single detailed index for this dataset
-  (cross-referenced, not duplicated here).
+- **Full v2.0 corpus vendored: 141 databases across 23 categories** — the
+  14-category standardized corpus (`01`–`0E`) plus the 9-category anti-forensic
+  extension (`11`–`19`), as `.db`+`.xml`+`.sql` per fixture. Per-category counts:
+  `01`:18 `02`:7 `03`:5 `04`:6 `05`:4 `06`:4 `07`:4 `08`:1 `09`:1 `0A`:5 `0B`:2
+  `0C`:10 `0D`:8 `0E`:2 `11`:5 `12`:6 `13`:8 `14`:8 `15`:13 `16`:2 `17`:13 `18`:5
+  `19`:4. The eight categories with per-row deleted ground truth
+  (`07`,`0A`,`0B`,`0C`,`0D`,`0E`,`17`,`18`) are scored for recall/precision; the
+  rest describe only LIVE content and are parse/format fixtures, NOT scored as
+  deleted-recall (the answer key has no deleted set to invent one from). The
+  full per-file md5 manifest, the 23-category table, and the deleted-vs-parse
+  classification live in `tests/data/nemetz/README.md` — the single detailed index
+  for this dataset (cross-referenced, not duplicated here).
+- **Real robustness finding:** vendoring category `12` (Manipulated Left Child
+  Page Pointers) exposed a genuine stack-overflow in the b-tree walkers
+  (`collect_rows`/`collect_rowids`/`walk_table_page`), which bounded only total
+  page COUNT, not recursion DEPTH — a manipulated child pointer forming a cycle
+  recursed ~1M frames deep before stopping. Fixed by a visited page-set (each page
+  descended at most once), so the parser degrades gracefully (partial rows) instead
+  of aborting. `nemetz_robustness.rs` now runs the full pipeline over all 141 DBs
+  panic-free.
 - Ground-truth manifest `tests/data/nemetz/nemetz_ground_truth.json` is generated
   from the `.xml` answer keys by the committed
   `tests/data/nemetz/gen_ground_truth.py`; the harness reads the manifest, never
@@ -351,7 +365,7 @@ Committed fixtures (under `tests/data/`, `tests/data/`):
 | `tests/data/deleted_places.db` | `16682d7df99b1e8a89287a508d95eb47` | 53248 |
 | `tests/data/updated_messages.db` | `e1edbb56bf37efa6a7c1e738040f1360` | 8192 |
 
-The 32 committed Nemetz databases under `tests/data/nemetz/` (CC0, §I) have their
+The 141 committed Nemetz databases under `tests/data/nemetz/` (CC0, §I) have their
 own md5 manifest in `tests/data/nemetz/README.md` to avoid duplicating it here.
 
 Not committed (provenance only — see §F, §G and the per-directory READMEs):

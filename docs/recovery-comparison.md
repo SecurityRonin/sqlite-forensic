@@ -73,9 +73,22 @@ precision (ours 5 dp, undark 6 dp, fqlite 8 dp), which would penalise float
 carry `FLOAT` values *at* positions 1 and 2, so no format-stable cross-tool key
 exists for them; they are **excluded from this table** (our own single-tool matrix
 still scores them, rounding reals symmetrically). Categories `0A`/`0B`
-(dropped/overwritten *tables* — no live-vs-deleted anchor) and `11` (anti-forensic
-tampering — no deleted answer key) carry no clean row-level deleted set and are
-**out of scope** for a recall table.
+(dropped/overwritten *tables* — no live-vs-deleted anchor) carry no clean
+row-level deleted set and are **out of scope** for this cross-tool recall table.
+
+> **Full-corpus scope (v2.0).** The vendored corpus is now the **full 141-DB
+> Nemetz v2.0** (23 categories). This head-to-head table stays scoped to `0C`/`0D`/
+> `0E` where all three tools have oracle output and a format-stable key exists; the
+> numbers above are unchanged. The newly-vendored deleted-ground-truth categories
+> `07` (fragmented contents) and the anti-forensic `17` (manipulated freeblocks) /
+> `18` (manipulated freelist trunks) are scored by our single-tool matrix
+> (`nemetz_metrics.rs`): `07` recovers its lone deleted row's substrate; `17`/`18`
+> have a near-zero substrate denominator (the manipulation destroys contiguous
+> identity) and the carver recovers **0** full rows there while re-surfacing **0**
+> live rows. Every false positive across the full 141-DB corpus is content-free —
+> 39 benign phantoms + 5 recovered `sqlite_master` schema rows, **0 real-content**
+> precision regressions (gated by `nemetz_metrics::phantom_fp_ceiling`). All 141
+> DBs additionally pass the panic-free `nemetz_robustness.rs` pipeline harness.
 
 `Ddel` = rows deleted; `Drec` = of those, the recoverable substrate — rows whose
 scored identity still physically survives in the file; `live` = live rows wrongly

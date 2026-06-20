@@ -1582,8 +1582,8 @@ impl Database {
     /// column count, used to apply the `INTEGER PRIMARY KEY` rowid-alias rule.
     ///
     /// Shares ONE b-tree/overflow walk with the snapshot-scoped read
-    /// ([`CommitSnapshot::read_table`]) via the [`PageSource`] abstraction, so the
-    /// live and historical paths can never diverge.
+    /// ([`CommitSnapshot::read_table`]) via an internal page-source abstraction, so
+    /// the live and historical paths can never diverge.
     pub fn read_table(&self, root_page: u32, column_count: usize) -> Result<Vec<Row>, Error> {
         read_table_via(self, root_page, column_count)
     }
@@ -2244,7 +2244,8 @@ impl CommitSnapshot {
     /// rowid order.
     ///
     /// This is the snapshot-scoped counterpart to [`Database::read_table`]: it
-    /// shares the SAME b-tree/overflow walk via [`PageSource`], so a large row
+    /// shares the SAME b-tree/overflow walk via an internal page-source
+    /// abstraction, so a large row
     /// decodes with the page content as of this commit (not stale/future content
     /// the live view would supply). `column_count` drives only the
     /// `INTEGER PRIMARY KEY` rowid-alias rule (pass the table's declared arity,

@@ -1143,6 +1143,23 @@ pub fn attribute_records(db: &Database, records: &[CarvedRecord]) -> Vec<Attribu
         .collect()
 }
 
+/// The core per-rowid VERSION HISTORY ([`Database::row_histories`]) augmented with
+/// free-space CARVED RESIDUE — the forensic-layer completion of Phase 1.
+///
+/// Carved residue is ORDER-UNKNOWN: a freeblock persists across commits, so
+/// [`carve_at_commit`] / [`carve_with_fragments`] tag where residue was OBSERVED,
+/// not where the row was deleted. Each carved record is therefore emitted as a
+/// [`VersionOrigin::CarvedResidue`] / [`ViewState::CarvedResidue`] version with
+/// `commit_seq: None` (never a fabricated commit position), `is_deleted: true`,
+/// and `is_guessed` set when its [`Attribution`] is `Inferred`. Residue is
+/// attributed to a table via [`attribute_records`] and DEDUPED against any WAL
+/// `AbsentInFinalView` version of the same rowid + values (the WAL holds it at
+/// higher fidelity), so a row is never double-listed.
+#[must_use]
+pub fn row_histories_with_residue(db: &Database) -> Vec<sqlite_core::row_history::TableHistory> {
+    db.row_histories()
+}
+
 #[cfg(test)]
 mod attribution_tests {
     use super::{

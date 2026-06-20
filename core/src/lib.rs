@@ -97,6 +97,24 @@ pub struct Row {
     pub values: Vec<Value>,
 }
 
+/// A live user table dumped for export: its name, the column header to present,
+/// and every live row in rowid order. Produced by [`Database::live_table_rows`].
+///
+/// `column_names` are the table's **real** column names parsed from its
+/// `CREATE TABLE` when available, falling back to generic `c0..c{N-1}` (sized to
+/// the widest row) when the schema parse was low-confidence — so a header is
+/// always present and never a fabricated guess. `rows` preserves b-tree order,
+/// which for an integer-rowid table is ascending rowid order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveTableDump {
+    /// Table name from `sqlite_master.name`.
+    pub name: String,
+    /// Header column names: real names from the schema, or `c0..c{N-1}`.
+    pub column_names: Vec<String>,
+    /// Every live row (rowid + decoded values), in b-tree (rowid) order.
+    pub rows: Vec<Row>,
+}
+
 /// A record-shaped cell recovered from unallocated / free space by
 /// [`Database::carve_cells`]. Carries the decoded row plus enough provenance for
 /// the analyzer to grade it as a "consistent with a deleted row" observation.
@@ -1298,6 +1316,49 @@ impl Database {
             });
         }
         tables
+    }
+
+    /// Dump every live user table for export: name, header columns, and all live
+    /// rows in rowid order. The base layer the combined live + recovered workbook
+    /// is built over.
+    ///
+    /// For each [`Database::live_tables`] entry, the b-tree is read via
+    /// [`Database::read_table`] (so rows arrive in ascending-rowid b-tree order).
+    /// The header is the table's **real** column names when the schema parse was
+    /// confident, otherwise generic `c0..c{N-1}` sized to the widest row — a
+    /// header is always present and never a fabricated name. Best-effort and
+    /// panic-free: a table whose b-tree is unreadable contributes an empty row set
+    /// rather than erroring.
+    #[must_use]
+    pub fn live_table_rows(&self) -> Vec<LiveTableDump> {
+        self.live_tables()
+            .into_iter()
+            .map(|table| {
+                // `read_table`'s column_count drives only the INTEGER PRIMARY KEY
+                // rowid-alias rule; use the declared arity when known, else 0
+                // (no alias substitution) so a low-confidence schema still dumps.
+                let declared = table.column_names.as_ref().map_or(0, Vec::len);
+                let rows = self
+                    .read_table(table.rootpage, declared)
+                    .unwrap_or_default();
+                let widest = rows.iter().map(|r| r.values.len()).max().unwrap_or(0);
+                let column_names = match table.column_names {
+                    // Confident schema parse: use the table's real column names.
+                    // Live rows legitimately omit trailing NULLs, so `widest` may
+                    // be < declared — the real header still governs (a recovered
+                    // row pads/truncates to it).
+                    Some(names) => names,
+                    // Low-confidence parse: generic header sized to the widest row,
+                    // never a fabricated real name.
+                    None => (0..widest).map(|i| format!("c{i}")).collect(),
+                };
+                LiveTableDump {
+                    name: table.name,
+                    column_names,
+                    rows,
+                }
+            })
+            .collect()
     }
 
     /// A map from each **allocated** page that belongs to a live table's b-tree

@@ -1087,6 +1087,8 @@ pub struct MergedRow {
     pub cells: Vec<Value>,
     /// `true` for a recovered row — the renderer tints the whole row.
     pub is_deleted: bool,
+    /// `true` for a Tier-2 inferred row — tinted pale yellow instead of red.
+    pub is_guessed: bool,
 }
 
 /// A live table's combined sheet: its name, the header (real columns + the three
@@ -1187,6 +1189,7 @@ fn live_merged_row(values: &[Value], width: usize) -> MergedRow {
     MergedRow {
         cells,
         is_deleted: false,
+        is_guessed: false,
     }
 }
 
@@ -1200,6 +1203,7 @@ fn recovered_merged_row(r: &RecoveredRow, width: usize) -> MergedRow {
     MergedRow {
         cells,
         is_deleted: true,
+        is_guessed: r.is_guessed,
     }
 }
 
@@ -1464,9 +1468,26 @@ pub fn recovered_tables_xlsx_bytes(
         .map_err(|e| format!("cannot build recovered xlsx {}: {e}", path.display()))
 }
 
-/// The pale-red fill marking a recovered (deleted) row across the combined
-/// workbook — a live row is left unfilled so deleted rows read at a glance.
+/// The pale-red fill marking a **certain** recovered (deleted) row across the
+/// combined workbook — a live row is left unfilled so deleted rows read at a glance.
 const RECOVERED_FILL: u32 = 0x00FF_E0E0;
+
+/// The pale-yellow fill marking a **guessed** (Tier-2 inferred) recovered row, so
+/// an inferred row reads distinct from a certain one at a glance.
+const GUESSED_FILL: u32 = 0x00FF_FFCC;
+
+/// The row fill for a combined-workbook row: none for a live row, pale yellow for
+/// a guessed (inferred) recovered row, pale red for a certain recovered row.
+/// `is_guessed` implies `is_deleted`, so it is checked first.
+fn fill_for(is_deleted: bool, is_guessed: bool) -> Option<u32> {
+    if is_guessed {
+        Some(GUESSED_FILL)
+    } else if is_deleted {
+        Some(RECOVERED_FILL)
+    } else {
+        None
+    }
+}
 
 /// Render the **combined** live + recovered workbook to in-memory bytes.
 ///
@@ -1484,6 +1505,7 @@ pub fn render_combined_xlsx(
 ) -> Result<Vec<u8>, XlsxError> {
     let header_fmt = Format::new().set_bold();
     let recovered_fmt = Format::new().set_background_color(RECOVERED_FILL);
+    let guessed_fmt = Format::new().set_background_color(GUESSED_FILL);
     let plain_fmt = Format::new();
     let mut workbook = Workbook::new();
     let mut taken: Vec<String> = Vec::new();
@@ -1495,11 +1517,11 @@ pub fn render_combined_xlsx(
         write_header(ws, &sheet.columns, &header_fmt)?;
         for (r, mrow) in sheet.rows.iter().enumerate() {
             let row = r as u32 + 1;
-            // A recovered row is tinted; a live row is left unfilled.
-            let fmt = if mrow.is_deleted {
-                &recovered_fmt
-            } else {
-                &plain_fmt
+            // Live → unfilled; certain recovered → pale red; guessed → pale yellow.
+            let fmt = match fill_for(mrow.is_deleted, mrow.is_guessed) {
+                None => &plain_fmt,
+                Some(c) if c == GUESSED_FILL => &guessed_fmt,
+                Some(_) => &recovered_fmt,
             };
             for (c, value) in mrow.cells.iter().enumerate() {
                 write_value_cell(ws, row, c as u16, value, fmt)?;
@@ -3515,7 +3537,11 @@ mod tests {
     }
 
     fn merged_row(cells: Vec<Value>, is_deleted: bool) -> MergedRow {
-        MergedRow { cells, is_deleted }
+        MergedRow {
+            cells,
+            is_deleted,
+            is_guessed: false,
+        }
     }
 
     /// The combined renderer writes one sheet per [`MergedSheet`] plus the extra

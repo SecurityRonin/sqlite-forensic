@@ -51,6 +51,10 @@ pub enum ViewState {
 
 /// One version of one row: a distinct record value the rowid held at some point,
 /// with its evidence-based classification and logical provenance.
+// The boolean flags are independent EVIDENCE bits (deleted / guessed / reused /
+// uncertain), each separately consumed by a renderer — not a hidden state machine
+// that a two-variant enum would clarify, so the excessive-bools lint is waived.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowVersion {
     /// The rowid this version belongs to. `None` only for a carved residue whose
@@ -101,6 +105,9 @@ pub struct TableHistory {
 /// logical position and trust flags. The ordered list of these (commit views in
 /// epoch order, then the final live view last) is the input to
 /// [`build_rowid_versions`].
+// `is_final` / `checksum_valid` / `schema_known` are independent per-view trust
+// bits, not a state machine; the excessive-bools lint is waived for clarity.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowView {
     /// LOGICAL commit sequence within the salt epoch (monotonic within an epoch
@@ -250,4 +257,75 @@ pub fn build_rowid_versions(rowid: i64, views: &[RowView]) -> Vec<RowVersion> {
             }
         })
         .collect()
+}
+
+/// Assemble the [`TableHistory`] for ONE table from its chronological `views`
+/// (commit views in epoch order, then the final live view last) and its schema.
+///
+/// `WITHOUT ROWID` tables have no rowid to key a history on, so they are recorded
+/// with `without_rowid = true` and NO versions (a renderer annotates their
+/// presence). For an ordinary table, every rowid that appears in any view is run
+/// through [`build_rowid_versions`]; the resulting versions are sorted by `rowid`
+/// then `commit_seq` ascending (a `None` `commit_seq` — the live or order-unknown
+/// value — sorts LAST within a rowid).
+///
+/// Pure: no I/O.
+#[must_use]
+pub fn table_history(
+    table: String,
+    columns: Vec<String>,
+    without_rowid: bool,
+    views: &[RowView],
+) -> TableHistory {
+    if without_rowid {
+        return TableHistory {
+            table,
+            columns,
+            without_rowid: true,
+            versions: Vec::new(),
+        };
+    }
+    // Every rowid seen across all views, ascending.
+    let mut rowids: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    for v in views {
+        rowids.extend(v.rows.keys().copied());
+    }
+    let mut versions: Vec<RowVersion> = Vec::new();
+    for rowid in rowids {
+        versions.extend(build_rowid_versions(rowid, views));
+    }
+    sort_versions(&mut versions);
+    TableHistory {
+        table,
+        columns,
+        without_rowid: false,
+        versions,
+    }
+}
+
+/// Sort versions by `rowid` (`None` last), then `commit_seq` ascending with a
+/// `None` `commit_seq` (live / order-unknown carved residue) grouped LAST within
+/// the rowid. Stable, so equal keys keep chronological insertion order.
+fn sort_versions(versions: &mut [RowVersion]) {
+    versions.sort_by(|a, b| {
+        // rowid: Some(_) before None; within Some, ascending by id.
+        let ra = a.rowid;
+        let rb = b.rowid;
+        let rowid_ord = match (ra, rb) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        rowid_ord.then_with(|| {
+            // commit_seq: Some(_) (positioned) before None (live/residue), then
+            // ascending within Some.
+            match (a.commit_seq, b.commit_seq) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        })
+    });
 }

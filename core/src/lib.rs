@@ -1382,7 +1382,110 @@ impl Database {
     /// no versions (they have no rowid to key a history on).
     #[must_use]
     pub fn row_histories(&self) -> Vec<row_history::TableHistory> {
-        Vec::new()
+        use row_history::{RowView, VersionOrigin};
+
+        // Live tables: name, header columns, live rows, and a WITHOUT ROWID flag
+        // read from the live schema (a WITHOUT ROWID table has no rowid history).
+        let live_dumps = self.live_table_rows();
+        let without_rowid = self.live_without_rowid_map();
+
+        // Per table, build the chronological views: each WAL commit snapshot (in
+        // epoch order, commit_seq = per-epoch ordinal) then the final live view.
+        let mut histories = Vec::with_capacity(live_dumps.len());
+        for dump in live_dumps {
+            let wr = without_rowid.get(&dump.name).copied().unwrap_or(false);
+            let mut views: Vec<RowView> = Vec::new();
+
+            // Historical views from the WAL timeline, if any.
+            if let Some(timeline) = self.wal_timeline() {
+                // commit_seq is monotonic WITHIN a salt epoch only — count per
+                // segment, never one global sequence spanning a salt reset.
+                let mut seq_in_segment: std::collections::BTreeMap<WalSegmentId, u32> =
+                    std::collections::BTreeMap::new();
+                for snapshot in timeline.commit_snapshots() {
+                    let seg = snapshot.id().segment;
+                    let seq = seq_in_segment.entry(seg).or_insert(0);
+                    let commit_seq = *seq;
+                    *seq += 1;
+
+                    // Resolve THIS table from the snapshot's OWN schema (a rootpage
+                    // can be reused by a different table across commits).
+                    let snap_tables = snapshot.tables();
+                    let Some(st) = snap_tables.iter().find(|t| t.name == dump.name) else {
+                        continue; // table did not exist at this commit
+                    };
+                    if st.without_rowid {
+                        continue; // no rowid history for a WITHOUT ROWID table
+                    }
+                    // schema_known: the snapshot's CREATE TABLE parsed to columns.
+                    let schema_known = !st.columns.is_empty();
+                    let rows = match snapshot.read_table(st.rootpage, st.columns.len()) {
+                        Ok(rows) => rows.into_iter().collect(),
+                        // An unreadable historical b-tree contributes no rows but
+                        // must not abort the whole history.
+                        Err(_) => std::collections::BTreeMap::new(),
+                    };
+                    views.push(RowView {
+                        commit_seq: Some(commit_seq),
+                        is_final: false,
+                        checksum_valid: snapshot.checksum_valid(),
+                        schema_known,
+                        origin: VersionOrigin::Commit(snapshot.id()),
+                        rows,
+                    });
+                }
+            }
+
+            // The final live view (current on-disk ⊕ WAL state).
+            let live_rows: std::collections::BTreeMap<i64, Vec<Value>> = dump
+                .rows
+                .iter()
+                .map(|r| (r.rowid, r.values.clone()))
+                .collect();
+            views.push(RowView {
+                commit_seq: None,
+                is_final: true,
+                checksum_valid: true,
+                schema_known: true,
+                origin: VersionOrigin::Live,
+                rows: live_rows,
+            });
+
+            histories.push(row_history::table_history(
+                dump.name,
+                dump.column_names,
+                wr,
+                &views,
+            ));
+        }
+        histories
+    }
+
+    /// Map each live user table's name to whether it is a `WITHOUT ROWID` table,
+    /// read from the live `sqlite_master` schema. Best-effort and panic-free.
+    fn live_without_rowid_map(&self) -> std::collections::BTreeMap<String, bool> {
+        let mut map = std::collections::BTreeMap::new();
+        let Ok(schema) = self.read_table(1, 5) else {
+            return map; // cov:unreachable: a validly-opened DB has a readable page-1 schema
+        };
+        for row in schema {
+            let is_table = matches!(row.values.first(), Some(Value::Text(t)) if t == "table");
+            if !is_table {
+                continue;
+            }
+            let Some(Value::Text(name)) = row.values.get(1) else {
+                continue; // cov:unreachable: a 'table' schema row has a TEXT name
+            };
+            if name.starts_with("sqlite_") {
+                continue;
+            }
+            let sql = match row.values.get(4) {
+                Some(Value::Text(s)) => s.as_str(),
+                _ => "", // cov:unreachable: a 'table' schema row carries its CREATE TABLE sql
+            };
+            map.insert(name.clone(), without_rowid_sql(sql));
+        }
+        map
     }
 
     /// Dump every live user table for export: name, header columns, and all live

@@ -124,9 +124,9 @@ fn carve_no_fragments() {
 
 /// A `-wal` sidecar co-located with the database is auto-detected (the
 /// `resolve_wal_path` auto-detect branch), so the WAL-applied carve runs and
-/// exits 0. Driven in default write-mode with `--out` to a scratch path so the
-/// rebuilt db lands in isolation (and the WAL branch of `collect_full_records`
-/// is exercised).
+/// exits 0. Driven in default write-mode with `--out` to a scratch stem so the
+/// output lands in isolation (and the WAL branch of `collect_for_rebuild` is
+/// exercised).
 #[test]
 fn carve_auto_detects_wal_sidecar() {
     let dir = Scratch::new("wal_auto");
@@ -134,7 +134,7 @@ fn carve_auto_detects_wal_sidecar() {
         .args(["carve"])
         .arg(data_dir().join("wal_places.db"))
         .arg("--out")
-        .arg(dir.join("recovered.db"))
+        .arg(dir.join("recovered"))
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve over a WAL db must exit 0");
@@ -150,7 +150,7 @@ fn carve_no_wal_uses_on_disk_only() {
         .arg(data_dir().join("wal_places.db"))
         .args(["--no-wal"])
         .arg("--out")
-        .arg(dir.join("recovered.db"))
+        .arg(dir.join("recovered"))
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve --no-wal must exit 0");
@@ -167,7 +167,7 @@ fn carve_explicit_wal_path() {
         .arg("--wal")
         .arg(data_dir().join("wal_places.db-wal"))
         .arg("--out")
-        .arg(dir.join("recovered.db"))
+        .arg(dir.join("recovered"))
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve --wal <path> must exit 0");
@@ -208,8 +208,7 @@ fn default_carve_writes_combined_xlsx_not_db() {
     );
     // The produced xlsx is the COMBINED workbook: the live table's own sheet with
     // the three trailing flag columns.
-    let mut wb: calamine::Xlsx<_> =
-        calamine::open_workbook(&xlsx).expect("xlsx must open in calamine");
+    let wb: calamine::Xlsx<_> = calamine::open_workbook(&xlsx).expect("xlsx must open in calamine");
     let names = wb.sheet_names();
     assert!(
         names.iter().any(|n| n == "moz_places"),

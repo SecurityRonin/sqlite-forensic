@@ -7,11 +7,11 @@
 
 # sqlite-forensic
 
-**The deleted rows are the evidence — and `sqlite3` can't see them.** `sqlite4n6` carves deleted records back out of any SQLite database — browser history, chat apps, mobile artifacts — into a **fresh database you can query in seconds**. It opens the evidence read-only, never writes it, and never re-surfaces a live row as "deleted".
+**The deleted rows are the evidence — and `sqlite3` can't see them.** `sqlite4n6` carves deleted records back out of any SQLite database — browser history, chat apps, mobile artifacts — into a **review-ready spreadsheet you can open in seconds**, the deleted rows folded back into their tables and flagged. It opens the evidence read-only, never writes it, and never re-surfaces a live row as "deleted".
 
 ```bash
 brew install securityronin/tap/sqlite4n6
-sqlite4n6 carve History.db          # → History.recovered.db
+sqlite4n6 carve History.db          # → History.recovered.xlsx
 ```
 
 **[Full documentation →](https://securityronin.github.io/sqlite-forensic/)**
@@ -22,15 +22,22 @@ sqlite4n6 carve History.db          # → History.recovered.db
 
 ```console
 $ sqlite4n6 carve History.db
-wrote 412 record(s) and 9 fragment(s) to History.recovered.db
+wrote 412 record(s) and 9 fragment(s) to History.recovered.xlsx
+```
 
-$ sqlite3 History.recovered.db 'SELECT _rowid, url FROM recovered_urls LIMIT 3'
+Open `History.recovered.xlsx` and the deleted rows are already **folded back into each table by rowid** and tinted, with `is_deleted` / `is_guessed` flag columns — a review-ready view, no schema to reconstruct by hand and no flags to learn. **Image BLOBs come back as in-cell thumbnails; every cell is recovered natively and losslessly.** Prefer a queryable database? Add `--db` and you also get `History.carved.db`:
+
+```console
+$ sqlite4n6 carve History.db --db
+wrote 412 record(s) and 9 fragment(s) to History.recovered.xlsx (+ History.carved.db)
+
+$ sqlite3 History.carved.db 'SELECT _rowid, url FROM recovered_moz_places LIMIT 3'
 588|https://mail.example.com/inbox
 587|https://news.example.com/the-story-they-deleted
 586|https://example.com/account/settings
 ```
 
-Deleted rows, in an ordinary SQLite file, queried with the tools already on your box. `carve` rebuilds the database for you — no schema to reconstruct by hand, no flags to learn. **BLOBs come back natively and losslessly.** The evidence database and its `-wal`/`-shm` sidecars are **never** touched.
+Deleted rows, in tools already on your box. The evidence database and its `-wal`/`-shm` sidecars are **never** touched.
 
 Precision-first, and **measured against independent ground truth** (the Nemetz *SQLite Forensic Corpus*, DFRWS-EU 2018): the **highest precision of any tool in the comparison**, **0 live-row re-reads**, and freeblock-aware recall of **0.833** on the cleanest category — ahead of `fqlite`'s 0.798. [How it's measured →](#trust-but-verify)
 
@@ -62,20 +69,20 @@ cargo install --git https://github.com/SecurityRonin/sqlite-forensic sqlite4n6
 
 ## What you get
 
-By default `carve` **rebuilds a queryable SQLite database** — `<name>.recovered.db` — so there is nothing left to parse. Recovered rows are **attributed back to their source table in three honest tiers** — observed fact, forensic inference, and unknown — each in its own table, all carrying the provenance columns (`_page`, `_offset`, `_rowid`, `_source`, `_confidence`) and the carved cells in their **native types** (a recovered `BLOB` is stored byte-for-byte):
+By default `carve` writes a **combined review workbook** — `<name>.recovered.xlsx` — so there is nothing to parse and nothing to reconstruct by hand. The source database is dumped **one sheet per live table** (its real column names) with the recovered (deleted) rows **folded back into their table by rowid**. Each recovered row is tinted **pale red** and carries three trailing flag columns — `is_deleted` (1 for a carved row), `is_guessed` (1 when the row was attributed by shape, consistent with that table rather than hard-linked), and `table_match_ambiguous` (1 when more than one table fit the shape). Rows whose rowid was destroyed sink to the bottom of their sheet. Unattributed rows and partial fragments stay in their own `recovered_unattributed` / `recovered_fragments` tabs. **Image BLOBs — live and recovered — are shown as in-cell thumbnails** (PNG/JPEG/GIF/BMP/WebP/TIFF); a video BLOB shows a typed `video/<ext> · <size>` placeholder (first-frame extraction is deferred). A sheet exceeding Excel's 1,048,576-row limit is truncated with a warning naming the table and dropped count.
+
+Need a queryable database too? Add `--db` to also write `<name>.carved.db` (same stem, `--out`'s stem honored) — the raw carved records as a SQLite file, **attributed back to their source table in three honest tiers** — observed fact, forensic inference, and unknown — each in its own table, all carrying the provenance columns (`_page`, `_offset`, `_rowid`, `_source`, `_confidence`) and the carved cells in their **native types** (a recovered `BLOB` is stored byte-for-byte):
 
 - **`recovered_<table>` — CERTAIN (observed fact).** The row was carved from a page still part of a live table's b-tree, so the owning table is known for sure; the columns are that table's **real names** (parsed from its `CREATE TABLE`). If the names cannot be parsed with confidence, the table keeps its real name but falls back to generic `c0..cN` columns — never wrong names.
 - **`recovered_inferred` — INFERRED (consistent with).** The whole page was freed, so the hard table linkage is cut. The row's **shape** (column count + per-column affinity) is matched against every surviving table; a `_table_guess` column names the candidate and `_table_match_ambiguous` (0/1) flags when more than one table is equally consistent. This is a forensic inference, never asserted as fact.
 - **`recovered_unattributed` — UNKNOWN.** Dropped-table residue, or a shape matching no surviving table — recovered in full, attributed to nothing.
 - **`recovered_fragments`** — the **separate** Tier-2 partial-salvage table (a distinctive cell survived but the row's identity did not), kept distinct so a fragment is never mistaken for a full row. `--no-fragments` drops it.
 
-Need a spreadsheet for review? Add `--xlsx` to also write `<name>.recovered.xlsx` (same stem as the rebuilt db, `--out`'s stem honored) — a **combined workbook**: the source database dumped **one sheet per live table** (its real column names) with the recovered (deleted) rows **folded back into their table by rowid**. Each recovered row is tinted **pale red** and carries three trailing flag columns — `is_deleted` (1 for a carved row), `is_guessed` (1 when the row was attributed by shape, consistent with that table rather than hard-linked), and `table_match_ambiguous` (1 when more than one table fit the shape). Rows whose rowid was destroyed sink to the bottom of their sheet. Tier-3 unattributed rows and partial fragments stay in their own `recovered_unattributed` / `recovered_fragments` tabs. **Image BLOBs — live and recovered — are shown as in-cell thumbnails** (PNG/JPEG/GIF/BMP/WebP/TIFF); a video BLOB shows a typed `video/<ext> · <size>` placeholder (first-frame extraction is deferred). A sheet exceeding Excel's 1,048,576-row limit is truncated with a warning naming the table and dropped count.
-
-Want a stream instead of a file? Pick a format; want the file elsewhere? Pick a path:
+Want a queryable database, the files elsewhere, or a stream instead? Pick the option:
 
 ```console
-$ sqlite4n6 carve ChatStorage.sqlite --out /cases/2026-001/recovered.db  # choose the output path
-$ sqlite4n6 carve ChatStorage.sqlite --xlsx             # also write a combined live + recovered workbook (image thumbnails in-cell)
+$ sqlite4n6 carve ChatStorage.sqlite --db               # also write a queryable <name>.carved.db
+$ sqlite4n6 carve ChatStorage.sqlite --out /cases/2026-001/case  # set the output stem (→ case.recovered.xlsx)
 $ sqlite4n6 carve ChatStorage.sqlite --format table     # recovered rows to stdout (or: csv, jsonl)
 $ sqlite4n6 carve ChatStorage.sqlite --format jsonl     # one JSON object per record (BLOBs as base64)
 $ sqlite4n6 carve ChatStorage.sqlite --min-confidence medium  # drop low-confidence carves
@@ -188,7 +195,7 @@ The `AnomalyKind` enum is `#[non_exhaustive]`: new codes can be added without a 
 
 A carver that *over*-reports is worse than useless on an evidence database — it manufactures rows that were never deleted. The design goal of this carver is therefore precision over recall, enforced structurally rather than by inspection:
 
-- **Read-only, panic-free, `forbid(unsafe)`** — `Database::open` owns a `Vec<u8>` and never writes back to the artifact; the whole workspace denies `unsafe` at compile time and reads every length/offset through bounds-checked helpers, so a malformed, attacker-controlled database cannot reach a raw-pointer path or panic. (The rebuilt `*.recovered.db` is a separate, new output file — the evidence is still never written.)
+- **Read-only, panic-free, `forbid(unsafe)`** — `Database::open` owns a `Vec<u8>` and never writes back to the artifact; the whole workspace denies `unsafe` at compile time and reads every length/offset through bounds-checked helpers, so a malformed, attacker-controlled database cannot reach a raw-pointer path or panic. (The `*.recovered.xlsx` workbook and the `--db` `*.carved.db` are separate, new output files — the evidence is still never written.)
 - **Measured against independent third-party ground truth.** Recall and precision are computed per database against the **SQLite Forensic Corpus** (Nemetz, Schmitt & Freiling, DFRWS-EU 2018, CC0), whose authors shipped a per-row deleted-record answer key — so the truth set is theirs, not ours. The harness (`forensic/tests/nemetz_metrics.rs`) emits a reproducible confusion matrix; the full table is in [`docs/recovery-comparison.md`](docs/recovery-comparison.md).
 - **High precision, structurally — never a live-row re-read.** Our carver carves only the *complement* of the live cell extents on a page, then drops any carved record whose rowid is currently live. Across the Nemetz recall corpus it produces **0 live-re-reads** (verified against the answer key's live rows), with only a small, low-confidence **phantom** class (all-empty/NULL records the inferred carver matches on a run of zero bytes). The two over-reporting failure modes the reference oracles exhibit on no-deletion databases — re-reading live cells, and re-surfacing a stale byte-copy of a live row — our carver does not.
 - **Strong in-page recall via freeblock reconstruction — reported honestly.** On the cleanest category (`0C`: records deleted in place, `secure_delete=0`, no overwrite, so **every** deleted row's bytes survive) the carver recovers **70 of the 84** cross-tool-scored rows (recall **0.833**), ahead of `fqlite`'s 0.798. SQLite overwrites a freed cell's first four bytes (payload-length + rowid varints, `header_len`, leading serial) with the freeblock pointer; `reconstruct_freeblock_records` rebuilds each record from its surviving serial-type tail plus a schema template derived from a live cell on the same page, with the destroyed rowid surfaced as unknown. It does so at higher precision than `fqlite` and **0 live-re-reads**.

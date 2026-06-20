@@ -1498,16 +1498,79 @@ const RECOVERED_FILL: u32 = 0x00FF_E0E0;
 /// an inferred row reads distinct from a certain one at a glance.
 const GUESSED_FILL: u32 = 0x00FF_FFCC;
 
-/// The row fill for a combined-workbook row: none for a live row, pale yellow for
-/// a guessed (inferred) recovered row, pale red for a certain recovered row.
-/// `is_guessed` implies `is_deleted`, so it is checked first.
-fn fill_for(is_deleted: bool, is_guessed: bool) -> Option<u32> {
-    if is_guessed {
+/// The pale-purple fill marking a **rowid-reused** version, so a reader never
+/// mistakes two distinct entities sharing one reused rowid for one continuous row.
+/// Highest precedence: a reused rowid is the strongest "do not conflate" signal.
+const REUSED_FILL: u32 = 0x00E6_CCFF;
+
+/// The pale-blue fill marking a **superseded** historical version
+/// ([`ViewState::ValueChangedLater`](sqlite_core::row_history::ViewState::ValueChangedLater)):
+/// a prior value of a still-live rowid that a later commit replaced.
+const SUPERSEDED_FILL: u32 = 0x00DD_EBFF;
+
+/// The row fill for a combined-workbook version row, by a 5-level PRECEDENCE
+/// (highest first):
+///
+/// 1. `rowid_reused` → pale purple — overrides the rest because the rowid may span
+///    DIFFERENT entities (delete+reinsert), never a continuous update.
+/// 2. `is_guessed` → pale yellow (Tier-2 inferred attribution).
+/// 3. `is_deleted` → pale red (deleted / carved-residue).
+/// 4. `superseded` (`ViewState::ValueChangedLater`) → pale blue (a prior value of a
+///    still-live rowid that a later commit replaced).
+/// 5. otherwise (`PresentInFinalView` / live current) → no fill.
+fn fill_for(
+    rowid_reused: bool,
+    is_guessed: bool,
+    is_deleted: bool,
+    superseded: bool,
+) -> Option<u32> {
+    if rowid_reused {
+        Some(REUSED_FILL)
+    } else if is_guessed {
         Some(GUESSED_FILL)
     } else if is_deleted {
         Some(RECOVERED_FILL)
+    } else if superseded {
+        Some(SUPERSEDED_FILL)
     } else {
         None
+    }
+}
+
+/// Render a [`ViewState`](sqlite_core::row_history::ViewState) as a stable output
+/// token for the `view_state` column.
+#[must_use]
+pub fn view_state_token(state: sqlite_core::row_history::ViewState) -> &'static str {
+    use sqlite_core::row_history::ViewState;
+    match state {
+        ViewState::PresentInFinalView => "present",
+        ViewState::ValueChangedLater => "changed_later",
+        ViewState::AbsentInFinalView => "absent_final",
+        ViewState::CarvedResidue => "carved_residue",
+    }
+}
+
+/// Render a [`VersionOrigin`](sqlite_core::row_history::VersionOrigin) as the
+/// `wal_commit` column token, resolving a [`Commit`](sqlite_core::row_history::VersionOrigin::Commit)
+/// to `commit:(salt1,salt2,frame_index)` from its `lsn` (the salt-qualified
+/// log-sequence identity the caller resolved via the timeline).
+///
+/// `Live` → `live`; `CarvedResidue` → `residue`; a `Commit` whose LSN could not be
+/// resolved degrades to `commit:?` rather than panicking — the WAL carries NO
+/// wall-clock time, only this logical commit coordinate.
+#[must_use]
+pub fn wal_commit_token(
+    origin: &sqlite_core::row_history::VersionOrigin,
+    lsn: Option<sqlite_core::WalLsn>,
+) -> String {
+    use sqlite_core::row_history::VersionOrigin;
+    match origin {
+        VersionOrigin::Live => "live".to_string(),
+        VersionOrigin::CarvedResidue => "residue".to_string(),
+        VersionOrigin::Commit(_) => match lsn {
+            Some(l) => format!("commit:({},{},{})", l.salt1, l.salt2, l.frame_index),
+            None => "commit:?".to_string(),
+        },
     }
 }
 
@@ -1540,7 +1603,7 @@ pub fn render_combined_xlsx(
         for (r, mrow) in sheet.rows.iter().enumerate() {
             let row = r as u32 + 1;
             // Live → unfilled; certain recovered → pale red; guessed → pale yellow.
-            let fmt = match fill_for(mrow.is_deleted, mrow.is_guessed) {
+            let fmt = match fill_for(false, mrow.is_guessed, mrow.is_deleted, false) {
                 None => &plain_fmt,
                 Some(c) if c == GUESSED_FILL => &guessed_fmt,
                 Some(_) => &recovered_fmt,

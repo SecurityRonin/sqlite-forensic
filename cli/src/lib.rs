@@ -1050,6 +1050,167 @@ fn fragments_table(frags: &[CarvedFragment]) -> RecoveredTable {
     }
 }
 
+// ---- combined live + recovered merge --------------------------------------
+
+/// Excel's hard cap on rows in a worksheet (`1,048,576`), including the header.
+/// A merged sheet exceeding it is truncated and the drop is reported, never
+/// silently swallowed.
+pub const EXCEL_MAX_ROWS: usize = 1_048_576;
+
+/// The three trailing flag columns appended to every combined table sheet, in
+/// order: recovered-vs-live, inferred-vs-certain, and shape-ambiguity.
+const FLAG_COLS: [&str; 3] = ["is_deleted", "is_guessed", "table_match_ambiguous"];
+
+/// One recovered (deleted) row folded into a live table's sheet. Its `cells`
+/// align to the table's real columns by position (padded/truncated by
+/// [`merge_table_sheet`]); `rowid` is `None` when the rowid was destroyed (it
+/// then sinks to the bottom of the sheet). `is_guessed` marks a Tier-2 inferred
+/// row, `ambiguous` that its shape matched more than one table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveredRow {
+    /// Recovered rowid, or `None` when destroyed/unknown (→ bottom of sheet).
+    pub rowid: Option<i64>,
+    /// Recovered cells, aligned to the real columns by position.
+    pub cells: Vec<Value>,
+    /// `true` for a Tier-2 inferred row (`is_guessed=1`), else `false`.
+    pub is_guessed: bool,
+    /// `true` when the inferred shape matched more than one table.
+    pub ambiguous: bool,
+}
+
+/// One row of a merged sheet: its cells (real columns padded/truncated, then the
+/// three flag values) and whether it is a recovered/deleted row (drives the pale
+/// red tint).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergedRow {
+    /// Real-column cells followed by the three flag cells.
+    pub cells: Vec<Value>,
+    /// `true` for a recovered row — the renderer tints the whole row.
+    pub is_deleted: bool,
+}
+
+/// A live table's combined sheet: its name, the header (real columns + the three
+/// flag columns), and the merged rows (live + recovered, interleaved by rowid).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergedSheet {
+    /// Table name (later run through [`sanitize_sheet_name`] for the worksheet).
+    pub name: String,
+    /// Real columns followed by `is_deleted, is_guessed, table_match_ambiguous`.
+    pub columns: Vec<String>,
+    /// The interleaved rows, capped at the Excel row limit.
+    pub rows: Vec<MergedRow>,
+}
+
+/// Build one live table's combined sheet: every live row (rowid order) with the
+/// attributed recovered rows folded in, sorted by rowid, unknown-rowid recovered
+/// rows appended at the bottom. Returns the sheet plus the number of data rows
+/// dropped to honor `row_cap`.
+///
+/// The header is `real_columns` followed by the three flag columns. Each row's
+/// cells are padded with NULL / truncated to `real_columns.len()`, then the flag
+/// triple is appended: a live row is `0,0,0`; a certain recovered row `1,0,0`; an
+/// inferred recovered row `1,1,{ambiguous}`. `is_deleted` on [`MergedRow`] mirrors
+/// the first flag so the renderer can tint without re-reading the cell.
+///
+/// `row_cap` bounds the **data** rows (the +1 header is the caller's concern). A
+/// sheet exceeding it is truncated to `row_cap` rows and the surplus is returned
+/// as the dropped count so the caller can warn — truncation is never silent.
+#[must_use]
+pub fn merge_table_sheet(
+    name: &str,
+    real_columns: &[String],
+    live_rows: &[sqlite_core::Row],
+    recovered: Vec<RecoveredRow>,
+    row_cap: usize,
+) -> (MergedSheet, usize) {
+    let width = real_columns.len();
+    let mut columns: Vec<String> = real_columns.to_vec();
+    columns.extend(FLAG_COLS.iter().map(|s| (*s).to_string()));
+
+    // Split recovered rows into rowid-bearing (interleave) and rowid-destroyed
+    // (sink to the bottom), preserving input order within each group.
+    let mut known: Vec<(i64, RecoveredRow)> = Vec::new();
+    let mut unknown: Vec<RecoveredRow> = Vec::new();
+    for r in recovered {
+        match r.rowid {
+            Some(id) => known.push((id, r)),
+            None => unknown.push(r),
+        }
+    }
+
+    // A sortable key per rowid-bearing row: live (false) before recovered (true)
+    // on a rowid tie, so a recovered prior version sits just after its live row.
+    enum Pending<'a> {
+        Live(&'a sqlite_core::Row),
+        Recovered(RecoveredRow),
+    }
+    let mut pending: Vec<(i64, bool, Pending)> = Vec::new();
+    for row in live_rows {
+        pending.push((row.rowid, false, Pending::Live(row)));
+    }
+    for (id, r) in known {
+        pending.push((id, true, Pending::Recovered(r)));
+    }
+    // Stable sort by (rowid, live-before-recovered) keeps same-key input order.
+    pending.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    let mut rows: Vec<MergedRow> = Vec::with_capacity(pending.len() + unknown.len());
+    for (_, _, item) in pending {
+        match item {
+            Pending::Live(row) => rows.push(live_merged_row(&row.values, width)),
+            Pending::Recovered(r) => rows.push(recovered_merged_row(&r, width)),
+        }
+    }
+    // Unknown-rowid recovered rows go last, in input order.
+    for r in &unknown {
+        rows.push(recovered_merged_row(r, width));
+    }
+
+    let dropped = rows.len().saturating_sub(row_cap);
+    rows.truncate(row_cap);
+
+    (
+        MergedSheet {
+            name: name.to_string(),
+            columns,
+            rows,
+        },
+        dropped,
+    )
+}
+
+/// A live row's merged cells: its values padded/truncated to `width`, then the
+/// flag triple `0,0,0`. Not tinted.
+fn live_merged_row(values: &[Value], width: usize) -> MergedRow {
+    let mut cells = align_cells(values, width);
+    cells.extend([Value::Integer(0), Value::Integer(0), Value::Integer(0)]);
+    MergedRow {
+        cells,
+        is_deleted: false,
+    }
+}
+
+/// A recovered row's merged cells: its cells padded/truncated to `width`, then
+/// the flag triple `1, is_guessed, ambiguous`. Tinted (`is_deleted = true`).
+fn recovered_merged_row(r: &RecoveredRow, width: usize) -> MergedRow {
+    let mut cells = align_cells(&r.cells, width);
+    cells.push(Value::Integer(1));
+    cells.push(Value::Integer(i64::from(r.is_guessed)));
+    cells.push(Value::Integer(i64::from(r.ambiguous)));
+    MergedRow {
+        cells,
+        is_deleted: true,
+    }
+}
+
+/// Align `values` to exactly `width` cells: pad missing trailing cells with NULL,
+/// truncate any surplus. The position-aligned mapping to a table's real columns.
+fn align_cells(values: &[Value], width: usize) -> Vec<Value> {
+    (0..width)
+        .map(|i| values.get(i).cloned().unwrap_or(Value::Null))
+        .collect()
+}
+
 // ---- XLSX export: blob classification + human size ------------------------
 
 /// How a recovered BLOB should be presented in the XLSX export.
@@ -2955,8 +3116,8 @@ mod tests {
         );
     }
 
-    /// A Tier-2 inferred row reads is_guessed = 1 and carries its ambiguity flag;
-    /// an unknown-rowid recovered row is appended at the bottom, after the
+    /// A Tier-2 inferred row reads `is_guessed = 1` and carries its ambiguity
+    /// flag; an unknown-rowid recovered row is appended at the bottom, after the
     /// rowid-sorted rows.
     #[test]
     fn merged_sheet_inferred_flags_and_unknown_rowid_at_bottom() {

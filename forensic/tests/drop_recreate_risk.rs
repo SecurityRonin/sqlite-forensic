@@ -35,7 +35,7 @@ fn fired(recs: &[sqlite_forensic::CarvedRecord], risks: &[TableInstanceRisk]) ->
             TableInstanceRisk::RowidExceedsAutoincHighwater { rowid, seq, .. } => {
                 Some((*rowid, *seq))
             }
-            TableInstanceRisk::None => None,
+            _ => None,
         })
         .collect();
     out.sort_unstable();
@@ -51,7 +51,7 @@ fn risks_for(bytes: &[u8]) -> (Vec<sqlite_forensic::CarvedRecord>, Vec<TableInst
     (recs, risks)
 }
 
-/// `b_autoinc.db`: residue rowids 6..=10 exceed sqlite_sequence=5 → flag fires on
+/// `b_autoinc.db`: residue rowids 6..=10 exceed `sqlite_sequence=5` → flag fires on
 /// exactly those, each carrying the evidence (rowid, seq=5).
 #[test]
 fn b_autoinc_flags_residue_above_highwater() {
@@ -68,7 +68,7 @@ fn b_autoinc_flags_residue_above_highwater() {
     }
 }
 
-/// `b_plainpk.db`: no sqlite_sequence ⟹ the flag never fires, even though the
+/// `b_plainpk.db`: no `sqlite_sequence` ⟹ the flag never fires, even though the
 /// same residue rowids 6..=10 are recovered (the honest undecidable limit).
 #[test]
 fn b_plainpk_never_flags() {
@@ -84,7 +84,7 @@ fn b_plainpk_never_flags() {
 }
 
 /// `upd_autoinc.db` — Codex BLOCKER-1: the residue rowid 1000 exceeds
-/// sqlite_sequence=5 and the flag FIRES, yet that row was a CURRENT-instance row
+/// `sqlite_sequence=5` and the flag FIRES, yet that row was a CURRENT-instance row
 /// an `UPDATE` moved past the high-water mark, then deleted. The flag is a HINT —
 /// it correctly does NOT assert this is a dropped predecessor.
 #[test]

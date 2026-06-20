@@ -208,10 +208,21 @@ unattributed blobs (no table claim at all), so our distinct `predecessor` label 
 
 ## 7. Scope
 
-- **v1:** Detector A (bare AUTOINCREMENT) + the `predecessor_residue` flag + output
-  routing + the anti-regression guard. Self-contained, no sidecar needed, covers
-  the common AUTOINCREMENT app-schema case.
-- **v1 (if cheap):** Detector B, reusing the journal/WAL prior-schema machinery.
+- **v1 — SHIPPED (Detector A).** The `table_instance_risk` HINT flag
+  (`TableInstanceRisk::RowidExceedsAutoincHighwater`) for bare AUTOINCREMENT
+  residue whose `rowid` exceeds `sqlite_sequence`, surfaced as a `_table_instance_risk`
+  provenance column in the rebuilt `.carved.db` `recovered_<table>` tables and the
+  combined XLSX, and a `table_instance_risk` field in JSONL. Orthogonal to
+  [`Attribution`] — never a reroute, tier change, or predecessor assertion. Backed
+  by `sqlite-core` `is_autoincrement()` + `Database::sqlite_sequence()`. Validated
+  on real `sqlite3`-minted fixtures (`tests/data/drop_recreate/`) including the
+  Codex BLOCKER-1 `UPDATE`-the-rowid case, with the Nemetz zero-firing
+  anti-regression guard (`forensic/tests/drop_recreate_risk.rs`).
+- **Follow-up — Detector B.** A sidecar `-wal`/`-journal` DDL-boundary signal
+  (`TableInstanceRisk::SidecarSchemaChanged`, the reserved `#[non_exhaustive]`
+  variant), reusing the journal/WAL prior-schema machinery — a *table-level*
+  boundary event, still NOT row-level provenance. Not yet implemented.
 - **Explicit limit (documented, not faked):** bare, non-AUTOINCREMENT, no sidecar →
   drop-recreate is undecidable; residue stays attributed by storage with the
-  honesty caveat. This matches the survey's own statement of the problem.
+  honesty caveat, and the flag stays silent. This matches the survey's own
+  statement of the problem.

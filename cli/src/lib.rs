@@ -3201,4 +3201,209 @@ mod tests {
         assert_eq!(sheet.rows.len(), 3, "truncated to the cap");
         assert_eq!(dropped, 2, "two rows dropped past the cap");
     }
+
+    // ---- routing recovered records into live-table buckets -----------------
+
+    /// Tier-1 Known routes to its table (certain: is_guessed=0); Tier-2 Inferred
+    /// routes to the guessed table (is_guessed=1, carrying ambiguity); Tier-3
+    /// Unattributed and an inferred guess with no live sheet both land in the
+    /// unattributed bucket. A destroyed rowid (0) becomes `None`.
+    #[test]
+    fn route_recovered_buckets_by_attribution_tier() {
+        let live_names = vec!["people".to_string(), "notes".to_string()];
+        let records = vec![
+            rec(
+                5,
+                0.9,
+                RecoverySource::InPageFreeBlock,
+                vec![Value::Integer(5)],
+            ),
+            rec(
+                7,
+                0.8,
+                RecoverySource::FreelistPage,
+                vec![Value::Integer(7)],
+            ),
+            rec(
+                0,
+                0.6,
+                RecoverySource::DroppedTable,
+                vec![Value::Integer(0)],
+            ),
+            // Inferred guess to a table with no live sheet → unattributed.
+            rec(
+                9,
+                0.5,
+                RecoverySource::FreelistPage,
+                vec![Value::Integer(9)],
+            ),
+        ];
+        let attrs = vec![
+            Attribution::Known("people".to_string()),
+            Attribution::Inferred {
+                guess: "notes".to_string(),
+                ambiguous: true,
+            },
+            Attribution::Unattributed,
+            Attribution::Inferred {
+                guess: "ghost".to_string(),
+                ambiguous: false,
+            },
+        ];
+        let routed = route_recovered(&live_names, &records, &attrs);
+
+        let people = routed.by_table.get("people").expect("people bucket");
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].rowid, Some(5));
+        assert!(!people[0].is_guessed, "Tier-1 certain");
+
+        let notes = routed.by_table.get("notes").expect("notes bucket");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].is_guessed, "Tier-2 inferred");
+        assert!(notes[0].ambiguous, "ambiguity carried");
+
+        // Tier-3 (index 2) and the ghost-guess (index 3) are unattributed.
+        assert_eq!(routed.unattributed, vec![2, 3]);
+    }
+
+    /// A destroyed rowid (0) routes to its bucket with `rowid: None` so the
+    /// merge step sinks it to the bottom of the sheet.
+    #[test]
+    fn route_recovered_destroyed_rowid_is_none() {
+        let live_names = vec!["people".to_string()];
+        let records = vec![rec(
+            0,
+            0.9,
+            RecoverySource::InPageFreeBlock,
+            vec![Value::Integer(1)],
+        )];
+        let attrs = vec![Attribution::Known("people".to_string())];
+        let routed = route_recovered(&live_names, &records, &attrs);
+        assert_eq!(routed.by_table["people"][0].rowid, None);
+    }
+
+    // ---- combined workbook renderer (tint + flags + image embed) -----------
+
+    fn merged_row(cells: Vec<Value>, is_deleted: bool) -> MergedRow {
+        MergedRow { cells, is_deleted }
+    }
+
+    /// The combined renderer writes one sheet per [`MergedSheet`] plus the extra
+    /// (unattributed / fragments) tables, with the real header + the three flag
+    /// columns, and the live and recovered rows interleaved as given.
+    #[test]
+    fn combined_renderer_writes_merged_and_extra_sheets() {
+        let people = MergedSheet {
+            name: "people".to_string(),
+            columns: [
+                "id",
+                "name",
+                "is_deleted",
+                "is_guessed",
+                "table_match_ambiguous",
+            ]
+            .map(String::from)
+            .to_vec(),
+            rows: vec![
+                merged_row(
+                    vec![
+                        Value::Integer(1),
+                        Value::Text("live".into()),
+                        Value::Integer(0),
+                        Value::Integer(0),
+                        Value::Integer(0),
+                    ],
+                    false,
+                ),
+                merged_row(
+                    vec![
+                        Value::Integer(2),
+                        Value::Text("deleted".into()),
+                        Value::Integer(1),
+                        Value::Integer(0),
+                        Value::Integer(0),
+                    ],
+                    true,
+                ),
+            ],
+        };
+        let extra = vec![RecoveredTable {
+            name: "recovered_unattributed".to_string(),
+            columns: vec!["c0".to_string()],
+            rows: vec![vec![Value::Integer(7)]],
+        }];
+        let buf = render_combined_xlsx(&[people], &extra).unwrap();
+        let mut wb = open_xlsx(&buf);
+        let names = wb.sheet_names();
+        assert!(names.iter().any(|n| n == "people"), "{names:?}");
+        assert!(
+            names.iter().any(|n| n == "recovered_unattributed"),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "recovered_inferred"),
+            "no inferred sheet: {names:?}"
+        );
+
+        let sheet = wb.worksheet_range("people").unwrap();
+        let header: Vec<String> = sheet
+            .rows()
+            .next()
+            .unwrap()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        assert_eq!(
+            header,
+            vec![
+                "id",
+                "name",
+                "is_deleted",
+                "is_guessed",
+                "table_match_ambiguous"
+            ]
+        );
+        // Row 1 (live) is_deleted=0; row 2 (recovered) is_deleted=1.
+        assert_eq!(sheet.rows().nth(1).unwrap()[2], Data::Float(0.0));
+        assert_eq!(sheet.rows().nth(2).unwrap()[2], Data::Float(1.0));
+        assert_eq!(
+            sheet.rows().nth(2).unwrap()[1],
+            Data::String("deleted".into())
+        );
+    }
+
+    /// A live image BLOB in a merged sheet is embedded as media (the base dump
+    /// embeds images, not only recovered rows).
+    #[test]
+    fn combined_renderer_embeds_live_image_blob() {
+        let png = rgb_png(40, 40);
+        let sheet = MergedSheet {
+            name: "photos".to_string(),
+            columns: ["img", "is_deleted", "is_guessed", "table_match_ambiguous"]
+                .map(String::from)
+                .to_vec(),
+            rows: vec![merged_row(
+                vec![
+                    Value::Blob(png),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                ],
+                false,
+            )],
+        };
+        let buf = render_combined_xlsx(&[sheet], &[]).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
+        let mut media = false;
+        for i in 0..zip.len() {
+            let name = zip.by_index(i).unwrap().name().to_string();
+            let is_png = std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+            if name.starts_with("xl/media/") && is_png {
+                media = true;
+            }
+        }
+        assert!(media, "a live image BLOB must embed under xl/media/*.png");
+    }
 }

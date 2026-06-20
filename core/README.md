@@ -13,7 +13,7 @@ anomaly auditor and deleted-record carver) and the `sqlite4n6` CLI.
 
 It also provides a small SQLite *writer* (the `rebuild` module) that materializes
 recovered records into a **fresh** database — pure Rust, no engine linkage, used
-to emit the CLI's `*.recovered.db`. This writes only the new output file; the
+to emit the CLI's `--db` `*.carved.db`. This writes only the new output file; the
 evidence database is never written.
 
 ## Use

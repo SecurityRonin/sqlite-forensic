@@ -716,6 +716,94 @@ fn full_tier_equals_carve_all_on_every_corpus_db() {
     }
 }
 
+// --- full-corpus deleted-ground-truth coverage (task: full 141-DB vendoring) --
+// The vendored corpus now carries deleted answer keys for EIGHT categories, not
+// just the original five. These are the categories whose `.xml` tags one or more
+// rows `deleted="1"`; every other category is a parse/format fixture with only
+// LIVE content (covered by the panic-free robustness harness, not scored here).
+//
+//   07 Fragmented contents          (1 deleted row, in 07-03)
+//   0A Deleted tables               (dropped-table proxy)
+//   0B Overwritten tables           (dropped-table proxy)
+//   0C Deleted records              (clean in-page free block)
+//   0D Overwritten records          (deleted then reclaimed)
+//   0E Deleted overflow pages       (long text, overflow chains)
+//   17 Manipulated Freeblock Structures   (anti-forensic, 15 deleted/DB)
+//   18 Manipulated Freelist Trunks        (anti-forensic, 7..240 deleted/DB)
+const DELETED_GROUND_TRUTH_CATEGORIES: &[&str] = &["07", "0A", "0B", "0C", "0D", "0E", "17", "18"];
+
+/// The ground-truth manifest covers every deletion category, and ONLY deletion
+/// categories — a parse-only fixture is never silently scored as deleted-recall.
+/// Pins the classification so re-vendoring or a generator change that drops a
+/// deletion category (or wrongly admits a parse-only one) fails CI.
+#[test]
+fn manifest_covers_exactly_the_deleted_ground_truth_categories() {
+    let mut present: BTreeSet<String> = BTreeSet::new();
+    for (_nid, category) in manifest().databases() {
+        present.insert(category);
+    }
+    let expected: BTreeSet<String> = DELETED_GROUND_TRUTH_CATEGORIES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!(
+        present, expected,
+        "manifest categories {present:?} != deleted-ground-truth set {expected:?}"
+    );
+}
+
+/// The three newly-vendored deletion categories (07, 17, 18) actually carry
+/// per-row deleted ground truth in the regenerated manifest — proof the generator
+/// parsed their answer keys, not just that the folders exist.
+#[test]
+fn new_deletion_categories_carry_deleted_rows() {
+    for cat in ["07", "17", "18"] {
+        let deleted: usize = manifest()
+            .databases()
+            .iter()
+            .filter(|(_, c)| c == cat)
+            .map(|(nid, _)| {
+                manifest()
+                    .db(nid)
+                    .elements()
+                    .iter()
+                    .map(|el| el.deleted().len())
+                    .sum::<usize>()
+            })
+            .sum();
+        assert!(
+            deleted > 0,
+            "category {cat} contributes no deleted rows to the manifest — generator did not parse its answer key"
+        );
+    }
+}
+
+/// Categories 17 and 18 are anti-forensic (manipulated freeblock / freelist-trunk
+/// structures) yet ship per-row deleted answer keys, so they ARE scored. The
+/// carver must stay panic-free and never re-surface a LIVE row as deleted on them
+/// (the structural 0-false-positive guarantee), exactly as on 0C/0D/0E. Recovery
+/// yield may legitimately be 0 (the structures are manipulated to defeat naive
+/// carving) — that is asserted honestly as a bounded result, not a silent pass.
+#[test]
+fn manipulated_structure_categories_17_18_never_resurface_a_live_row() {
+    let mut scored = 0usize;
+    for m in all_matrices()
+        .iter()
+        .filter(|m| matches!(m.category.as_str(), "17" | "18"))
+    {
+        assert_eq!(
+            m.live_reread, 0,
+            "{}: carved {} live row(s) as deleted on a manipulated-structure DB",
+            m.nid, m.live_reread
+        );
+        scored += 1;
+    }
+    assert!(
+        scored > 0,
+        "no category-17/18 DB was scored — manifest coverage regressed"
+    );
+}
+
 /// No fragment's surviving set equals the column-projection of any `full` record
 /// (suppression layer 2 works) on every corpus DB.
 #[test]

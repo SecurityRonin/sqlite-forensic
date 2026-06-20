@@ -1348,8 +1348,9 @@ impl Database {
                     // be < declared — the real header still governs (a recovered
                     // row pads/truncates to it).
                     Some(names) => names,
-                    // Low-confidence parse: generic header sized to the widest row,
-                    // never a fabricated real name.
+                    // Low-confidence parse (malformed/unparseable CREATE TABLE):
+                    // generic header sized to the widest row, never a fabricated
+                    // real name. This is the schema-damage robustness guard.
                     None => (0..widest).map(|i| format!("c{i}")).collect(),
                 };
                 LiveTableDump {
@@ -3804,6 +3805,59 @@ mod tests {
         );
         assert_eq!(*ids.first().unwrap(), 1);
         assert_eq!(*ids.last().unwrap(), 200);
+    }
+
+    #[test]
+    fn live_table_rows_falls_back_to_generic_columns_on_unparseable_schema() {
+        // Robustness: a damaged CREATE TABLE whose column list cannot be parsed
+        // must dump the table with generic c0..cN columns (never a fabricated
+        // real header), while its rows still read. Mint a valid db, then blank out
+        // the `( ... )` column list in the stored schema SQL in place (same byte
+        // length), so column_defs yields None for that table.
+        use crate::rebuild::{build_recovered_db_tables, RecoveredTable as RT};
+        let seed = vec![RT {
+            name: "people".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::Integer(1), Value::Text("alice".into())]],
+        }];
+        let mut bytes = build_recovered_db_tables(&seed);
+
+        // Find the stored `CREATE TABLE "people" (...)` text and overwrite from the
+        // first '(' through the matching ')' with spaces, leaving `CREATE TABLE
+        // "people"` (no column list) — unparseable to column_defs.
+        let needle = b"CREATE TABLE \"people\"";
+        let start = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("schema SQL present");
+        let open = bytes[start..]
+            .iter()
+            .position(|&b| b == b'(')
+            .map(|p| start + p)
+            .expect("column list open paren");
+        let close = bytes[open..]
+            .iter()
+            .position(|&b| b == b')')
+            .map(|p| open + p)
+            .expect("column list close paren");
+        for b in &mut bytes[open..=close] {
+            *b = b' ';
+        }
+
+        let db = Database::open(bytes).expect("corrupted-schema db still opens");
+        let dumps = db.live_table_rows();
+        let people = dumps
+            .iter()
+            .find(|t| t.name == "people")
+            .expect("people dump present");
+        // Generic columns sized to the row width (2), never the real id/name.
+        assert_eq!(
+            people.column_names,
+            vec!["c0".to_string(), "c1".to_string()]
+        );
+        // The row still decoded despite the schema damage.
+        assert_eq!(people.rows.len(), 1);
+        assert_eq!(people.rows[0].values.first(), Some(&Value::Integer(1)));
     }
 
     /// Real-corpus freeblock reconstruction: 0C-01 page 2 has six freeblock-head

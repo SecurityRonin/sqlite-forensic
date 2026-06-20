@@ -1591,26 +1591,36 @@ pub fn plan_combined_workbook(
     }
 }
 
+/// The stderr warning for a sheet truncated to the Excel row cap, naming the
+/// table and the dropped row count so a truncation is never silent. Pure so the
+/// message is unit-testable without provoking a million-row carve.
+#[must_use]
+pub fn row_cap_warning(table: &str, dropped: usize, cap: usize) -> String {
+    format!(
+        "warning: table {table} exceeds Excel's {cap}-row limit; \
+         dropped {dropped} row(s) from the {table} sheet"
+    )
+}
+
 /// Build the combined live + recovered `.xlsx` bytes, warning on stderr for any
-/// sheet truncated to the Excel row cap, and mapping any [`XlsxError`] to an
-/// actionable string keyed by `path`.
+/// sheet truncated to `row_cap`, and mapping any [`XlsxError`] to an actionable
+/// string keyed by `path`.
 ///
-/// This is the String-returning façade the binary shell calls: it plans the
-/// workbook ([`plan_combined_workbook`] at the [`EXCEL_MAX_ROWS`] cap), emits one
-/// `eprintln!` per dropped-row warning (naming the table and the count, so a
-/// truncation is never silent), and renders the bytes via [`render_combined_xlsx`].
+/// This is the String-returning façade the binary shell calls (with `row_cap` =
+/// [`EXCEL_MAX_ROWS`]): it plans the workbook ([`plan_combined_workbook`]), emits
+/// one [`row_cap_warning`] per dropped-row warning so a truncation is never
+/// silent, and renders the bytes via [`render_combined_xlsx`]. `row_cap` is a
+/// parameter so a unit test can drive the truncation-warning path at a small cap.
 pub fn combined_xlsx_bytes(
     db: &Database,
     records: &[CarvedRecord],
     fragments: Option<&[CarvedFragment]>,
     path: &Path,
+    row_cap: usize,
 ) -> Result<Vec<u8>, String> {
-    let plan = plan_combined_workbook(db, records, fragments, EXCEL_MAX_ROWS);
+    let plan = plan_combined_workbook(db, records, fragments, row_cap);
     for (table, count) in &plan.dropped {
-        eprintln!(
-            "warning: table {table} exceeds Excel's {EXCEL_MAX_ROWS}-row limit; \
-             dropped {count} row(s) from the {table} sheet"
-        );
+        eprintln!("{}", row_cap_warning(table, *count, row_cap));
     }
     render_combined_xlsx(&plan.sheets, &plan.extra)
         .map_err(|e| format!("cannot build recovered xlsx {}: {e}", path.display()))
@@ -3671,10 +3681,11 @@ mod tests {
         assert!(people.rows[1].is_deleted, "recovered row second");
         // Folded as inferred → is_guessed column (index 3) is 1.
         assert_eq!(people.rows[1].cells[3], Value::Integer(1));
-        // No recovered_inferred table anywhere.
+        // The inferred row folded into `people`, so there are no extra tables at
+        // all here (no Tier-3, no fragments) — and thus no recovered_inferred tab.
         assert!(
-            !plan.extra.iter().any(|t| t.name == "recovered_inferred"),
-            "inferred folds into the table sheet, not a separate table"
+            plan.extra.is_empty(),
+            "inferred folds into the table sheet; no separate extra table"
         );
         assert!(plan.dropped.is_empty(), "no truncation under the full cap");
     }
@@ -3691,12 +3702,10 @@ mod tests {
             vec![Value::Integer(9), Value::Text("ghost".into())],
         )];
         let plan = plan_combined_workbook(&db, &records, None, EXCEL_MAX_ROWS);
+        let extra_names: Vec<&String> = plan.extra.iter().map(|t| &t.name).collect();
         assert!(
-            plan.extra
-                .iter()
-                .any(|t| t.name == "recovered_unattributed"),
-            "Tier-3 lands in recovered_unattributed: {:?}",
-            plan.extra.iter().map(|t| &t.name).collect::<Vec<_>>()
+            extra_names.iter().any(|n| *n == "recovered_unattributed"),
+            "Tier-3 lands in recovered_unattributed: {extra_names:?}"
         );
         // The people sheet has only its live row (no recovered fold).
         let people = plan.sheets.iter().find(|s| s.name == "people").unwrap();
@@ -3731,5 +3740,62 @@ mod tests {
             .find(|(name, _)| name == "people")
             .expect("people drop recorded");
         assert_eq!(drop.1, 2, "two data rows dropped past the cap of 1");
+    }
+
+    /// The row-cap warning names the table and the dropped count.
+    #[test]
+    fn row_cap_warning_names_table_and_count() {
+        let w = row_cap_warning("people", 7, EXCEL_MAX_ROWS);
+        assert!(w.contains("people"), "names the table: {w}");
+        assert!(w.contains('7'), "names the dropped count: {w}");
+        assert!(
+            w.contains(&EXCEL_MAX_ROWS.to_string()),
+            "names the cap: {w}"
+        );
+    }
+
+    /// `combined_xlsx_bytes` builds a valid workbook and, at a small injected cap,
+    /// drives the truncation-warning path (a drop occurs) without a million-row
+    /// carve. The produced bytes still open in calamine.
+    #[test]
+    fn combined_xlsx_bytes_builds_and_warns_at_small_cap() {
+        let db = minted_people_db();
+        let records = vec![rec(
+            2,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Integer(2), Value::Text("deleted".into())],
+        )];
+        // Cap of 1: the people sheet (1 live + 1 recovered = 2 rows) is truncated,
+        // exercising the dropped-row warning loop.
+        let buf = combined_xlsx_bytes(&db, &records, None, Path::new("/out/x.recovered.xlsx"), 1)
+            .unwrap();
+        assert!(!buf.is_empty());
+        let _ = open_xlsx(&buf);
+    }
+
+    /// `combined_xlsx_bytes` maps an `XlsxError` to a path-keyed string. A Tier-3
+    /// record far wider than Excel's column limit makes the `recovered_unattributed`
+    /// sheet fail to render, exercising the error arm.
+    #[test]
+    fn combined_xlsx_bytes_maps_render_error_to_path() {
+        let db = minted_people_db();
+        // A dropped-table record with > Excel's 16384 columns: unattributed (it
+        // cannot shape-match the 2-column `people`), so it becomes a too-wide
+        // recovered_unattributed sheet the writer rejects.
+        let wide = (0..20_000).map(Value::Integer).collect();
+        let records = vec![rec(0, 0.5, RecoverySource::DroppedTable, wide)];
+        let err = combined_xlsx_bytes(
+            &db,
+            &records,
+            None,
+            Path::new("/out/wide.recovered.xlsx"),
+            EXCEL_MAX_ROWS,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("recovered xlsx") && err.contains("wide.recovered.xlsx"),
+            "error maps to a path-keyed string: {err}"
+        );
     }
 }

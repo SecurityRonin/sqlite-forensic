@@ -1208,7 +1208,7 @@ pub struct JournalRecovery {
 /// `-journal` by diffing the pre-transaction snapshot against the live database
 /// (design §4) — the temporal inverse of WAL recovery.
 ///
-/// For each prior rowid table, the prior rows (read through [`PriorSnapshot`])
+/// For each prior rowid table, the prior rows (read through `PriorSnapshot`)
 /// are diffed against the current rows by rowid:
 /// - **deleted** = rowid in prior but not current → a full-fidelity [`PriorRow`];
 /// - **modified** = rowid in both with different values → a [`PriorVersionRecord`]

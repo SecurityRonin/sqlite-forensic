@@ -1920,7 +1920,7 @@ fn fold_journal_into_histories(
 /// `journal` is the optional rollback-`-journal` recovery (mutually exclusive with
 /// a WAL — the caller passes `None` under a WAL): its deleted prior rows fold in as
 /// red `is_deleted` versions and its modified rows' prior values as blue superseded
-/// versions, under their KNOWN table+rowid, via [`fold_journal_into_histories`].
+/// versions, under their KNOWN table+rowid, via `fold_journal_into_histories`.
 #[must_use]
 pub fn plan_combined_workbook(
     db: &Database,

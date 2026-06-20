@@ -1633,3 +1633,74 @@ fn stdout_carve_surfaces_rollback_journal_records() {
         "--no-journal omits the rollback-journal rows"
     );
 }
+
+/// `carve --db` over the AUTOINCREMENT drop-recreate fixture writes a
+/// `_table_instance_risk` provenance column into `recovered_students`, populated
+/// (non-NULL) for the residue rowids 6..=10 that exceed `sqlite_sequence=5`. The
+/// honesty flag rides as a column alongside the other provenance columns — never
+/// a rerouted table. Skips when `sqlite3` is unavailable.
+#[test]
+fn carved_db_carries_table_instance_risk_column() {
+    let Some(sqlite3) = sqlite3_bin() else {
+        eprintln!("SKIP carved_db_carries_table_instance_risk_column: no sqlite3");
+        return;
+    };
+    let dir = Scratch::new("tir_db");
+    let src = data_dir().join("drop_recreate/b_autoinc.db");
+    let db = dir.join("b_autoinc.db");
+    std::fs::copy(&src, &db).expect("copy fixture");
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "b_autoinc.db", "--db"])
+        .output()
+        .expect("run carve --db");
+    assert!(out.status.success(), "carve --db must exit 0");
+
+    let produced = dir.join("b_autoinc.carved.db");
+    let cols = sqlite3_query(
+        &sqlite3,
+        &produced,
+        "SELECT group_concat(name) FROM pragma_table_info('recovered_students');",
+    );
+    assert!(
+        cols.contains("_table_instance_risk"),
+        "recovered_students carries the _table_instance_risk column: {cols}"
+    );
+
+    // The residue rowids 6..=10 (above the high-water mark) carry a non-NULL,
+    // evidence-bearing risk token; nothing reroutes them out of recovered_students.
+    let flagged = sqlite3_query(
+        &sqlite3,
+        &produced,
+        "SELECT count(*) FROM recovered_students \
+         WHERE _table_instance_risk LIKE 'rowid_exceeds_autoinc_highwater%';",
+    );
+    assert!(
+        flagged.parse::<i64>().unwrap_or(0) >= 5,
+        "at least the 5 residue rows 6..=10 are flagged: {flagged}"
+    );
+}
+
+/// `carve --format jsonl` over the AUTOINCREMENT fixture emits a
+/// `table_instance_risk` field on every record: the evidence token for the
+/// residue rows above the high-water mark, `null` otherwise.
+#[test]
+fn carve_jsonl_carries_table_instance_risk_field() {
+    let out = bin()
+        .args(["carve"])
+        .arg(data_dir().join("drop_recreate/b_autoinc.db"))
+        .args(["--format", "jsonl"])
+        .output()
+        .expect("run carve --format jsonl");
+    assert!(out.status.success(), "carve --format jsonl must exit 0");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("\"table_instance_risk\""),
+        "jsonl records carry a table_instance_risk field"
+    );
+    assert!(
+        stdout.contains("rowid_exceeds_autoinc_highwater"),
+        "the residue rows above the high-water mark carry the evidence token"
+    );
+}

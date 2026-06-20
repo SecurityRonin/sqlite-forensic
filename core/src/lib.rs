@@ -5994,4 +5994,68 @@ mod tests {
             "CREATE TABLE t(\"without rowid\" TEXT, x INT)"
         ));
     }
+
+    #[test]
+    fn is_autoincrement_detects_only_the_real_clause() {
+        // Positive: an ordinary rowid table declaring INTEGER PRIMARY KEY
+        // AUTOINCREMENT — case-insensitive and whitespace-tolerant.
+        assert!(is_autoincrement(
+            "CREATE TABLE students(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)"
+        ));
+        assert!(is_autoincrement(
+            "create table t(  id   integer   primary key   autoincrement )"
+        ));
+        // Negative: a plain INTEGER PRIMARY KEY is NOT autoincrement.
+        assert!(!is_autoincrement(
+            "CREATE TABLE students(id INTEGER PRIMARY KEY, name TEXT)"
+        ));
+        // Negative: a WITHOUT ROWID table cannot be AUTOINCREMENT (no rowid).
+        assert!(!is_autoincrement(
+            "CREATE TABLE kv(k INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT) WITHOUT ROWID"
+        ));
+        // Negative: a column merely NAMED autoincrement is not the clause.
+        assert!(!is_autoincrement(
+            "CREATE TABLE t(\"autoincrement\" INTEGER PRIMARY KEY, x INT)"
+        ));
+        // Negative: the keyword inside a quoted string / comment does not qualify.
+        assert!(!is_autoincrement(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, note TEXT DEFAULT 'autoincrement')"
+        ));
+        // Negative: AUTOINCREMENT without INTEGER PRIMARY KEY is not a valid clause.
+        assert!(!is_autoincrement(
+            "CREATE TABLE t(id INTEGER AUTOINCREMENT, name TEXT)"
+        ));
+    }
+
+    #[test]
+    fn sqlite_sequence_reads_present_absent_and_multi() {
+        // A db with no AUTOINCREMENT table has no sqlite_sequence: empty map
+        // (NOT seq=0), so callers never invent a high-water mark.
+        let plain = Database::open(crate::rebuild::build_recovered_db_tables(&[
+            crate::rebuild::RecoveredTable {
+                name: "plain".to_string(),
+                columns: vec!["c0".to_string()],
+                rows: vec![vec![Value::Integer(1)]],
+            },
+        ]))
+        .expect("minted db opens");
+        assert!(
+            plain.sqlite_sequence().is_empty(),
+            "no AUTOINCREMENT table ⟹ empty sqlite_sequence map"
+        );
+
+        // The b_autoinc fixture maintains sqlite_sequence(students)=5.
+        let auto =
+            Database::open(include_bytes!("../../tests/data/drop_recreate/b_autoinc.db").to_vec())
+                .expect("open b_autoinc.db");
+        let seq = auto.sqlite_sequence();
+        assert_eq!(seq.get("students"), Some(&5), "students high-water = 5");
+
+        // The upd_autoinc fixture: a single AUTOINCREMENT table t at seq=5.
+        let upd = Database::open(
+            include_bytes!("../../tests/data/drop_recreate/upd_autoinc.db").to_vec(),
+        )
+        .expect("open upd_autoinc.db");
+        assert_eq!(upd.sqlite_sequence().get("t"), Some(&5), "t high-water = 5");
+    }
 }

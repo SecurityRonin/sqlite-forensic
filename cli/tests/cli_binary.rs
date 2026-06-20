@@ -391,9 +391,10 @@ fn malformed_db_audit_exits_nonzero() {
 
 // ---- default combined workbook + opt-in db (`carve` / `carve --db`) ----------
 
-/// The default `carve` writes the COMBINED workbook: the source DB dumped one
-/// sheet per live table (here `moz_places`) with recovered rows folded in, each
-/// carrying the three trailing flag columns and interleaving live + recovered rows.
+/// The default `carve` writes the COMBINED TEMPORAL workbook: the source DB dumped
+/// one VERSION-HISTORY sheet per live table (here `moz_places`), carrying the eight
+/// temporal/flag columns and interleaving live (`present`, is_deleted=0) versions
+/// with carved-residue (is_deleted=1) versions of deleted rows.
 #[test]
 fn default_carve_combined_workbook_folds_recovered_rows() {
     use calamine::Reader;
@@ -412,18 +413,18 @@ fn default_carve_combined_workbook_folds_recovered_rows() {
     let recovered_xlsx = dir.join("deleted_places.recovered.xlsx");
     assert!(recovered_xlsx.exists(), "the .xlsx must be written");
 
-    // The combined workbook opens in calamine with the live table's own sheet
-    // (`moz_places`), carrying the three trailing flag columns.
+    // The combined workbook opens in calamine with the live table's own
+    // version-history sheet (`moz_places`), carrying the temporal/flag columns.
     let mut wb: calamine::Xlsx<_> =
         calamine::open_workbook(&recovered_xlsx).expect("xlsx must open in calamine");
     let names = wb.sheet_names();
     assert!(
         names.iter().any(|n| n == "moz_places"),
-        "the live table gets its own combined sheet: {names:?}"
+        "the live table gets its own version-history sheet: {names:?}"
     );
     assert!(
         !names.iter().any(|n| n == "recovered_inferred"),
-        "inferred rows fold into table sheets, not a separate tab: {names:?}"
+        "attributed residue folds into the table sheet, not a separate tab: {names:?}"
     );
     let sheet = wb.worksheet_range("moz_places").unwrap();
     let header: Vec<String> = sheet
@@ -433,14 +434,25 @@ fn default_carve_combined_workbook_folds_recovered_rows() {
         .iter()
         .map(std::string::ToString::to_string)
         .collect();
-    for flag in ["is_deleted", "is_guessed", "table_match_ambiguous"] {
+    for flag in [
+        "_rowid",
+        "wal_commit",
+        "commit_seq",
+        "view_state",
+        "is_deleted",
+        "is_guessed",
+        "rowid_reused",
+        "attribution_uncertain",
+    ] {
         assert!(
             header.iter().any(|h| h == flag),
-            "trailing flag column {flag} present: {header:?}"
+            "temporal/flag column {flag} present: {header:?}"
         );
     }
-    // Both live (is_deleted=0) and recovered (is_deleted=1) rows are present.
+    // Both live (is_deleted=0) and carved-residue (is_deleted=1) versions appear in
+    // the one sheet — the deleted rows are folded into their table's history once.
     let del_col = header.iter().position(|h| h == "is_deleted").unwrap();
+    let commit_col = header.iter().position(|h| h == "wal_commit").unwrap();
     let mut saw_live = false;
     let mut saw_deleted = false;
     for row in sheet.rows().skip(1) {
@@ -452,7 +464,17 @@ fn default_carve_combined_workbook_folds_recovered_rows() {
     }
     assert!(
         saw_live && saw_deleted,
-        "combined sheet interleaves live + recovered rows"
+        "version-history sheet carries both live and deleted versions"
+    );
+    // No WAL here → it degrades to live + carved residue, with NO WAL-historical
+    // commit versions (every wal_commit cell is `live` or `residue`, never commit).
+    let no_commit = sheet
+        .rows()
+        .skip(1)
+        .all(|r| !matches!(&r[commit_col], calamine::Data::String(s) if s.starts_with("commit:")));
+    assert!(
+        no_commit,
+        "no-WAL carve has no historical commit versions (live + residue only)"
     );
 }
 
@@ -957,11 +979,11 @@ fn three_tier_attribution_round_trips_through_sqlite3() {
 }
 
 /// The headline combined-workbook layout, end to end via calamine. On the
-/// three-tier fixture the default `carve` writes the source DB dumped per live
-/// table with recovered rows folded back in:
-/// - `people` sheet interleaves its live rows with the Tier-1 deleted row (rowid
-///   3) in rowid order, `is_deleted=1` only on the recovered row;
-/// - `amounts` sheet folds the Tier-2 freed-page rows in with `is_guessed=1`;
+/// three-tier fixture the default `carve` writes the source DB dumped one
+/// VERSION-HISTORY sheet per live table:
+/// - `people` sheet carries its live (`present`, is_deleted=0) versions AND the
+///   carved-residue version of the deleted row (id 3 'carol') — appearing EXACTLY
+///   once, never double-listed;
 /// - `recovered_unattributed` (the dropped `secret` table) and
 ///   `recovered_fragments` are SEPARATE tabs; there is no `recovered_inferred`.
 #[test]
@@ -989,8 +1011,8 @@ fn xlsx_combined_workbook_folds_recovered_into_live_sheets() {
         calamine::open_workbook(&xlsx).expect("calamine must open the xlsx");
     let names = wb.sheet_names();
 
-    // The two live tables get their own combined sheets; Tier-3 + fragments are
-    // separate; no recovered_inferred tab (inferred rows folded into a sheet).
+    // The live tables get their own version-history sheets; Tier-3 + fragments are
+    // separate; no recovered_inferred tab (attributed residue folds into a sheet).
     for live in ["people", "amounts"] {
         assert!(
             names.iter().any(|n| n == live),
@@ -1010,78 +1032,69 @@ fn xlsx_combined_workbook_folds_recovered_into_live_sheets() {
         "no recovered_inferred tab: {names:?}"
     );
 
-    // Helper: read a sheet's header + the index of a named column.
-    let header_of = |wb: &mut calamine::Xlsx<_>, sheet: &str| -> Vec<String> {
-        wb.worksheet_range(sheet)
-            .unwrap()
-            .rows()
-            .next()
-            .unwrap()
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect()
-    };
-
-    // people: header carries the real `id`/`name` columns + the three flags.
-    let people_hdr = header_of(&mut wb, "people");
-    for col in [
-        "id",
-        "name",
-        "is_deleted",
-        "is_guessed",
-        "table_match_ambiguous",
-    ] {
+    // people: header carries the real `id`/`name` columns + the temporal/flag cols.
+    let people = wb.worksheet_range("people").unwrap();
+    let people_hdr: Vec<String> = people
+        .rows()
+        .next()
+        .unwrap()
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    for col in ["id", "name", "_rowid", "view_state", "is_deleted"] {
         assert!(
             people_hdr.iter().any(|h| h == col),
             "people header has {col}: {people_hdr:?}"
         );
     }
     let del_col = people_hdr.iter().position(|h| h == "is_deleted").unwrap();
-    let people = wb.worksheet_range("people").unwrap();
-    // is_deleted per data row, in sheet order.
-    let deleted_flags: Vec<f64> = people
+    let view_col = people_hdr.iter().position(|h| h == "view_state").unwrap();
+
+    // The four surviving live rows are `present` (is_deleted=0); the deleted row's
+    // residue folds in as a single `carved_residue` (is_deleted=1) version.
+    let live_count = people
         .rows()
         .skip(1)
-        .filter_map(|r| match &r[del_col] {
-            Data::Float(d) => Some(*d),
-            _ => None,
-        })
+        .filter(|r| matches!(&r[del_col], Data::Float(d) if *d == 0.0))
+        .count();
+    let deleted: Vec<_> = people
+        .rows()
+        .skip(1)
+        .filter(|r| matches!(&r[del_col], Data::Float(d) if *d == 1.0))
         .collect();
-    // Four live rows survive the id=3 deletion; the carve folds in at least one
-    // recovered (deleted) row. Both surfaces are present in the one sheet.
-    let live_count = deleted_flags.iter().filter(|&&d| d == 0.0).count();
-    let recovered_count = deleted_flags.iter().filter(|&&d| d == 1.0).count();
     assert_eq!(
         live_count, 4,
-        "the four surviving live rows: {deleted_flags:?}"
+        "the four surviving live versions (id 3 deleted)"
     );
-    assert!(
-        recovered_count >= 1,
-        "at least one recovered row folded into people: {deleted_flags:?}"
+    assert_eq!(
+        deleted.len(),
+        1,
+        "the deleted row folds in EXACTLY once as a residue version (not double-listed)"
     );
-    // Every live row precedes the recovered rows whose rowid was destroyed (this
-    // fixture's freeblock reconstruction nulls the rowid → bottom of the sheet).
-    let last_live = deleted_flags.iter().rposition(|&d| d == 0.0).unwrap();
-    let first_recovered = deleted_flags.iter().position(|&d| d == 1.0).unwrap();
-    assert!(
-        last_live < first_recovered,
-        "destroyed-rowid recovered rows sink below the live rows: {deleted_flags:?}"
+    assert_eq!(
+        deleted[0][view_col],
+        Data::String("carved_residue".into()),
+        "the deleted version is a carved_residue: {:?}",
+        deleted[0]
     );
 
-    // amounts: the Tier-2 freed-page rows folded in with is_guessed=1.
-    let amounts_hdr = header_of(&mut wb, "amounts");
-    let gcol = amounts_hdr
-        .iter()
-        .position(|h| h == "is_guessed")
-        .expect("is_guessed column");
+    // amounts: the freed-page rows fold into its history as deleted residue too.
     let amounts = wb.worksheet_range("amounts").unwrap();
-    let any_guessed = amounts
+    let a_hdr: Vec<String> = amounts
+        .rows()
+        .next()
+        .unwrap()
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    let a_del = a_hdr.iter().position(|h| h == "is_deleted").unwrap();
+    let any_deleted = amounts
         .rows()
         .skip(1)
-        .any(|r| matches!(&r[gcol], Data::Float(f) if *f == 1.0));
+        .any(|r| matches!(&r[a_del], Data::Float(d) if *d == 1.0));
     assert!(
-        any_guessed,
-        "amounts holds at least one inferred (is_guessed=1) recovered row"
+        any_deleted,
+        "amounts holds at least one deleted (residue) version"
     );
 }
 
@@ -1391,6 +1404,13 @@ fn xlsx_temporal_workbook_has_version_history_from_wal() {
     assert!(
         r2.iter().any(|t| t.2 == "absent_final" && t.3 == 1),
         "rowid 2 is absent_final / is_deleted: {r2:?}"
+    );
+    // The deleted rowid-2 version is listed EXACTLY once — the WAL-historical
+    // version subsumes the carved residue, never double-listed.
+    assert_eq!(
+        r2.len(),
+        1,
+        "rowid 2 has exactly one (deleted) version, not double-listed: {r2:?}"
     );
 
     // rowid 4: REUSED (delete 'x' then reinsert 'y') → rowid_reused=1 on its rows.

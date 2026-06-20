@@ -35,6 +35,9 @@ const DELETE_HI: i64 = 120_000;
 /// under this. The point is to fail loudly on a catastrophic regression (e.g. an
 /// accidental O(n^2)), not to police a tight latency budget — the real timings
 /// are reported in `docs/competitive-landscape.md`.
+// `from_secs(120)` reads as the "120 s" ceiling referenced in the assertion
+// message; the larger-unit pedantic lint would obscure that, so allow it here.
+#[allow(clippy::duration_suboptimal_units)]
 const WALL_CLOCK_CEILING: Duration = Duration::from_secs(120);
 
 fn perf_db_path() -> Option<PathBuf> {

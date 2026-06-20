@@ -59,6 +59,12 @@ regenerate its table). Corpus and oracle provenance are in
   — substrate-limited (carver capability) and end-to-end (examiner usefulness).
 - These are honest measurements of *each tool* against *this* corpus, not a
   verdict that any tool is "best": stated plainly below.
+- **Scope.** This page measures **free-space carving** against the Nemetz corpus
+  (which ships no WAL/journal fixtures). The other recovery substrates —
+  uncheckpointed **WAL** frames/snapshots and the **rollback journal** (the last
+  transaction's deletes + edits) — are validated separately against NIST CFReDS
+  ground truth (SFT-03: WAL, and PERSIST journal 100/100); see
+  [`validation.md`](validation.md).
 
 ## Head-to-head — ours vs undark vs fqlite (computed)
 

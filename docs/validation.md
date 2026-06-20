@@ -42,6 +42,8 @@ reader, across C / Java / SQLite-C / Rust:
 | Deleted-record **recall & precision** | **Nemetz SQLite Forensic Corpus** (DFRWS-EU 2018, CC0) — the full **141-DB** v2.0 corpus (incl. 9 anti-forensic categories) whose authors shipped a per-row deleted **answer key** | recall + precision as a reproducible per-DB confusion matrix against **third-party ground truth** (the authors wrote both the deletions *and* the key) | `nemetz_metrics.rs` · [`recovery-comparison.md`](recovery-comparison.md) |
 | **Header / encoding reporting** (UTF-8, UTF-16LE, UTF-16BE; page size) | **NIST CFReDS / CFTT** SFT-01 — real-device DBs, NIST-published ground truth + MD5s | page size + text encoding + 100-row table read correctly across all three on-disk encodings (real-device replacement for the self-minted UTF-16 fixtures) | `cfreds_encoding.rs` |
 | **Deleted/modified records** (WAL substrate) | **NIST CFReDS / CFTT** SFT-03 — 100 documented deletes in an uncheckpointed WAL | main-only (pre-delete, 2240 rows) and WAL-applied (post-delete, 2140) states both surfaced, matching NIST's documented delta of 100 | `cfreds_recovery.rs` |
+| **Deleted + modified records** (rollback-journal substrate) | **NIST CFReDS / CFTT** SFT-03 PERSIST — 100 documented deletes + 100 modifications in a `-journal` (ios + android) | `carve_rollback_journal` recovers **100/100 deletes + 100/100 modified prior values** by diffing the journal's pre-transaction snapshot against the live db; the derived oracle (`{1..=2240} \ live PKs`) is cross-checked against NIST's documented IDs | `cfreds_journal_recovery.rs` |
+| **Rollback-journal anomalies** | the journal's own structure (header tier, page checksums, page set) | `audit_journal` emits "consistent with" observations (hot journal, PERSIST-recoverable, checksum mismatch, schema-page journaled, duplicate page, db-size delta), each showing the offending value | `cfreds_journal_anomaly.rs` |
 | Deleted-record **carving** | `undark` (C), `fqlite` (Java) — independent carvers | inter-tool **concordance** (agreement, page-level-diagnosed — *not* correctness) | `oracle_differential.rs` (below) |
 | **Live b-tree read** | `sqlite3 SELECT` — the engine that wrote the file | live rows read **byte-identical** to the canonical engine | `live_read_matches_sqlite3` |
 | **`.recover` differential** | `sqlite3 .recover` | ours ⊇ `.recover`, 100% content agreement on the overlap | `our_fixture_agrees_with_sqlite3_recover` |
@@ -55,8 +57,11 @@ reader, across C / Java / SQLite-C / Rust:
 ### Input provenance (what is committed vs minted)
 
 The **carving core** is validated against committed inputs: the independently-authored
-**Nemetz corpus** (the gold standard — committed, CC0) and the committed synthetic
-fixtures in [`corpus-catalog.md`](corpus-catalog.md). Several newer capabilities (the WAL
+**Nemetz corpus** (the gold standard — committed, CC0), the **NIST CFReDS / CFTT** SQLite
+sets (committed, U.S.-Government public domain, MD5-verified against NIST's published
+hashes — SFT-01 encodings + SFT-03 deleted/modified records across WAL and rollback-journal
+substrates), and the committed synthetic fixtures in
+[`corpus-catalog.md`](corpus-catalog.md). Several newer capabilities (the WAL
 **version history / rowid-reuse**, **snapshot-aware reads**, **in-cell image blobs**,
 **WITHOUT ROWID** handling) are validated by fixtures **minted at test time** (a
 held-reader WAL retained per-commit, a generated image blob) checked against the

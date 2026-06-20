@@ -13,6 +13,11 @@ matrix by `forensic/tests/nemetz_metrics.rs` and the three-tool head-to-head by
 regenerate its table). Corpus and oracle provenance are in
 [`corpus-catalog.md`](corpus-catalog.md) and [`validation.md`](validation.md).
 
+> For the **false-positive** angle — our 0-FP discipline measured against
+> `bring2lite` and the SQLite Deleted Records Parser on the 2025 SQLite-recovery
+> survey's scenarios (identical bytes), with the survey's three-technique
+> framework — see [`competitive-landscape.md`](competitive-landscape.md).
+
 ## Executive summary
 
 - **Freeblock-aware reconstruction leads in-page recall, at the highest precision

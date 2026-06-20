@@ -3505,6 +3505,15 @@ mod tests {
 
     // ---- combined workbook renderer (tint + flags + image embed) -----------
 
+    #[test]
+    fn combined_fill_marks_guessed_yellow_and_certain_red() {
+        // A guessed (Tier-2 inferred) row tints pale yellow; a certain recovered
+        // row pale red; a live row is left unfilled.
+        assert_eq!(fill_for(false, false), None);
+        assert_eq!(fill_for(true, false), Some(RECOVERED_FILL));
+        assert_eq!(fill_for(true, true), Some(GUESSED_FILL));
+    }
+
     fn merged_row(cells: Vec<Value>, is_deleted: bool) -> MergedRow {
         MergedRow { cells, is_deleted }
     }

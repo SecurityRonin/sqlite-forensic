@@ -48,11 +48,18 @@ fn clean_db_has_no_freelist_finding() {
 fn wal_overlay_flags_uncheckpointed_state() {
     let db = Database::open_with_wal(WAL_MAIN.to_vec(), WAL_SIDE).expect("open with wal");
     let anomalies = audit(&db);
+    let wal = anomalies
+        .iter()
+        .find(|a| matches!(a.kind, AnomalyKind::WalUncheckpointedState { .. }))
+        .expect("an active WAL overlay must raise an uncheckpointed-state finding");
+    // The note must carry acquisition guidance: a checkpoint on the app's clean
+    // close discards uncheckpointed residue, so the live -wal must be acquired
+    // before termination (the paper's §6.2 point — the post-checkpoint main file
+    // alone would not contain it).
     assert!(
-        anomalies
-            .iter()
-            .any(|a| matches!(a.kind, AnomalyKind::WalUncheckpointedState { .. })),
-        "an active WAL overlay must raise an uncheckpointed-state finding"
+        wal.note.contains("acquire") && wal.note.contains("checkpoint"),
+        "WAL-uncheckpointed note must warn to acquire the live -wal before a checkpoint discards it, got: {}",
+        wal.note
     );
     // Without the sidecar, no such finding.
     let main_only = Database::open(WAL_MAIN.to_vec()).expect("open main");

@@ -11,9 +11,19 @@ deleted-record carving validation see
 independent-oracle corpus is documented separately in
 [`../../tests-oracle-corpus/README.md`](../../tests-oracle-corpus/README.md).
 
-All files here are **SYNTHETIC** — built locally with the real `sqlite3` engine
-(`SQLite 3.45.3 2024-04-15`, REAL engine / synthetic data). The generator command
-IS the provenance; there is no download URL.
+The **loose top-level** files here are **SYNTHETIC** — built locally with the
+real `sqlite3` engine (`SQLite 3.45.3 2024-04-15`, REAL engine / synthetic data).
+The generator command IS the provenance; there is no download URL.
+
+The **committed real-world third-party corpora** live in subdirectories, each with
+its own provenance README (source, NIST/author hashes, licence, ground truth):
+
+- [`nemetz/`](nemetz/README.md) — Nemetz SQLite Forensic Corpus v2.0 (141 DBs, CC0)
+  — deleted-record ground truth + anti-forensic robustness.
+- [`cfreds/`](cfreds/README.md) — NIST CFReDS / CFTT SQLite test sets (SFT-01 encodings,
+  SFT-03 deleted/modified records) — U.S. Government public domain, MD5-verified
+  against NIST-published hashes.
+- [`sharifctf/`](sharifctf/README.md) — a real damaged-header CTF database (robustness).
 
 #### places.db
 

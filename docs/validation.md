@@ -39,7 +39,9 @@ reader, across C / Java / SQLite-C / Rust:
 
 | Capability | Independent reference | What it establishes | Machine-checked in |
 |---|---|---|---|
-| Deleted-record **recall & precision** | **Nemetz SQLite Forensic Corpus** (DFRWS-EU 2018, CC0) — 32 DBs whose authors shipped a per-row deleted **answer key** | recall + precision as a reproducible per-DB confusion matrix against **third-party ground truth** (the authors wrote both the deletions *and* the key) | `nemetz_metrics.rs` · [`recovery-comparison.md`](recovery-comparison.md) |
+| Deleted-record **recall & precision** | **Nemetz SQLite Forensic Corpus** (DFRWS-EU 2018, CC0) — the full **141-DB** v2.0 corpus (incl. 9 anti-forensic categories) whose authors shipped a per-row deleted **answer key** | recall + precision as a reproducible per-DB confusion matrix against **third-party ground truth** (the authors wrote both the deletions *and* the key) | `nemetz_metrics.rs` · [`recovery-comparison.md`](recovery-comparison.md) |
+| **Header / encoding reporting** (UTF-8, UTF-16LE, UTF-16BE; page size) | **NIST CFReDS / CFTT** SFT-01 — real-device DBs, NIST-published ground truth + MD5s | page size + text encoding + 100-row table read correctly across all three on-disk encodings (real-device replacement for the self-minted UTF-16 fixtures) | `cfreds_encoding.rs` |
+| **Deleted/modified records** (WAL substrate) | **NIST CFReDS / CFTT** SFT-03 — 100 documented deletes in an uncheckpointed WAL | main-only (pre-delete, 2240 rows) and WAL-applied (post-delete, 2140) states both surfaced, matching NIST's documented delta of 100 | `cfreds_recovery.rs` |
 | Deleted-record **carving** | `undark` (C), `fqlite` (Java) — independent carvers | inter-tool **concordance** (agreement, page-level-diagnosed — *not* correctness) | `oracle_differential.rs` (below) |
 | **Live b-tree read** | `sqlite3 SELECT` — the engine that wrote the file | live rows read **byte-identical** to the canonical engine | `live_read_matches_sqlite3` |
 | **`.recover` differential** | `sqlite3 .recover` | ours ⊇ `.recover`, 100% content agreement on the overlap | `our_fixture_agrees_with_sqlite3_recover` |

@@ -106,10 +106,20 @@ pub enum AnomalyKind {
         /// Total page records the journal carries (the denominator).
         total: usize,
     },
-    /// The schema page (page 1) is present among the journal's page images.
-    /// Consistent with a DDL change (CREATE/DROP/ALTER) in the last transaction;
-    /// the prior schema is recoverable (design §6 item 6).
-    JournalSchemaChange,
+    /// The journal's prior **page-1 image** carries a different schema cookie
+    /// (file-header offset 40, 4-byte BE) than the live database. The cookie
+    /// advances only on `CREATE`/`DROP`/`ALTER`, so a difference is consistent
+    /// with a DDL change in the last transaction; the prior schema is recoverable
+    /// (design §6 item 6). Page 1 alone is NOT sufficient — it is journaled on
+    /// nearly every write (the change-counter / freelist-count / db-size header
+    /// fields update routinely), so the cookie comparison, not page-1 presence,
+    /// is the DDL signal.
+    JournalSchemaChange {
+        /// Schema cookie in the journal's prior page-1 image (offset 40, BE).
+        journal_cookie: u32,
+        /// Schema cookie in the live database's page 1 (offset 40, BE).
+        db_cookie: u32,
+    },
     /// A `pgno` appeared more than once across the journal's page records. The
     /// spec journals a page at most once, so a repeat is consistent with
     /// corruption, a savepoint/super-journal artifact, or tampering (design §6
@@ -139,7 +149,7 @@ impl AnomalyKind {
             AnomalyKind::DeletedRecordRecovered { .. }
             | AnomalyKind::WalUncheckpointedState { .. }
             | AnomalyKind::JournalRecoverable { .. }
-            | AnomalyKind::JournalSchemaChange
+            | AnomalyKind::JournalSchemaChange { .. }
             | AnomalyKind::JournalDuplicatePage => Severity::Medium,
             AnomalyKind::PageCountMismatch { .. }
             | AnomalyKind::HotJournal
@@ -160,7 +170,7 @@ impl AnomalyKind {
             AnomalyKind::HotJournal => "SQLITE-JOURNAL-HOT",
             AnomalyKind::JournalRecoverable { .. } => "SQLITE-JOURNAL-RECOVERABLE",
             AnomalyKind::JournalChecksumMismatch { .. } => "SQLITE-JOURNAL-CHECKSUM-MISMATCH",
-            AnomalyKind::JournalSchemaChange => "SQLITE-JOURNAL-SCHEMA-CHANGE",
+            AnomalyKind::JournalSchemaChange { .. } => "SQLITE-JOURNAL-SCHEMA-CHANGE",
             AnomalyKind::JournalDuplicatePage => "SQLITE-JOURNAL-DUPLICATE-PAGE",
             AnomalyKind::JournalDbSizeDelta { .. } => "SQLITE-JOURNAL-DBSIZE-DELTA",
         }
@@ -228,10 +238,14 @@ impl AnomalyKind {
                     pgnos.len()
                 )
             }
-            AnomalyKind::JournalSchemaChange => "the schema page (page 1) is among the journal's \
-                 page images — consistent with a DDL change (CREATE/DROP/ALTER) in the last \
-                 transaction; the prior schema is recoverable"
-                .to_string(),
+            AnomalyKind::JournalSchemaChange {
+                journal_cookie,
+                db_cookie,
+            } => format!(
+                "the journal's prior schema cookie ({journal_cookie}) differs from the \
+                 database's ({db_cookie}) — consistent with a DDL change (CREATE/DROP/ALTER) \
+                 in the last transaction; the prior schema is recoverable"
+            ),
             AnomalyKind::JournalDuplicatePage => "a page number appears more than once across the \
                  journal's page records — the spec journals a page at most once, so this is \
                  consistent with corruption, a savepoint/super-journal artifact, or tampering"
@@ -322,7 +336,7 @@ impl Observation for Anomaly {
             AnomalyKind::DeletedRecordRecovered { .. }
             | AnomalyKind::NonEmptyFreelist { .. }
             | AnomalyKind::JournalRecoverable { .. }
-            | AnomalyKind::JournalSchemaChange => Category::Residue,
+            | AnomalyKind::JournalSchemaChange { .. } => Category::Residue,
             // A WAL-only/uncheckpointed state, a header/file page-count mismatch,
             // and the journal integrity observations (hot journal, checksum /
             // duplicate corruption, db-size delta) are integrity-of-state.
@@ -426,9 +440,23 @@ impl Observation for Anomaly {
                     location: None,
                 },
             ],
+            AnomalyKind::JournalSchemaChange {
+                journal_cookie,
+                db_cookie,
+            } => vec![
+                Evidence {
+                    field: "journal_schema_cookie".to_string(),
+                    value: journal_cookie.to_string(),
+                    location: None,
+                },
+                Evidence {
+                    field: "db_schema_cookie".to_string(),
+                    value: db_cookie.to_string(),
+                    location: None,
+                },
+            ],
             AnomalyKind::NonZeroReservedSpace { .. }
             | AnomalyKind::HotJournal
-            | AnomalyKind::JournalSchemaChange
             | AnomalyKind::JournalDuplicatePage => Vec::new(),
         }
     }
@@ -1341,6 +1369,15 @@ pub fn audit_findings(db: &Database, source: &Source) -> Vec<Finding> {
         .collect()
 }
 
+/// The database schema cookie: file-header bytes `40..44` as a big-endian `u32`
+/// (file-format §1.3). Returns `None` when the page is too short to hold the
+/// field — bounded and panic-free, so a truncated page-1 image degrades to "no
+/// cookie" rather than indexing out of range.
+fn schema_cookie(page: &[u8]) -> Option<u32> {
+    let bytes = page.get(40..44)?;
+    Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 /// Audit a rollback `-journal` (raw bytes) bound to `db` for the design-§6
 /// observations, additive to [`audit`] (which covers main-db anomalies only).
 ///
@@ -1350,7 +1387,8 @@ pub fn audit_findings(db: &Database, source: &Source) -> Vec<Finding> {
 /// - a **hot journal** (valid header magic) — an interrupted/in-progress write;
 /// - a **recoverable** PERSIST journal (zeroed header, page images intact);
 /// - **checksum mismatch(es)** (Tier A) — corruption / torn page / modification;
-/// - a **journaled schema page** (page 1) — a DDL change, prior schema recoverable;
+/// - a **schema-cookie advance** (journal page-1 image vs live db, offset 40) — a
+///   DDL change, prior schema recoverable;
 /// - a **duplicate page record** — corruption / savepoint / tampering;
 /// - a **db-size delta** (Tier A `mxPage` vs current) — growth or shrink.
 ///
@@ -1409,9 +1447,31 @@ pub fn audit_journal(db: &Database, journal: &[u8]) -> Vec<Anomaly> {
         }));
     }
 
-    // The schema page (page 1) among the images ⇒ a DDL change is recoverable.
-    if images.iter().any(|i| i.pgno == 1) {
-        out.push(Anomaly::new(AnomalyKind::JournalSchemaChange));
+    // A DDL change is signalled by the schema cookie (file-header offset 40, BE)
+    // advancing — NOT merely by page 1 being journaled. Page 1 carries the
+    // change-counter / freelist-count / db-size header fields that update on
+    // nearly every write, so it is present in almost every rollback journal; only
+    // a cookie that differs between the journal's prior page-1 image and the live
+    // database indicates CREATE/DROP/ALTER. Read both cookies defensively: if the
+    // page-1 image is absent or the live page 1 is unreadable, do not fire.
+    //
+    // Caveat: for an UNCOMMITTED hot journal the live main-db file may not yet
+    // carry the new cookie, so a DDL in a hot journal can be undetectable here.
+    // That is acceptable — the detector never false-positives; it just cannot
+    // always observe the committed-cookie case mid-flight.
+    if let (Some(journal_cookie), Some(db_cookie)) = (
+        images
+            .iter()
+            .find(|i| i.pgno == 1)
+            .and_then(|i| schema_cookie(&i.bytes)),
+        db.raw_page(1).and_then(schema_cookie),
+    ) {
+        if journal_cookie != db_cookie {
+            out.push(Anomaly::new(AnomalyKind::JournalSchemaChange {
+                journal_cookie,
+                db_cookie,
+            }));
+        }
     }
 
     // A page journaled more than once (the spec forbids it).

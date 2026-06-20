@@ -236,7 +236,7 @@ This is one workspace (`sqlite-forensic`): two library crates following the flee
 | `SQLITE-JOURNAL-HOT` | High | A `-journal` with a valid header sits beside the database — consistent with an interrupted or in-progress write transaction (the main db may require rollback). |
 | `SQLITE-JOURNAL-RECOVERABLE` | Medium | A `PERSIST` rollback journal carries pre-transaction page images — consistent with a committed transaction whose deleted/modified rows remain recoverable. |
 | `SQLITE-JOURNAL-CHECKSUM-MISMATCH` | High | A journal page record failed its page checksum — consistent with corruption, a torn page write, or post-write modification. Names the offending page(s). |
-| `SQLITE-JOURNAL-SCHEMA-CHANGE` | Medium | The schema page (page 1) is among the journal's images — consistent with a DDL change (CREATE/DROP/ALTER) in the last transaction; the prior schema is recoverable. |
+| `SQLITE-JOURNAL-SCHEMA-CHANGE` | Medium | The journal's prior page-1 image carries a different schema cookie (file-header offset 40) than the live database — consistent with a DDL change (CREATE/DROP/ALTER) in the last transaction; the prior schema is recoverable. (Page 1 alone is not enough — it is journaled on nearly every write; only a cookie change signals DDL.) |
 | `SQLITE-JOURNAL-DUPLICATE-PAGE` | Medium | A page number repeats across the journal's records (the spec journals a page at most once) — consistent with corruption, a savepoint/super-journal artifact, or tampering. |
 | `SQLITE-JOURNAL-DBSIZE-DELTA` | Low | The journal's transaction-start page count differs from the current size — the last transaction grew (INSERTs) or shrank (auto-vacuum / truncation) the database. |
 

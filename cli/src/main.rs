@@ -781,8 +781,8 @@ mod tests {
     }
 
     /// `audit` over the committed SFT-03 PERSIST pair folds the rollback-journal
-    /// §6 observations in: the PERSIST journal is recoverable and journaled page 1
-    /// (a schema change), so both codes surface.
+    /// §6 observations in: the PERSIST journal is recoverable. It is DML only (the
+    /// schema cookie did not advance), so SCHEMA-CHANGE must NOT surface.
     #[test]
     fn audit_surfaces_journal_anomaly_codes() {
         let s = JournalScratch::new("audit_jrnl", &[]);
@@ -797,8 +797,8 @@ mod tests {
             "audit folds in the recoverable journal observation; got {codes:?}"
         );
         assert!(
-            codes.contains(&"SQLITE-JOURNAL-SCHEMA-CHANGE"),
-            "audit folds in the journaled-page-1 observation; got {codes:?}"
+            !codes.contains(&"SQLITE-JOURNAL-SCHEMA-CHANGE"),
+            "DML-only PERSIST (schema cookie unchanged) must NOT raise SCHEMA-CHANGE; got {codes:?}"
         );
     }
 

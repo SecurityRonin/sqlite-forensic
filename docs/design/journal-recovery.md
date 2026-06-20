@@ -201,9 +201,10 @@ artifact, or tampering.
    overflow, page 1, freelist trunk, pointer-map) — not just table leaves — so a
    prior table can be *walked* through its interior pages, and overflow payloads
    reassembled, exactly as for the live db.
-2. **Resolve schema.** Default to the main db's current schema. If **page 1** is in
-   the journal, the last transaction changed the schema (CREATE/DROP/ALTER); read
-   the prior schema from the journal's page-1 image and reconcile (a table dropped
+2. **Resolve schema.** Default to the main db's current schema. If the journal's
+   page-1 image carries a **different schema cookie** (file-header offset 40, BE)
+   than the live db, the last transaction changed the schema (CREATE/DROP/ALTER);
+   read the prior schema from the journal's page-1 image and reconcile (a table dropped
    in the last txn reappears in `prior`; a table created in the last txn is absent
    in `prior`). This recovers the **prior schema**; whether the dropped table's
    *rows* are also recoverable depends on whether its b-tree pages were journaled
@@ -362,8 +363,15 @@ conclusion (the report never asserts a legal/intent conclusion).
    `mxPage > current` ⇒ the db file shrank — *consistent with* `auto_vacuum`/
    incremental-vacuum or truncation (an ordinary `DELETE` does **not** shrink the
    file, so do not name "large delete").
-6. **Schema page (page 1) journaled.** *Consistent with* a DDL change in the last
-   transaction (CREATE/DROP/ALTER); enables prior-schema + dropped-table recovery.
+6. **Schema cookie advanced.** The journal's prior page-1 image schema cookie
+   (file-header offset 40, BE) differs from the live db's. *Consistent with* a DDL
+   change in the last transaction (CREATE/DROP/ALTER); enables prior-schema +
+   dropped-table recovery. Page 1 presence alone is **not** the signal — page 1
+   is journaled on nearly every write (change-counter / freelist-count / db-size
+   header fields update routinely), so only a cookie difference indicates DDL. For
+   an *uncommitted* hot journal the live file may not yet carry the new cookie, so
+   a committed-cookie DDL can be undetectable mid-flight — acceptable, since the
+   detector never false-positives.
 7. **Page-type/schema drift** — a journal image of page N decodes to a different
    table shape than main-db page N. *Consistent with* page repurposing
    (DROP+CREATE reused the page) / aggressive space reuse.

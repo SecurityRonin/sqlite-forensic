@@ -1184,3 +1184,236 @@ fn xlsx_combined_embeds_live_image_blob() {
         "the live image BLOB must embed under xl/media/*.png in the combined workbook"
     );
 }
+
+// ---- temporal (WAL version-history) combined workbook ----------------------
+
+/// Build a held-reader WAL fixture with a KNOWN mutation sequence so the `-wal` is
+/// RETAINED (this host's sqlite3 checkpoints-and-deletes the sidecar on a clean
+/// close). Returns the live reader (kept alive until `teardown_reader`). The db
+/// also holds a live image BLOB so the embed path is exercised.
+///
+/// Table `t(id INTEGER PRIMARY KEY, name TEXT, pic BLOB)`:
+///   C1: insert (1,'a'),(2,'b'),(4,'x')           [pic NULL]
+///   C2: update 1->'A'; delete 2; delete 4
+///   C3: insert 3->'c' with a real PNG; insert 4->'y'  (rowid 4 REUSED)
+fn build_temporal_fixture(
+    sqlite3: &str,
+    dir: &Path,
+    png_path: &Path,
+) -> (std::process::Child, PathBuf) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let db = dir.join("ev.db");
+
+    let mut reader = Command::new(sqlite3)
+        .arg(&db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn held reader");
+    let mut rin = reader.stdin.take().unwrap();
+    writeln!(
+        rin,
+        "PRAGMA journal_mode=WAL;\nPRAGMA wal_autocheckpoint=0;\nPRAGMA secure_delete=OFF;\n\
+         CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, pic BLOB);"
+    )
+    .unwrap();
+    rin.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    writeln!(rin, "BEGIN;\nSELECT count(*) FROM t;").unwrap();
+    rin.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    reader.stdin = Some(rin);
+
+    let writer = |sql: &str| {
+        let out = Command::new(sqlite3).arg(&db).arg(sql).output().unwrap();
+        assert!(
+            out.status.success(),
+            "sqlite3 writer failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    writer(
+        "PRAGMA wal_autocheckpoint=0; \
+         INSERT INTO t VALUES(1,'a',NULL); INSERT INTO t VALUES(2,'b',NULL); \
+         INSERT INTO t VALUES(4,'x',NULL);",
+    );
+    writer(
+        "PRAGMA wal_autocheckpoint=0; \
+         UPDATE t SET name='A' WHERE id=1; DELETE FROM t WHERE id=2; DELETE FROM t WHERE id=4;",
+    );
+    writer(&format!(
+        "PRAGMA wal_autocheckpoint=0; \
+         INSERT INTO t VALUES(3,'c',readfile('{}')); INSERT INTO t VALUES(4,'y',NULL);",
+        png_path.display()
+    ));
+
+    (reader, db)
+}
+
+/// Release the held reader (lets sqlite3 quit cleanly without us caring whether it
+/// checkpoints — the carve already ran against the retained `-wal`).
+fn teardown_reader(mut reader: std::process::Child) {
+    use std::io::Write;
+    if let Some(mut rin) = reader.stdin.take() {
+        let _ = writeln!(rin, "COMMIT;\n.quit");
+    }
+    let _ = reader.wait();
+}
+
+/// The DEFAULT combined workbook is a TEMPORAL workbook: each live user table's
+/// sheet carries that table's per-rowid VERSION HISTORY from the uncheckpointed
+/// WAL. On the held-reader fixture the `t` sheet must show, for the same rowid, a
+/// historical (`changed_later`) version AND the current (`present`) version; the
+/// delete+reinsert of rowid 4 must flag `rowid_reused=1`; the deleted rowid 2 must
+/// be `absent_final` / `is_deleted=1`. A live image BLOB still embeds in-cell.
+/// Gated on `sqlite3` (skips when absent).
+#[test]
+fn xlsx_temporal_workbook_has_version_history_from_wal() {
+    use calamine::{Data, Reader};
+
+    let Some(sqlite3) = sqlite3_bin() else {
+        eprintln!("SKIP xlsx_temporal_workbook_has_version_history_from_wal: no sqlite3");
+        return;
+    };
+    let dir = Scratch::new("temporal_xlsx");
+
+    // A small real PNG for the live image BLOB embed assertion.
+    let png_path = dir.join("pic.png");
+    let img = image::RgbImage::from_fn(24, 24, |x, y| {
+        image::Rgb([(x * 10) as u8, (y * 10) as u8, 64])
+    });
+    img.save(&png_path).expect("write png fixture");
+
+    let (reader, db_path) = build_temporal_fixture(&sqlite3, &dir.0, &png_path);
+
+    // Confirm the -wal was retained (non-empty) before carving.
+    let wal = dir.join("ev.db-wal");
+    let walb = std::fs::read(&wal).expect("snapshot -wal present");
+    assert!(!walb.is_empty(), "the -wal must be RETAINED (non-empty)");
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "ev.db"])
+        .output()
+        .expect("run carve");
+    assert!(
+        out.status.success(),
+        "carve must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let xlsx = dir.join("ev.recovered.xlsx");
+    assert!(xlsx.exists(), "xlsx companion must be written");
+
+    let mut wb: calamine::Xlsx<_> =
+        calamine::open_workbook(&xlsx).expect("calamine must open the xlsx");
+    let names = wb.sheet_names();
+    assert!(
+        names.iter().any(|n| n == "t"),
+        "the live table t has its own version-history sheet: {names:?}"
+    );
+
+    let range = wb.worksheet_range("t").unwrap();
+    let header: Vec<String> = range
+        .rows()
+        .next()
+        .unwrap()
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    for col in [
+        "id",
+        "name",
+        "_rowid",
+        "wal_commit",
+        "commit_seq",
+        "view_state",
+        "is_deleted",
+        "rowid_reused",
+    ] {
+        assert!(
+            header.iter().any(|h| h == col),
+            "t header has {col}: {header:?}"
+        );
+    }
+    let idx = |name: &str| header.iter().position(|h| h == name).unwrap();
+    let (i_rowid, i_name) = (idx("_rowid"), idx("name"));
+    let (i_view, i_del, i_reuse) = (idx("view_state"), idx("is_deleted"), idx("rowid_reused"));
+    let i_commit = idx("wal_commit");
+
+    // Gather (rowid, name, view_state, is_deleted, rowid_reused, wal_commit) per row.
+    let as_i = |d: &Data| -> Option<i64> {
+        match d {
+            Data::Float(f) => Some(*f as i64),
+            Data::Int(i) => Some(*i),
+            _ => None,
+        }
+    };
+    let as_s = |d: &Data| -> String { d.to_string() };
+    let body: Vec<(Option<i64>, String, String, i64, i64, String)> = range
+        .rows()
+        .skip(1)
+        .map(|r| {
+            (
+                as_i(&r[i_rowid]),
+                as_s(&r[i_name]),
+                as_s(&r[i_view]),
+                as_i(&r[i_del]).unwrap_or(0),
+                as_i(&r[i_reuse]).unwrap_or(0),
+                as_s(&r[i_commit]),
+            )
+        })
+        .collect();
+
+    // rowid 1: a historical 'a' (changed_later) AND the current 'A' (present).
+    let r1: Vec<&(Option<i64>, String, String, i64, i64, String)> =
+        body.iter().filter(|t| t.0 == Some(1)).collect();
+    assert!(
+        r1.iter().any(|t| t.1 == "a" && t.2 == "changed_later"),
+        "rowid 1 historical 'a' is changed_later: {r1:?}"
+    );
+    assert!(
+        r1.iter().any(|t| t.1 == "A" && t.2 == "present"),
+        "rowid 1 current 'A' is present: {r1:?}"
+    );
+    // The historical version is labelled with a commit:(...) wal_commit token.
+    assert!(
+        r1.iter()
+            .any(|t| t.2 == "changed_later" && t.5.starts_with("commit:(")),
+        "historical version carries a commit:(...) label: {r1:?}"
+    );
+
+    // rowid 2: deleted → absent_final, is_deleted=1.
+    let r2: Vec<_> = body.iter().filter(|t| t.0 == Some(2)).collect();
+    assert!(
+        r2.iter().any(|t| t.2 == "absent_final" && t.3 == 1),
+        "rowid 2 is absent_final / is_deleted: {r2:?}"
+    );
+
+    // rowid 4: REUSED (delete 'x' then reinsert 'y') → rowid_reused=1 on its rows.
+    let r4: Vec<_> = body.iter().filter(|t| t.0 == Some(4)).collect();
+    assert!(
+        r4.len() >= 2 && r4.iter().all(|t| t.4 == 1),
+        "rowid 4 versions flag rowid_reused=1: {r4:?}"
+    );
+
+    // The live image BLOB (rowid 3's pic) still embeds as xl/media/*.png.
+    let bytes = std::fs::read(&xlsx).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut media = false;
+    for i in 0..zip.len() {
+        let name = zip.by_index(i).unwrap().name().to_string();
+        let is_png = std::path::Path::new(&name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+        if name.starts_with("xl/media/") && is_png {
+            media = true;
+        }
+    }
+    assert!(media, "the live image BLOB must embed under xl/media/*.png");
+
+    teardown_reader(reader);
+}

@@ -60,6 +60,17 @@ serial-type carve of unallocated space, and WAL + rollback-journal recovery — 
 a 0-false-positive discipline on the in-page tier (live rowids are excluded by
 construction).
 
+![Radar of the three SQLite recovery technique families (metadata, carving, WAL)
+on the survey's Throughput / Coverage / Anti-Forensic axes, with sqlite4n6
+overlaid spanning all three.](img/landscape-radar.png)
+
+*Qualitative positioning, on the survey's Fig. 8 axes (the paper notes those
+per-technique values are heuristically assigned, not measured). The single
+measured-anchored point is `sqlite4n6`'s Throughput — medium, ~15.3 s to carve a
+100 MB database (see the Throughput section below); its Coverage and Anti-Forensic
+are high because it reads metadata, carves, applies the WAL overlay, and recovers
+the rollback journal. Regenerate with `python3 docs/plot_landscape_radar.py`.*
+
 ## Measured false-positive / recall table (identical bytes)
 
 Three scenarios were built with the real `sqlite3` engine following the survey's

@@ -3695,6 +3695,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_table_rows_dumps_each_user_table_in_rowid_order() {
+        let db = Database::open(CLEAN_DB.to_vec()).unwrap();
+        let dumps = db.live_table_rows();
+        // places.db has exactly one user table (moz_places); sqlite_* excluded.
+        assert_eq!(dumps.len(), 1, "one user-table dump expected: {dumps:?}");
+        let t = &dumps[0];
+        assert_eq!(t.name, "moz_places");
+        // Real column names come from the CREATE TABLE, not generic c0..cN.
+        assert!(
+            t.column_names.iter().any(|c| c == "url"),
+            "real column names expected: {:?}",
+            t.column_names
+        );
+        // The rowids must be the live set, in ascending order.
+        let rowids: Vec<i64> = t.rows.iter().map(|r| r.rowid).collect();
+        assert_eq!(rowids, vec![1, 2, 3, 4, 5], "rowid order: {rowids:?}");
+        // The url cell of row 1 decodes (cross-check values are real).
+        assert!(
+            matches!(t.rows[0].values.get(1), Some(Value::Text(s)) if s.contains("rust-lang")),
+            "row 1 url must decode: {:?}",
+            t.rows[0].values
+        );
+    }
+
+    #[test]
+    fn live_table_rows_excludes_internal_tables_and_handles_interior_btree() {
+        // The deletions fixture has an INTERIOR root page; all 200 live rows dump
+        // in ascending rowid order, and no sqlite_* table appears.
+        let db = Database::open(DELETED_DB.to_vec()).unwrap();
+        let dumps = db.live_table_rows();
+        assert!(
+            dumps.iter().all(|t| !t.name.starts_with("sqlite_")),
+            "internal tables excluded: {:?}",
+            dumps.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        let places = dumps
+            .iter()
+            .find(|t| t.name == "moz_places")
+            .expect("moz_places dump");
+        assert_eq!(places.rows.len(), 200, "all live rows dumped");
+        let ids: Vec<i64> = places.rows.iter().map(|r| r.rowid).collect();
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "rows in ascending rowid order"
+        );
+        assert_eq!(*ids.first().unwrap(), 1);
+        assert_eq!(*ids.last().unwrap(), 200);
+    }
+
     /// Real-corpus freeblock reconstruction: 0C-01 page 2 has six freeblock-head
     /// cells the forward parser cannot reach; reconstruction recovers them
     /// (including the destroyed-rowid `id` column) from the surviving serial tail.

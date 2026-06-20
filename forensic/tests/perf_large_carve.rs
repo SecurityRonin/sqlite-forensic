@@ -97,12 +97,19 @@ fn perf_smoke_carves_large_db_under_ceiling() {
         }
     }
 
-    // RED: deliberately wrong — there are no live rows in the deleted range, so
-    // this asserts a false positive that does not exist. Flipped to the real
-    // (empty) expectation in the GREEN commit.
+    // ZERO live rows surface as recovered: the deleted range is contiguous in the
+    // middle, with live rows on both sides, so a carver that excludes live rowids
+    // must report no id outside DELETE_LO..=DELETE_HI.
     assert!(
-        !live_false_positives.is_empty(),
-        "RED placeholder: expected at least one live false positive"
+        live_false_positives.is_empty(),
+        "carve surfaced {} live rows as deleted (false positives): {:?}",
+        live_false_positives.len(),
+        {
+            let mut v: Vec<i64> = live_false_positives.iter().copied().collect();
+            v.sort_unstable();
+            v.truncate(10);
+            v
+        }
     );
 
     // A high recovery fraction (the carve must actually recover the subset, not

@@ -28,7 +28,7 @@
 use forensicnomicon::report::{
     Confidence, Evidence, Finding, Location, Observation, Severity, Source,
 };
-use sqlite_core::{CommitId, Database, Value, WalTimeline};
+use sqlite_core::{CommitId, Database, JournalHeader, RollbackJournal, Value, WalTimeline};
 
 /// The classified `SQLite` forensic anomalies this auditor can grade.
 ///
@@ -317,6 +317,44 @@ pub enum RecoverySource {
     /// [`CarvedRecord::wal`] — the per-commit temporal coordinate, distinct from a
     /// raw [`RecoverySource::WalFrame`] residue's frame index.
     CommitSnapshot,
+    /// A **prior allocated row from the rollback journal** (design §5). The row
+    /// was LIVE in the pre-transaction state the `-journal` preserves and the last
+    /// transaction deleted or modified it — it is NOT a free-space residue, so
+    /// downstream reports must not relabel it as unallocated. Carries the page /
+    /// segment / header-state / checksum provenance in [`RollbackJournalSource`].
+    RollbackJournal(RollbackJournalSource),
+}
+
+/// Whether a rollback-journal header was parsed intact (Tier A) or reconstructed
+/// from a zeroed (PERSIST post-commit) header (Tier B). A reconstructed header
+/// could not verify page checksums (the nonce was zeroed), so its recoveries
+/// rest on cross-record structural consistency — a graded distinction the
+/// examiner weighs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalHeaderState {
+    /// Tier A: header magic present; the checksum nonce was known and verified.
+    Valid,
+    /// Tier B: header zeroed (PERSIST post-commit); parameters reconstructed,
+    /// checksums unverifiable.
+    ReconstructedZeroed,
+}
+
+/// Provenance for a record recovered from a rollback journal (design §5):
+/// where in the journal its page image lived and how trustworthy the parse was.
+/// `Copy` (all fields are scalar) so it threads through the existing
+/// attribution → output pipeline exactly like [`WalProvenance`]; the journal's
+/// path is supplied once at the API boundary, not duplicated per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RollbackJournalSource {
+    /// 0-based journal segment the page image came from.
+    pub segment: usize,
+    /// 1-based database page number the prior image restored.
+    pub pgno: u32,
+    /// Whether the header was intact (Tier A) or reconstructed (Tier B).
+    pub header_state: JournalHeaderState,
+    /// `Some(true/false)` when the page checksum could be verified (Tier A);
+    /// `None` in Tier B (nonce zeroed).
+    pub checksum_valid: Option<bool>,
 }
 
 /// Provenance for a record carved from a `-wal` frame: the
@@ -913,6 +951,188 @@ fn dedup_keep_best(mut records: Vec<CarvedRecord>) -> Vec<CarvedRecord> {
         }
     }
     kept
+}
+
+/// A row recovered from the prior (pre-transaction) snapshot of a rollback
+/// journal (design §5). In the prior state it was a LIVE allocated row that the
+/// last transaction DELETED — so it is recovered at full fidelity and is NOT a
+/// free-space carve (`allocated` was true in the prior state). Carries full
+/// journal provenance in [`RollbackJournalSource`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PriorRow {
+    /// The table the row belonged to (prior schema).
+    pub table: String,
+    /// The row's rowid (its INTEGER PRIMARY KEY for a rowid table).
+    pub rowid: i64,
+    /// The decoded prior column values, in column order.
+    pub values: Vec<Value>,
+    /// Journal provenance: page / segment / header-state / checksum status.
+    pub source: RecoverySource,
+}
+
+/// A row present in BOTH the prior snapshot and the live db with DIFFERENT values
+/// — the last transaction modified it (design §4). Carries the PRIOR (pre-edit)
+/// values and the CURRENT values. `replaced_rowid` is set because a delete +
+/// insert reusing the same rowid is indistinguishable from an in-place UPDATE
+/// here, so identity may differ — never asserted as "UPDATE".
+#[derive(Debug, Clone, PartialEq)]
+pub struct PriorVersionRecord {
+    /// The table the row belonged to (prior schema).
+    pub table: String,
+    /// The rowid present in both states.
+    pub rowid: i64,
+    /// The decoded PRIOR (pre-transaction) column values.
+    pub prior_values: Vec<Value>,
+    /// The decoded CURRENT (live) column values.
+    pub current_values: Vec<Value>,
+    /// Always `true`: the rowid is shared but identity may differ (delete+insert
+    /// reusing a rowid is indistinguishable from an UPDATE), so the prior value is
+    /// edit history, not an asserted in-place update.
+    pub replaced_rowid: bool,
+    /// Journal provenance for the prior image.
+    pub source: RecoverySource,
+}
+
+/// Structured counts of what the rollback-journal recovery found — the NIST
+/// SFT-03 "number of deleted/modified records" report (design §5/§6.11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct JournalCounts {
+    /// Rows deleted by the last transaction (prior \ current by rowid).
+    pub deleted: usize,
+    /// Rows modified by the last transaction (present in both, values differ).
+    pub modified: usize,
+}
+
+/// The result of recovering deletions + modifications from a rollback journal
+/// (design §5). Deleted rows are full-fidelity prior allocated rows (NOT
+/// free-space carves); modified rows carry the prior and current values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JournalRecovery {
+    /// Rows present in the prior snapshot but absent now — deleted by the last
+    /// transaction, recovered at full fidelity.
+    pub deleted: Vec<PriorRow>,
+    /// Rows present in both, values differ — prior (pre-edit) + current values.
+    pub modified: Vec<PriorVersionRecord>,
+    /// Structured counts (the NIST source-file report).
+    pub counts: JournalCounts,
+}
+
+/// Recover the last transaction's **deletions and modifications** from a rollback
+/// `-journal` by diffing the pre-transaction snapshot against the live database
+/// (design §4) — the temporal inverse of WAL recovery.
+///
+/// For each prior rowid table, the prior rows (read through [`PriorSnapshot`])
+/// are diffed against the current rows by rowid:
+/// - **deleted** = rowid in prior but not current → a full-fidelity [`PriorRow`];
+/// - **modified** = rowid in both with different values → a [`PriorVersionRecord`]
+///   flagged `replaced_rowid` (identity may differ; never asserted as UPDATE);
+/// - **inserted** (rowid only in current) is a timeline fact, not a recovery target.
+///
+/// `WITHOUT ROWID` tables are excluded (no integer rowid key; design §4 limit).
+/// Read-only and panic-free: a malformed/truncated journal, or a WAL-applied db
+/// (the modes are exclusive), yields an empty recovery rather than an error or
+/// panic — the journal source is bound to THIS database via
+/// [`Database::rollback_prior`].
+#[must_use]
+pub fn carve_rollback_journal(db: &Database, journal: &[u8]) -> JournalRecovery {
+    let mut deleted = Vec::new();
+    let mut modified = Vec::new();
+
+    let Ok(prior) = db.rollback_prior(journal) else {
+        return JournalRecovery {
+            deleted,
+            modified,
+            counts: JournalCounts::default(),
+        };
+    };
+    // Header state + checksum status are uniform across a single journal; carry
+    // them on every recovered row's provenance.
+    let Some(header_state) = prior_header_state(journal, db) else {
+        return empty_recovery(); // cov:unreachable: rollback_prior already parsed it
+    };
+    // Per-row checksum status is not threaded through PriorSnapshot in v1, so the
+    // verifiable fact recorded here is the journal-level one: Tier A could verify
+    // checksums (nonce known), Tier B could not (nonce zeroed). A finer per-image
+    // status is a later enhancement; `header_state` carries the Tier either way.
+    let checksum_valid = match header_state {
+        JournalHeaderState::Valid => Some(true),
+        JournalHeaderState::ReconstructedZeroed => None,
+    };
+
+    // Index the current (live) rows per table by rowid, so the diff is O(rows).
+    let live = db.live_table_rows();
+
+    for ptable in prior.tables() {
+        if ptable.without_rowid {
+            continue; // design §4 limit: WITHOUT ROWID excluded from the rowid diff.
+        }
+        let col_count = ptable.columns.len();
+        let Ok(prior_rows) = prior.read_table_with_pages(ptable.rootpage, col_count) else {
+            continue;
+        };
+        // Current rows of the same-named table (live schema), by rowid.
+        let current: std::collections::BTreeMap<i64, Vec<Value>> = live
+            .iter()
+            .find(|d| d.name == ptable.name)
+            .map(|d| d.rows.iter().map(|r| (r.rowid, r.values.clone())).collect())
+            .unwrap_or_default();
+
+        for (rowid, values, leaf_page) in prior_rows {
+            let source = RecoverySource::RollbackJournal(RollbackJournalSource {
+                segment: 0,
+                pgno: leaf_page,
+                header_state,
+                checksum_valid,
+            });
+            match current.get(&rowid) {
+                None => deleted.push(PriorRow {
+                    table: ptable.name.clone(),
+                    rowid,
+                    values,
+                    source,
+                }),
+                Some(cur) if *cur != values => modified.push(PriorVersionRecord {
+                    table: ptable.name.clone(),
+                    rowid,
+                    prior_values: values,
+                    current_values: cur.clone(),
+                    replaced_rowid: true,
+                    source,
+                }),
+                Some(_) => {} // unchanged: the page was journaled for another row.
+            }
+        }
+    }
+
+    let counts = JournalCounts {
+        deleted: deleted.len(),
+        modified: modified.len(),
+    };
+    JournalRecovery {
+        deleted,
+        modified,
+        counts,
+    }
+}
+
+/// An empty recovery (no deletions/modifications) — the graceful degradation for
+/// a malformed/unbound journal.
+fn empty_recovery() -> JournalRecovery {
+    JournalRecovery {
+        deleted: Vec::new(),
+        modified: Vec::new(),
+        counts: JournalCounts::default(),
+    }
+}
+
+/// Determine whether the journal header was intact (Tier A) or zeroed (Tier B),
+/// by re-parsing it against the db's authoritative page size.
+fn prior_header_state(journal: &[u8], db: &Database) -> Option<JournalHeaderState> {
+    let parsed = RollbackJournal::parse(journal, db.header().page_size).ok()?;
+    Some(match parsed.header() {
+        JournalHeader::Valid { .. } => JournalHeaderState::Valid,
+        JournalHeader::ReconstructedZeroed { .. } => JournalHeaderState::ReconstructedZeroed,
+    })
 }
 
 /// Audit an opened [`Database`] for forensically-notable anomalies.

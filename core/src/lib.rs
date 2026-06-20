@@ -4412,6 +4412,75 @@ impl PriorSnapshot {
     pub fn grew_db(&self) -> bool {
         self.grew_db
     }
+
+    /// Read the table rooted at `rootpage` AS OF the prior state, returning each
+    /// row's rowid, values, AND the 1-based LEAF page it was decoded from — the
+    /// per-row page provenance the forensic diff attaches to a recovered prior
+    /// row. Shares [`decode_leaf_cell`] with the standard read; a typed [`Error`]
+    /// (never a panic) on a cyclic/over-deep b-tree.
+    pub fn read_table_with_pages(
+        &self,
+        rootpage: u32,
+        column_count: usize,
+    ) -> Result<Vec<(i64, Vec<Value>, u32)>, Error> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        walk_table_page_with_leaf(self, rootpage, column_count, &mut out, &mut seen)?;
+        Ok(out)
+    }
+
+    /// The 1-based page numbers carried by the rollback journal (the pages whose
+    /// pre-transaction image differs from the live db). Diagnostic provenance.
+    #[must_use]
+    pub fn changed_pages(&self) -> Vec<u32> {
+        self.overlaid.keys().copied().collect()
+    }
+}
+
+/// Walk a table b-tree like [`walk_table_page`] but record each row's LEAF page,
+/// for the rollback-journal per-row provenance. Bounded identically (visited-set
+/// caps recursion depth; a revisited page is silently skipped).
+fn walk_table_page_with_leaf(
+    src: &dyn PageSource,
+    page: u32,
+    column_count: usize,
+    out: &mut Vec<(i64, Vec<Value>, u32)>,
+    seen: &mut std::collections::BTreeSet<u32>,
+) -> Result<(), Error> {
+    if seen.len() > MAX_PAGES_PER_WALK {
+        return Err(Error::TooManyPages);
+    }
+    if !seen.insert(page) {
+        return Ok(());
+    }
+    let slice = src.page(page).ok_or(Error::PageOutOfRange(page))?;
+    let hdr_off = if page == 1 { SQLITE_HEADER_SIZE } else { 0 };
+    let page_type = *slice.get(hdr_off).ok_or(Error::TruncatedCell)?;
+    let cell_count = be_u16(slice, hdr_off + 3) as usize;
+    match page_type {
+        0x0d => {
+            let cell_ptr_array = hdr_off + 8;
+            for i in 0..cell_count {
+                let p = cell_ptr_array + i * 2;
+                let cell_off = be_u16(slice, p) as usize;
+                let row = decode_leaf_cell(src, slice, cell_off, column_count)?;
+                out.push((row.rowid, row.values, page));
+            }
+            Ok(())
+        }
+        0x05 => {
+            let cell_ptr_array = hdr_off + 12;
+            for i in 0..cell_count {
+                let p = cell_ptr_array + i * 2;
+                let cell_off = be_u16(slice, p) as usize;
+                let child = be_u32(slice, cell_off);
+                walk_table_page_with_leaf(src, child, column_count, out, seen)?;
+            }
+            let right = be_u32(slice, hdr_off + 8);
+            walk_table_page_with_leaf(src, right, column_count, out, seen)
+        }
+        other => Err(Error::NotATablePage(other)),
+    }
 }
 
 /// Bounds-checked big-endian u32; out-of-range yields 0 (never panics).

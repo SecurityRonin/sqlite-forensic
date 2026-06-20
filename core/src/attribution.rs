@@ -33,6 +33,11 @@ pub struct LiveTable {
     pub column_names: Option<Vec<String>>,
     /// Declared column affinity for each column, in column order.
     pub affinities: Vec<Affinity>,
+    /// The table's `CREATE TABLE` statement (`sqlite_master.sql`), threaded so a
+    /// consumer can re-derive schema properties (e.g. `AUTOINCREMENT`-ness via
+    /// [`crate::is_autoincrement`]) without re-reading the schema. Empty when the
+    /// schema row carried no/invalid sql (a damaged schema).
+    pub create_sql: String,
 }
 
 /// Column type **affinity** as defined by the `SQLite` file format (§3.1, "Type

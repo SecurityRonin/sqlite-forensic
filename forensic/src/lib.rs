@@ -1670,6 +1670,122 @@ pub fn attribute_records(db: &Database, records: &[CarvedRecord]) -> Vec<Attribu
         .collect()
 }
 
+/// A **non-overclaiming diagnostic HINT** about a recovered record's relationship
+/// to the *instance* of the table it was attributed to — ORTHOGONAL to
+/// [`Attribution`] (it never changes the tier, the routing, or the table claim).
+///
+/// Detector A (`docs/design/drop-recreate-attribution.md`): when a record
+/// attributed `Known(T)` has a rowid exceeding `T`'s `AUTOINCREMENT`
+/// `sqlite_sequence` high-water mark, that is *consistent with* residue from a
+/// prior incarnation of `T` (a drop-recreate reset `sqlite_sequence`) — but it is
+/// **not proof**: the Codex review confirmed `rowid > seq` is equally reachable by
+/// an `UPDATE` of the rowid, a manual `sqlite_sequence` edit, or a current-instance
+/// deletion. So the flag is surfaced as a hint that names its evidence, and the
+/// examiner draws the conclusion. The `note` never asserts "predecessor".
+///
+/// `#[non_exhaustive]` so the documented follow-up `SidecarSchemaChanged` variant
+/// (Detector B — a sidecar `-wal`/`-journal` DDL boundary) can be added without a
+/// breaking change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TableInstanceRisk {
+    /// No instance-provenance hint applies to this record.
+    None,
+    /// The record was attributed `Known(table)`, `table` is `AUTOINCREMENT`, has a
+    /// `sqlite_sequence` entry `seq`, and the record's `rowid` exceeds it. The
+    /// current instance never assigned a rowid above `seq` via `INSERT`, so this is
+    /// *consistent with* prior-incarnation residue — and equally with an `UPDATE`
+    /// to the rowid, a `sqlite_sequence` edit, or a current-instance deletion.
+    RowidExceedsAutoincHighwater {
+        /// The live table the record was attributed to.
+        table: String,
+        /// The record's recovered rowid (the value exceeding the high-water mark).
+        rowid: i64,
+        /// The table's `AUTOINCREMENT` high-water mark (`sqlite_sequence.seq`).
+        seq: i64,
+    },
+}
+
+impl TableInstanceRisk {
+    /// A human, evidence-bearing note for the examiner — or `""` for
+    /// [`TableInstanceRisk::None`]. The wording deliberately states what the
+    /// observation is *consistent with* and lists the equally-consistent benign
+    /// explanations; it never asserts the row is a predecessor.
+    #[must_use]
+    pub fn note(&self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::RowidExceedsAutoincHighwater { table, rowid, seq } => format!(
+                "rowid {rowid} exceeds table {table}'s AUTOINCREMENT high-water mark \
+                 (sqlite_sequence={seq}) — consistent with residue from a prior incarnation of \
+                 this table, but also explainable by an UPDATE to the rowid, a sqlite_sequence \
+                 edit, or a current-instance deletion; the examiner should cross-check the RowID \
+                 and any WAL/journal schema history."
+            ),
+        }
+    }
+
+    /// A short, stable provenance token for column/field output (`null`-like for
+    /// [`TableInstanceRisk::None`] → empty string), carrying the evidence inline:
+    /// `rowid_exceeds_autoinc_highwater(r=…,seq=…)`.
+    #[must_use]
+    pub fn token(&self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::RowidExceedsAutoincHighwater { rowid, seq, .. } => {
+                format!("rowid_exceeds_autoinc_highwater(r={rowid},seq={seq})")
+            }
+        }
+    }
+}
+
+/// Per-record [`TableInstanceRisk`], parallel to `records` and their
+/// `attributions` — the Detector-A diagnostic pass.
+///
+/// A record trips [`TableInstanceRisk::RowidExceedsAutoincHighwater`] **only** when
+/// ALL hold: it is `Attribution::Known(table)`; `table` is an `AUTOINCREMENT`
+/// rowid table ([`sqlite_core::is_autoincrement`] on its `CREATE TABLE`); `table`
+/// has a `sqlite_sequence` entry `seq` ([`Database::sqlite_sequence`]); and
+/// `rec.rowid > seq`. Every other record is [`TableInstanceRisk::None`]. This is
+/// orthogonal to attribution — it reads the same inputs but never alters the
+/// attribution, tier, or routing.
+#[must_use]
+pub fn table_instance_risks(
+    db: &Database,
+    records: &[CarvedRecord],
+    attributions: &[Attribution],
+) -> Vec<TableInstanceRisk> {
+    // The set of AUTOINCREMENT table names, from the live schema's CREATE sql.
+    let autoinc: std::collections::BTreeSet<String> = db
+        .live_tables()
+        .into_iter()
+        .filter(|t| sqlite_core::is_autoincrement(&t.create_sql))
+        .map(|t| t.name)
+        .collect();
+    let sequences = db.sqlite_sequence();
+
+    records
+        .iter()
+        .zip(attributions)
+        .map(|(rec, attr)| {
+            let Attribution::Known(table) = attr else {
+                return TableInstanceRisk::None;
+            };
+            if !autoinc.contains(table) {
+                return TableInstanceRisk::None;
+            }
+            match sequences.get(table) {
+                Some(&seq) if rec.rowid > seq => TableInstanceRisk::RowidExceedsAutoincHighwater {
+                    table: table.clone(),
+                    rowid: rec.rowid,
+                    seq,
+                },
+                _ => TableInstanceRisk::None,
+            }
+        })
+        .collect()
+}
+
 /// The core per-rowid VERSION HISTORY ([`Database::row_histories`]) augmented with
 /// free-space CARVED RESIDUE — the forensic-layer completion of Phase 1.
 ///
@@ -1809,6 +1925,7 @@ mod attribution_tests {
             rootpage: root,
             column_names: None,
             affinities,
+            create_sql: String::new(),
         }
     }
 

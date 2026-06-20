@@ -25,8 +25,9 @@ use sqlite4n6::{
 use sqlite_core::rebuild::build_recovered_db_tables;
 use sqlite_core::Database;
 use sqlite_forensic::{
-    audit, audit_journal, carve_all_deleted_records, carve_rollback_journal, carve_with_fragments,
-    Anomaly, CarvedFragment, CarvedRecord, JournalRecovery,
+    attribute_records, audit, audit_journal, carve_all_deleted_records, carve_rollback_journal,
+    carve_with_fragments, table_instance_risks, Anomaly, CarvedFragment, CarvedRecord,
+    JournalRecovery,
 };
 
 /// sqlite4n6 — read-only SQLite forensic analysis CLI.
@@ -442,7 +443,9 @@ fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
             carve_all_deleted_records(&db)
         };
         let records = filter_by_confidence(records, args.min_confidence.into());
-        for line in render_carve_with_snapshot(&records, fmt, args.rowid_only) {
+        let attrs = attribute_records(&db, &records);
+        let risks = table_instance_risks(&db, &records, &attrs);
+        for line in render_carve_with_snapshot(&records, &risks, fmt, args.rowid_only) {
             println!("{line}");
         }
         // v1 fragments are sourced from the on-disk image only (no WAL fragment
@@ -468,14 +471,18 @@ fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
             let tiers = carve_with_fragments(&db);
             let mut full = filter_by_confidence(tiers.full, args.min_confidence.into());
             full.extend(journal_records);
-            for line in render_carve_tiered(&full, &tiers.fragments, fmt, args.rowid_only) {
+            let attrs = attribute_records(&db, &full);
+            let risks = table_instance_risks(&db, &full, &attrs);
+            for line in render_carve_tiered(&full, &risks, &tiers.fragments, fmt, args.rowid_only) {
                 println!("{line}");
             }
         } else {
             let mut records =
                 filter_by_confidence(carve_all_deleted_records(&db), args.min_confidence.into());
             records.extend(journal_records);
-            for line in render_carve(&records, fmt, args.rowid_only) {
+            let attrs = attribute_records(&db, &records);
+            let risks = table_instance_risks(&db, &records, &attrs);
+            for line in render_carve(&records, &risks, fmt, args.rowid_only) {
                 println!("{line}");
             }
         }

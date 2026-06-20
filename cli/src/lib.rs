@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use sqlite_core::rebuild::{FragmentRow, RebuildRow, RecoveredTable};
 use sqlite_core::{Database, Value, WalTimeline};
 use sqlite_forensic::{
-    attribute_records, carve_all_deleted_records, carve_at_commit, Anomaly, Attribution,
-    CarvedFragment, CarvedRecord, JournalRecovery, RecoverySource,
+    attribute_records, carve_all_deleted_records, carve_at_commit, table_instance_risks, Anomaly,
+    Attribution, CarvedFragment, CarvedRecord, JournalRecovery, RecoverySource, TableInstanceRisk,
 };
 
 /// Output rendering format, shared by `carve` and `audit`.
@@ -306,6 +306,7 @@ fn dedup_keep_earliest_label(mut records: Vec<CarvedRecord>) -> Vec<CarvedRecord
 #[must_use]
 pub fn render_carve(
     records: &[CarvedRecord],
+    risks: &[TableInstanceRisk],
     format: OutputFormat,
     rowid_only: bool,
 ) -> Vec<String> {
@@ -315,7 +316,20 @@ pub fn render_carve(
     match format {
         OutputFormat::Table => render_carve_table(records),
         OutputFormat::Csv => render_carve_csv(records),
-        OutputFormat::Jsonl => render_carve_jsonl(records),
+        OutputFormat::Jsonl => render_carve_jsonl(records, risks),
+    }
+}
+
+/// The JSONL `table_instance_risk` field value for a record's risk: the quoted
+/// evidence token, or the literal `null` for [`TableInstanceRisk::None`] / a risk
+/// slice that does not cover this index. Kept null/empty for the overwhelming
+/// majority of records (only an AUTOINCREMENT `rowid > seq` trips it).
+fn table_instance_risk_json(risks: &[TableInstanceRisk], idx: usize) -> String {
+    match risks.get(idx) {
+        Some(risk @ TableInstanceRisk::RowidExceedsAutoincHighwater { .. }) => {
+            format!("\"{}\"", json_escape(&risk.token()))
+        }
+        _ => "null".to_string(),
     }
 }
 
@@ -359,17 +373,19 @@ fn render_carve_csv(records: &[CarvedRecord]) -> Vec<String> {
     lines
 }
 
-fn render_carve_jsonl(records: &[CarvedRecord]) -> Vec<String> {
+fn render_carve_jsonl(records: &[CarvedRecord], risks: &[TableInstanceRisk]) -> Vec<String> {
     records
         .iter()
-        .map(|rec| {
+        .enumerate()
+        .map(|(i, rec)| {
             format!(
-                "{{\"page\":{},\"offset\":{},\"rowid\":{},\"recovery_source\":\"{}\",\"confidence\":{:.4},\"values\":{}}}",
+                "{{\"page\":{},\"offset\":{},\"rowid\":{},\"recovery_source\":\"{}\",\"confidence\":{:.4},\"table_instance_risk\":{},\"values\":{}}}",
                 rec.page,
                 rec.offset,
                 rec.rowid,
                 recovery_source_token(rec.source),
                 rec.confidence,
+                table_instance_risk_json(risks, i),
                 values_json_array(&rec.values)
             )
         })
@@ -506,6 +522,7 @@ fn render_fragments_jsonl(frags: &[CarvedFragment]) -> Vec<String> {
 #[must_use]
 pub fn render_carve_tiered(
     full: &[CarvedRecord],
+    risks: &[TableInstanceRisk],
     fragments: &[CarvedFragment],
     format: OutputFormat,
     rowid_only: bool,
@@ -534,7 +551,7 @@ pub fn render_carve_tiered(
         return lines;
     }
     // Table / JSONL: full-row output unchanged, fragment section appended.
-    let mut lines = render_carve(full, format, false);
+    let mut lines = render_carve(full, risks, format, false);
     lines.extend(render_fragments(fragments, format));
     lines
 }
@@ -548,6 +565,7 @@ pub fn render_carve_tiered(
 #[must_use]
 pub fn render_carve_with_snapshot(
     records: &[CarvedRecord],
+    risks: &[TableInstanceRisk],
     format: OutputFormat,
     rowid_only: bool,
 ) -> Vec<String> {
@@ -557,7 +575,7 @@ pub fn render_carve_with_snapshot(
     match format {
         OutputFormat::Table => render_carve_snapshot_table(records),
         OutputFormat::Csv => render_carve_snapshot_csv(records),
-        OutputFormat::Jsonl => render_carve_snapshot_jsonl(records),
+        OutputFormat::Jsonl => render_carve_snapshot_jsonl(records, risks),
     }
 }
 
@@ -604,18 +622,23 @@ fn render_carve_snapshot_csv(records: &[CarvedRecord]) -> Vec<String> {
     lines
 }
 
-fn render_carve_snapshot_jsonl(records: &[CarvedRecord]) -> Vec<String> {
+fn render_carve_snapshot_jsonl(
+    records: &[CarvedRecord],
+    risks: &[TableInstanceRisk],
+) -> Vec<String> {
     records
         .iter()
-        .map(|rec| {
+        .enumerate()
+        .map(|(i, rec)| {
             format!(
-                "{{\"page\":{},\"offset\":{},\"rowid\":{},\"recovery_source\":\"{}\",\"confidence\":{:.4},\"snapshot\":\"{}\",\"values\":{}}}",
+                "{{\"page\":{},\"offset\":{},\"rowid\":{},\"recovery_source\":\"{}\",\"confidence\":{:.4},\"snapshot\":\"{}\",\"table_instance_risk\":{},\"values\":{}}}",
                 rec.page,
                 rec.offset,
                 rec.rowid,
                 recovery_source_token(rec.source),
                 rec.confidence,
                 json_escape(&snapshot_label(rec)),
+                table_instance_risk_json(risks, i),
                 values_json_array(&rec.values)
             )
         })
@@ -849,7 +872,14 @@ pub fn fragment_to_rebuild_row(frag: &CarvedFragment) -> FragmentRow {
 // ---- table attribution → recovered tables ---------------------------------
 
 /// The fixed provenance columns every recovered table carries before its cells.
-const PROVENANCE_COLS: [&str; 5] = ["_page", "_offset", "_rowid", "_source", "_confidence"];
+const PROVENANCE_COLS: [&str; 6] = [
+    "_page",
+    "_offset",
+    "_rowid",
+    "_source",
+    "_confidence",
+    "_table_instance_risk",
+];
 
 /// Group carved records into the attribution-tiered [`RecoveredTable`] set that
 /// both the rebuilt db and the xlsx are built from:
@@ -872,29 +902,48 @@ pub fn group_attributed_tables(
     fragments: Option<&[CarvedFragment]>,
 ) -> Vec<RecoveredTable> {
     let attributions = attribute_records(db, records);
-    group_into_tables(records, &attributions, &db.live_tables(), fragments)
+    let risks = table_instance_risks(db, records, &attributions);
+    group_into_tables(records, &attributions, &risks, &db.live_tables(), fragments)
 }
 
 /// Pure core of [`group_attributed_tables`]: given the records, their parallel
-/// attributions, the live-table schema (for real Tier-1 column names), and the
-/// fragments, produce the ordered [`RecoveredTable`] set. No DB access, so it is
-/// directly unit-testable.
+/// attributions, their parallel [`TableInstanceRisk`]s, the live-table schema (for
+/// real Tier-1 column names), and the fragments, produce the ordered
+/// [`RecoveredTable`] set. No DB access, so it is directly unit-testable.
+///
+/// Every record-derived recovered table (Tier-1 / Tier-2 / Tier-3) carries the
+/// `_table_instance_risk` provenance column; the value is the risk's evidence
+/// token, empty (`NULL`) for [`TableInstanceRisk::None`] — which is every record
+/// that is not an AUTOINCREMENT `rowid > sqlite_sequence` residue. The flag rides
+/// as a column; no record is ever rerouted out of its attribution table.
 #[must_use]
 pub fn group_into_tables(
     records: &[CarvedRecord],
     attributions: &[Attribution],
+    risks: &[TableInstanceRisk],
     live_tables: &[sqlite_core::attribution::LiveTable],
     fragments: Option<&[CarvedFragment]>,
 ) -> Vec<RecoveredTable> {
-    // Tier-1: one bucket per attributed live table, first-seen order preserved.
-    let mut known_order: Vec<String> = Vec::new();
-    let mut known: std::collections::HashMap<String, Vec<&CarvedRecord>> =
-        std::collections::HashMap::new();
-    // Tier-2: parallel records + their (guess, ambiguous); Tier-3: records only.
-    let mut inferred: Vec<(&CarvedRecord, &str, bool)> = Vec::new();
-    let mut unattributed: Vec<&CarvedRecord> = Vec::new();
+    // Each record's risk token (empty for None), looked up by index alongside the
+    // record. Sized to `records`; a short `risks` slice degrades to empty tokens.
+    let risk_token = |i: usize| -> String {
+        risks
+            .get(i)
+            .map(TableInstanceRisk::token)
+            .unwrap_or_default()
+    };
 
-    for (rec, attr) in records.iter().zip(attributions) {
+    // Tier-1: one bucket per attributed live table, first-seen order preserved.
+    // Each bucket entry pairs the record with its risk token.
+    let mut known_order: Vec<String> = Vec::new();
+    let mut known: std::collections::HashMap<String, Vec<(&CarvedRecord, String)>> =
+        std::collections::HashMap::new();
+    // Tier-2: parallel records + their (guess, ambiguous); Tier-3: (record, token).
+    let mut inferred: Vec<(&CarvedRecord, &str, bool, String)> = Vec::new();
+    let mut unattributed: Vec<(&CarvedRecord, String)> = Vec::new();
+
+    for (i, (rec, attr)) in records.iter().zip(attributions).enumerate() {
+        let token = risk_token(i);
         match attr {
             Attribution::Known(name) => {
                 known.entry(name.clone()).or_insert_with(|| {
@@ -902,13 +951,13 @@ pub fn group_into_tables(
                     Vec::new()
                 });
                 if let Some(bucket) = known.get_mut(name) {
-                    bucket.push(rec);
+                    bucket.push((rec, token));
                 }
             }
             Attribution::Inferred { guess, ambiguous } => {
-                inferred.push((rec, guess.as_str(), *ambiguous));
+                inferred.push((rec, guess.as_str(), *ambiguous, token));
             }
-            Attribution::Unattributed => unattributed.push(rec),
+            Attribution::Unattributed => unattributed.push((rec, token)),
         }
     }
 
@@ -919,7 +968,7 @@ pub fn group_into_tables(
         let Some(recs) = known.get(table_name) else {
             continue; // cov:unreachable: known_order mirrors known's keys
         };
-        let max_cells = recs.iter().map(|r| r.values.len()).max().unwrap_or(0);
+        let max_cells = recs.iter().map(|(r, _)| r.values.len()).max().unwrap_or(0);
         let real_names = live_tables
             .iter()
             .find(|t| &t.name == table_name)
@@ -933,7 +982,7 @@ pub fn group_into_tables(
         let columns = provenance_columns_then(&cell_cols);
         let rows = recs
             .iter()
-            .map(|r| record_row_values(r, max_cells))
+            .map(|(r, token)| record_row_values(r, token, max_cells))
             .collect();
         out.push(RecoveredTable {
             name: format!("recovered_{table_name}"),
@@ -946,7 +995,7 @@ pub fn group_into_tables(
     if !inferred.is_empty() {
         let max_cells = inferred
             .iter()
-            .map(|(r, _, _)| r.values.len())
+            .map(|(r, _, _, _)| r.values.len())
             .max()
             .unwrap_or(0);
         let mut columns: Vec<String> = PROVENANCE_COLS.iter().map(|s| (*s).to_string()).collect();
@@ -955,8 +1004,8 @@ pub fn group_into_tables(
         columns.extend(generic_cell_columns(max_cells));
         let rows = inferred
             .iter()
-            .map(|(r, guess, ambiguous)| {
-                let mut v = provenance_values(r);
+            .map(|(r, guess, ambiguous, token)| {
+                let mut v = provenance_values(r, token);
                 v.push(Value::Text((*guess).to_string()));
                 v.push(Value::Integer(i64::from(*ambiguous)));
                 v.extend(cell_values(r, max_cells));
@@ -974,13 +1023,13 @@ pub fn group_into_tables(
     if !unattributed.is_empty() {
         let max_cells = unattributed
             .iter()
-            .map(|r| r.values.len())
+            .map(|(r, _)| r.values.len())
             .max()
             .unwrap_or(0);
         let columns = provenance_columns_then(&generic_cell_columns(max_cells));
         let rows = unattributed
             .iter()
-            .map(|r| record_row_values(r, max_cells))
+            .map(|(r, token)| record_row_values(r, token, max_cells))
             .collect();
         out.push(RecoveredTable {
             name: "recovered_unattributed".to_string(),
@@ -1009,9 +1058,10 @@ fn provenance_columns_then(cell_cols: &[String]) -> Vec<String> {
     columns
 }
 
-/// The five provenance values for a record: page, offset, rowid (NULL when 0),
-/// source token, confidence.
-fn provenance_values(rec: &CarvedRecord) -> Vec<Value> {
+/// The six provenance values for a record: page, offset, rowid (NULL when 0),
+/// source token, confidence, and the `table_instance_risk` token (NULL when the
+/// risk is [`TableInstanceRisk::None`], i.e. an empty `token`).
+fn provenance_values(rec: &CarvedRecord, risk_token: &str) -> Vec<Value> {
     vec![
         Value::Integer(i64::from(rec.page)),
         Value::Integer(rec.offset as i64),
@@ -1022,6 +1072,11 @@ fn provenance_values(rec: &CarvedRecord) -> Vec<Value> {
         },
         Value::Text(recovery_source_token(rec.source).to_string()),
         Value::Real(f64::from(rec.confidence)),
+        if risk_token.is_empty() {
+            Value::Null
+        } else {
+            Value::Text(risk_token.to_string())
+        },
     ]
 }
 
@@ -1033,8 +1088,8 @@ fn cell_values(rec: &CarvedRecord, max_cells: usize) -> Vec<Value> {
 }
 
 /// Full row for a provenance-only table (Tier-1 / Tier-3): provenance + cells.
-fn record_row_values(rec: &CarvedRecord, max_cells: usize) -> Vec<Value> {
-    let mut v = provenance_values(rec);
+fn record_row_values(rec: &CarvedRecord, risk_token: &str, max_cells: usize) -> Vec<Value> {
+    let mut v = provenance_values(rec, risk_token);
     v.extend(cell_values(rec, max_cells));
     v
 }
@@ -1458,7 +1513,7 @@ pub fn wal_commit_token(
 /// sheet, after the table's real columns, in order: the rowid, the WAL commit
 /// label, the logical commit sequence, the evidence-based view state, then the
 /// four 0/1 flag columns.
-pub const TEMPORAL_FLAG_COLS: [&str; 8] = [
+pub const TEMPORAL_FLAG_COLS: [&str; 9] = [
     "_rowid",
     "wal_commit",
     "commit_seq",
@@ -1467,6 +1522,7 @@ pub const TEMPORAL_FLAG_COLS: [&str; 8] = [
     "is_guessed",
     "rowid_reused",
     "attribution_uncertain",
+    "_table_instance_risk",
 ];
 
 /// The annotation note a `WITHOUT ROWID` table's sheet carries instead of versions:
@@ -1528,6 +1584,7 @@ pub struct TemporalSheet {
 pub fn temporal_sheet(
     history: &sqlite_core::row_history::TableHistory,
     resolve_lsn: impl Fn(&sqlite_core::CommitId) -> Option<sqlite_core::WalLsn>,
+    risk_token: impl Fn(i64) -> String,
     row_cap: usize,
 ) -> (TemporalSheet, usize) {
     use sqlite_core::row_history::VersionOrigin;
@@ -1584,6 +1641,14 @@ pub fn temporal_sheet(
         cells.push(Value::Integer(i64::from(v.is_guessed)));
         cells.push(Value::Integer(i64::from(v.rowid_reused)));
         cells.push(Value::Integer(i64::from(v.attribution_uncertain)));
+        // _table_instance_risk — the Detector-A evidence token for a residue row
+        // whose rowid exceeds this AUTOINCREMENT table's high-water mark, else NULL.
+        let token = v.rowid.map(&risk_token).unwrap_or_default();
+        cells.push(if token.is_empty() {
+            Value::Null
+        } else {
+            Value::Text(token)
+        });
 
         let superseded = v.view_state == sqlite_core::row_history::ViewState::ValueChangedLater;
         rows.push(TemporalRow {
@@ -1884,10 +1949,31 @@ pub fn plan_combined_workbook(
             .map(sqlite_core::CommitSnapshot::lsn)
     };
 
+    // The Detector-A instance-risk per carved record, keyed by (table, rowid) so a
+    // residue version folded into a table's history carries its evidence token in
+    // the `_table_instance_risk` column. Only an AUTOINCREMENT `rowid > seq` residue
+    // populates the map; everything else is absent (→ NULL column).
+    let attributions = attribute_records(db, records);
+    let risks = table_instance_risks(db, records, &attributions);
+    let mut risk_by_table_rowid: std::collections::BTreeMap<(String, i64), String> =
+        std::collections::BTreeMap::new();
+    for (rec, risk) in records.iter().zip(&risks) {
+        if let TableInstanceRisk::RowidExceedsAutoincHighwater { table, .. } = risk {
+            risk_by_table_rowid.insert((table.clone(), rec.rowid), risk.token());
+        }
+    }
+
     let mut sheets = Vec::with_capacity(histories.len());
     let mut dropped = Vec::new();
     for h in &histories {
-        let (sheet, n) = temporal_sheet(h, resolve_lsn, row_cap);
+        let table = h.table.clone();
+        let risk_token = |rowid: i64| -> String {
+            risk_by_table_rowid
+                .get(&(table.clone(), rowid))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let (sheet, n) = temporal_sheet(h, resolve_lsn, risk_token, row_cap);
         if n > 0 {
             dropped.push((h.table.clone(), n));
         }
@@ -1900,7 +1986,6 @@ pub fn plan_combined_workbook(
     // bucket is exactly that set, so the attributed residue (already in its table's
     // version history) is never double-listed.
     let live_names: Vec<String> = histories.iter().map(|h| h.table.clone()).collect();
-    let attributions = attribute_records(db, records);
     let routed = route_recovered(&live_names, records, &attributions);
     let unattr_records: Vec<CarvedRecord> = routed
         .unattributed
@@ -1908,7 +1993,9 @@ pub fn plan_combined_workbook(
         .map(|&i| records[i].clone())
         .collect();
     let unattr_attrs = vec![Attribution::Unattributed; unattr_records.len()];
-    let extra = group_into_tables(&unattr_records, &unattr_attrs, &[], fragments);
+    // Unattributed residue is never Known+AUTOINCREMENT, so its risk is always
+    // None; an empty risks slice degrades each token to empty (NULL column).
+    let extra = group_into_tables(&unattr_records, &unattr_attrs, &[], &[], fragments);
 
     CombinedWorkbook {
         sheets,
@@ -2250,6 +2337,7 @@ mod tests {
             rootpage: 2,
             column_names: Some(cols.iter().map(|s| (*s).to_string()).collect()),
             affinities: affs,
+            create_sql: String::new(),
         }
     }
 
@@ -2273,7 +2361,7 @@ mod tests {
             vec![Value::Integer(1), Value::Text("a".into())],
         )];
         let attrs = vec![Attribution::Known("people".to_string())];
-        let tables = group_into_tables(&records, &attrs, std::slice::from_ref(&people), None);
+        let tables = group_into_tables(&records, &attrs, &[], std::slice::from_ref(&people), None);
         assert_eq!(
             cols_of(&tables, "recovered_people"),
             [
@@ -2282,6 +2370,7 @@ mod tests {
                 "_rowid",
                 "_source",
                 "_confidence",
+                "_table_instance_risk",
                 "id",
                 "name"
             ]
@@ -2309,7 +2398,7 @@ mod tests {
             ],
         )];
         let attrs = vec![Attribution::Known("people".to_string())];
-        let tables = group_into_tables(&records, &attrs, std::slice::from_ref(&people), None);
+        let tables = group_into_tables(&records, &attrs, &[], std::slice::from_ref(&people), None);
         assert_eq!(
             cols_of(&tables, "recovered_people"),
             [
@@ -2318,6 +2407,7 @@ mod tests {
                 "_rowid",
                 "_source",
                 "_confidence",
+                "_table_instance_risk",
                 "c0",
                 "c1",
                 "c2"
@@ -2352,7 +2442,7 @@ mod tests {
                 ambiguous: true,
             },
         ];
-        let tables = group_into_tables(&records, &attrs, &[], None);
+        let tables = group_into_tables(&records, &attrs, &[], &[], None);
         assert_eq!(
             cols_of(&tables, "recovered_inferred"),
             [
@@ -2361,6 +2451,7 @@ mod tests {
                 "_rowid",
                 "_source",
                 "_confidence",
+                "_table_instance_risk",
                 "_table_guess",
                 "_table_match_ambiguous",
                 "c0"
@@ -2372,12 +2463,12 @@ mod tests {
             .find(|t| t.name == "recovered_inferred")
             .unwrap();
         assert_eq!(inferred.rows.len(), 2);
-        // Row 0: guess "people", ambiguous 0.
-        assert_eq!(inferred.rows[0][5], Value::Text("people".into()));
-        assert_eq!(inferred.rows[0][6], Value::Integer(0));
+        // Row 0: guess "people", ambiguous 0 (after the six provenance columns).
+        assert_eq!(inferred.rows[0][6], Value::Text("people".into()));
+        assert_eq!(inferred.rows[0][7], Value::Integer(0));
         // Row 1: guess "notes", ambiguous 1.
-        assert_eq!(inferred.rows[1][5], Value::Text("notes".into()));
-        assert_eq!(inferred.rows[1][6], Value::Integer(1));
+        assert_eq!(inferred.rows[1][6], Value::Text("notes".into()));
+        assert_eq!(inferred.rows[1][7], Value::Integer(1));
     }
 
     #[test]
@@ -2389,7 +2480,7 @@ mod tests {
             vec![Value::Integer(1), Value::Integer(2)],
         )];
         let attrs = vec![Attribution::Unattributed];
-        let tables = group_into_tables(&records, &attrs, &[], None);
+        let tables = group_into_tables(&records, &attrs, &[], &[], None);
         assert_eq!(
             cols_of(&tables, "recovered_unattributed"),
             [
@@ -2398,6 +2489,7 @@ mod tests {
                 "_rowid",
                 "_source",
                 "_confidence",
+                "_table_instance_risk",
                 "c0",
                 "c1"
             ]
@@ -2426,7 +2518,7 @@ mod tests {
             source: RecoverySource::FreeblockReconstructed,
             wal: None,
         }];
-        let tables = group_into_tables(&records, &attrs, &[], Some(&frags));
+        let tables = group_into_tables(&records, &attrs, &[], &[], Some(&frags));
         let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         // Only the inferred tier + fragments — no empty recovered_unattributed.
         assert!(names.contains(&"recovered_inferred"));
@@ -2554,7 +2646,7 @@ mod tests {
             ),
             rec(0, 0.4, RecoverySource::FreeblockReconstructed, vec![]),
         ];
-        let lines = render_carve(&records, OutputFormat::Csv, true);
+        let lines = render_carve(&records, &[], OutputFormat::Csv, true);
         assert_eq!(lines, vec!["5".to_string(), "?".to_string()]);
     }
 
@@ -2566,7 +2658,7 @@ mod tests {
             RecoverySource::FreelistPage,
             vec![Value::Text("alice".into()), Value::Integer(30)],
         )];
-        let lines = render_carve(&records, OutputFormat::Csv, false);
+        let lines = render_carve(&records, &[], OutputFormat::Csv, false);
         assert_eq!(
             lines[0],
             "page,offset,rowid,recovery_source,confidence,values"
@@ -2584,7 +2676,7 @@ mod tests {
             RecoverySource::FreelistPage,
             vec![Value::Text("a,b".into())],
         )];
-        let lines = render_carve(&records, OutputFormat::Csv, false);
+        let lines = render_carve(&records, &[], OutputFormat::Csv, false);
         assert!(lines[1].contains("\"a,b\""), "{}", lines[1]);
     }
 
@@ -2604,7 +2696,7 @@ mod tests {
                 vec![Value::Null],
             ),
         ];
-        let lines = render_carve(&records, OutputFormat::Jsonl, false);
+        let lines = render_carve(&records, &[], OutputFormat::Jsonl, false);
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("{\"page\":3"), "{}", lines[0]);
         assert!(
@@ -2628,7 +2720,7 @@ mod tests {
             RecoverySource::FreelistPage,
             vec![Value::Blob(b"foobar".to_vec())],
         )];
-        let lines = render_carve(&records, OutputFormat::Jsonl, false);
+        let lines = render_carve(&records, &[], OutputFormat::Jsonl, false);
         // RFC 4648 test vector: base64("foobar") == "Zm9vYmFy".
         assert!(
             lines[0].contains("\"values\":[{\"blob_base64\":\"Zm9vYmFy\"}]"),
@@ -2646,7 +2738,7 @@ mod tests {
             RecoverySource::FreelistPage,
             vec![Value::Text("alice".into()), Value::Integer(30)],
         )];
-        let lines = render_carve(&records, OutputFormat::Table, false);
+        let lines = render_carve(&records, &[], OutputFormat::Table, false);
         assert!(lines[0].contains("page"));
         assert!(lines[0].contains("recovery_source"));
         assert_eq!(lines.len(), 2);
@@ -2722,7 +2814,7 @@ mod tests {
             wal_rec(RecoverySource::CommitSnapshot, 0),
             wal_rec(RecoverySource::WalFrame, 1),
         ];
-        let lines = render_carve_with_snapshot(&records, OutputFormat::Table, false);
+        let lines = render_carve_with_snapshot(&records, &[], OutputFormat::Table, false);
         assert!(
             lines[0].contains("snapshot"),
             "header has snapshot col: {}",
@@ -2744,7 +2836,7 @@ mod tests {
     #[test]
     fn carve_with_snapshot_csv_has_snapshot_header_and_value() {
         let records = vec![wal_rec(RecoverySource::CommitSnapshot, 0)];
-        let lines = render_carve_with_snapshot(&records, OutputFormat::Csv, false);
+        let lines = render_carve_with_snapshot(&records, &[], OutputFormat::Csv, false);
         assert_eq!(
             lines[0],
             "page,offset,rowid,recovery_source,confidence,snapshot,values"
@@ -2760,7 +2852,7 @@ mod tests {
     #[test]
     fn carve_with_snapshot_jsonl_carries_snapshot_field() {
         let records = vec![wal_rec(RecoverySource::WalFrame, 1)];
-        let lines = render_carve_with_snapshot(&records, OutputFormat::Jsonl, false);
+        let lines = render_carve_with_snapshot(&records, &[], OutputFormat::Jsonl, false);
         assert_eq!(lines.len(), 1);
         assert!(
             lines[0].contains("\"snapshot\":\"wal-frame:(3131615003,3836839008,1)\""),
@@ -2772,7 +2864,7 @@ mod tests {
     #[test]
     fn carve_with_snapshot_rowid_only_still_projects_rowids() {
         let records = vec![wal_rec(RecoverySource::CommitSnapshot, 0)];
-        let lines = render_carve_with_snapshot(&records, OutputFormat::Jsonl, true);
+        let lines = render_carve_with_snapshot(&records, &[], OutputFormat::Jsonl, true);
         assert_eq!(lines, vec!["130".to_string()]);
     }
 
@@ -3204,8 +3296,8 @@ mod tests {
             RecoverySource::FreelistPage,
             vec![Value::Integer(7)],
         )];
-        let plain = render_carve(&records, OutputFormat::Jsonl, false);
-        let tiered = render_carve_tiered(&records, &[], OutputFormat::Jsonl, false);
+        let plain = render_carve(&records, &[], OutputFormat::Jsonl, false);
+        let tiered = render_carve_tiered(&records, &[], &[], OutputFormat::Jsonl, false);
         assert_eq!(plain, tiered, "no fragments → full-row JSONL unchanged");
         assert!(!tiered[0].contains("\"kind\""));
     }
@@ -3218,7 +3310,7 @@ mod tests {
             RecoverySource::FreelistPage,
             vec![Value::Integer(7)],
         )];
-        let lines = render_carve_tiered(&records, &[frag()], OutputFormat::Csv, false);
+        let lines = render_carve_tiered(&records, &[], &[frag()], OutputFormat::Csv, false);
         assert_eq!(
             lines[0],
             "kind,page,offset,rowid,recovery_source,confidence,values"
@@ -3230,7 +3322,7 @@ mod tests {
     #[test]
     fn tiered_rowid_only_emits_full_rowids_no_fragments() {
         let records = vec![rec(7, 0.9, RecoverySource::FreelistPage, vec![])];
-        let lines = render_carve_tiered(&records, &[frag()], OutputFormat::Table, true);
+        let lines = render_carve_tiered(&records, &[], &[frag()], OutputFormat::Table, true);
         assert_eq!(lines, vec!["7".to_string()]);
     }
 
@@ -4097,6 +4189,12 @@ mod tests {
         None
     }
 
+    /// A `risk_token` lookup that never reports a `table_instance_risk` (the
+    /// common case: a sheet whose rows carry no AUTOINCREMENT-high-water hint).
+    fn no_risk(_: i64) -> String {
+        String::new()
+    }
+
     #[test]
     fn temporal_sheet_header_appends_flag_columns() {
         let h = TableHistory {
@@ -4105,7 +4203,7 @@ mod tests {
             without_rowid: false,
             versions: vec![],
         };
-        let (sheet, dropped) = temporal_sheet(&h, no_lsn, EXCEL_MAX_ROWS);
+        let (sheet, dropped) = temporal_sheet(&h, no_lsn, no_risk, EXCEL_MAX_ROWS);
         assert_eq!(dropped, 0);
         assert_eq!(
             sheet.columns,
@@ -4120,6 +4218,7 @@ mod tests {
                 "is_guessed",
                 "rowid_reused",
                 "attribution_uncertain",
+                "_table_instance_risk",
             ]
             .map(String::from)
         );
@@ -4135,7 +4234,7 @@ mod tests {
             without_rowid: true,
             versions: vec![],
         };
-        let (sheet, _) = temporal_sheet(&h, no_lsn, EXCEL_MAX_ROWS);
+        let (sheet, _) = temporal_sheet(&h, no_lsn, no_risk, EXCEL_MAX_ROWS);
         assert_eq!(sheet.rows.len(), 1, "exactly one annotation row");
         let note = &sheet.rows[0].cells[0];
         assert_eq!(
@@ -4172,7 +4271,7 @@ mod tests {
                 frame_index: 3,
             })
         };
-        let (sheet, _) = temporal_sheet(&h, resolve, EXCEL_MAX_ROWS);
+        let (sheet, _) = temporal_sheet(&h, resolve, no_risk, EXCEL_MAX_ROWS);
         assert_eq!(sheet.rows.len(), 1);
         let cells = &sheet.rows[0].cells;
         // Real columns first.
@@ -4213,7 +4312,7 @@ mod tests {
             without_rowid: false,
             versions: vec![v],
         };
-        let (sheet, _) = temporal_sheet(&h, no_lsn, EXCEL_MAX_ROWS);
+        let (sheet, _) = temporal_sheet(&h, no_lsn, no_risk, EXCEL_MAX_ROWS);
         let cells = &sheet.rows[0].cells;
         assert_eq!(cells[0], Value::Text("ghost".into()));
         assert_eq!(cells[1], Value::Null, "None rowid → blank _rowid");
@@ -4248,7 +4347,7 @@ mod tests {
             without_rowid: false,
             versions: vec![v],
         };
-        let (sheet, _) = temporal_sheet(&h, no_lsn, EXCEL_MAX_ROWS);
+        let (sheet, _) = temporal_sheet(&h, no_lsn, no_risk, EXCEL_MAX_ROWS);
         // _rowid, wal_commit cells.
         assert_eq!(sheet.rows[0].cells[1], Value::Integer(9));
         assert_eq!(sheet.rows[0].cells[2], Value::Text("commit:?".into()));
@@ -4277,7 +4376,7 @@ mod tests {
             without_rowid: false,
             versions,
         };
-        let (sheet, dropped) = temporal_sheet(&h, no_lsn, 2);
+        let (sheet, dropped) = temporal_sheet(&h, no_lsn, no_risk, 2);
         assert_eq!(sheet.rows.len(), 2);
         assert_eq!(dropped, 3);
     }

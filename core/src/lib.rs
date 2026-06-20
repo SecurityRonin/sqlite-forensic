@@ -1429,6 +1429,7 @@ impl Database {
                 rootpage,
                 column_names,
                 affinities,
+                create_sql: sql.to_string(),
             });
         }
         tables
@@ -1548,6 +1549,58 @@ impl Database {
                 _ => "", // cov:unreachable: a 'table' schema row carries its CREATE TABLE sql
             };
             map.insert(name.clone(), without_rowid_sql(sql));
+        }
+        map
+    }
+
+    /// The `sqlite_sequence` table `SQLite` maintains for `AUTOINCREMENT` tables,
+    /// as `name → seq` — `seq` being the highest rowid ever assigned to that table
+    /// (its monotonic INSERT high-water mark).
+    ///
+    /// `sqlite_sequence` exists **only** once at least one `AUTOINCREMENT` table
+    /// has been created; a database with none returns an **empty** map (never a
+    /// fabricated `seq = 0`), so a caller can distinguish "no high-water mark" from
+    /// "high-water mark of 0". Best-effort, bounded, panic-free: an unreadable
+    /// `sqlite_sequence` b-tree, or a malformed row, is omitted rather than
+    /// erroring. Note `sqlite_sequence` is a mutable user table — `seq` tracks the
+    /// INSERT high-water mark, not live rowid assignment — so this is a forensic
+    /// HINT input, not proof of any row's provenance.
+    #[must_use]
+    pub fn sqlite_sequence(&self) -> std::collections::BTreeMap<String, i64> {
+        let mut map = std::collections::BTreeMap::new();
+        let Ok(schema) = self.read_table(1, 5) else {
+            return map; // cov:unreachable: a validly-opened DB has a readable page-1 schema
+        };
+        // Locate the sqlite_sequence table's rootpage from the schema.
+        let mut rootpage: Option<u32> = None;
+        for row in &schema {
+            let is_table = matches!(row.values.first(), Some(Value::Text(t)) if t == "table");
+            if !is_table {
+                continue;
+            }
+            if !matches!(row.values.get(1), Some(Value::Text(n)) if n == "sqlite_sequence") {
+                continue;
+            }
+            if let Some(Value::Integer(root)) = row.values.get(3) {
+                rootpage = u32::try_from(*root).ok();
+            }
+            break;
+        }
+        let Some(root) = rootpage else {
+            return map; // no AUTOINCREMENT table ⟹ no sqlite_sequence ⟹ empty
+        };
+        let Ok(rows) = self.read_table(root, 2) else {
+            return map; // cov:unreachable: a present sqlite_sequence has a readable b-tree
+        };
+        for row in rows {
+            // sqlite_sequence row: (name TEXT, seq INTEGER). A malformed row (wrong
+            // types) is skipped — never a fabricated entry.
+            let (Some(Value::Text(name)), Some(Value::Integer(seq))) =
+                (row.values.first(), row.values.get(1))
+            else {
+                continue;
+            };
+            map.insert(name.clone(), *seq);
         }
         map
     }
@@ -2294,9 +2347,12 @@ pub struct SnapshotTable {
 /// case-insensitively and tolerant of internal whitespace, while ignoring any
 /// occurrence inside a quoted identifier/string so a column literally named
 /// "without rowid" is not a false positive.
-fn without_rowid_sql(create_sql: &str) -> bool {
-    // Strip quoted spans ('...', "...", `...`, [...]) so the clause search sees
-    // only unquoted SQL text, then normalize whitespace and look for the clause.
+/// A `CREATE TABLE` statement with quoted spans removed and whitespace collapsed,
+/// uppercased — so a clause search sees only unquoted SQL tokens. Strips
+/// `'...'` / `"..."` / `` `...` `` / `[...]` spans (the four `SQLite` identifier /
+/// string quotings) exactly as the clause detectors require, so the keyword
+/// appearing inside a quoted identifier or string literal can never false-match.
+fn normalized_unquoted_sql(create_sql: &str) -> String {
     let bytes = create_sql.as_bytes();
     let mut unquoted = String::with_capacity(create_sql.len());
     let mut quote: Option<u8> = None;
@@ -2314,10 +2370,39 @@ fn without_rowid_sql(create_sql: &str) -> bool {
             },
         }
     }
-    // Collapse runs of ASCII whitespace to single spaces, uppercase, and look for
-    // the clause as a discrete token sequence near the end of the statement.
-    let normalized: String = unquoted.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalized.to_ascii_uppercase().contains("WITHOUT ROWID")
+    unquoted
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase()
+}
+
+fn without_rowid_sql(create_sql: &str) -> bool {
+    // Look for the clause as a discrete token sequence, ignoring quoted spans and
+    // case/whitespace (file-format §2.4).
+    normalized_unquoted_sql(create_sql).contains("WITHOUT ROWID")
+}
+
+/// Whether `create_sql` declares an ordinary rowid table with an
+/// `INTEGER PRIMARY KEY AUTOINCREMENT` column — the only form for which `SQLite`
+/// maintains a monotonic `sqlite_sequence` high-water mark.
+///
+/// Per the file format, `AUTOINCREMENT` is valid **only** immediately after
+/// `INTEGER PRIMARY KEY`, and **never** on a `WITHOUT ROWID` table (which has no
+/// rowid to auto-increment). So this is true iff the normalized, unquoted CREATE
+/// text contains the exact token run `INTEGER PRIMARY KEY AUTOINCREMENT` and does
+/// NOT carry the `WITHOUT ROWID` clause. Quoted identifiers / string literals /
+/// comments are stripped first (mirroring [`without_rowid_sql`]), so a column
+/// merely named `"autoincrement"`, or the keyword inside a string, never matches.
+///
+/// This is a HINT input only: a true result means the table has an AUTOINCREMENT
+/// high-water mark the forensic layer can reconcile against, not that any
+/// particular row predates the current instance.
+#[must_use]
+pub fn is_autoincrement(create_sql: &str) -> bool {
+    let normalized = normalized_unquoted_sql(create_sql);
+    normalized.contains("INTEGER PRIMARY KEY AUTOINCREMENT")
+        && !normalized.contains("WITHOUT ROWID")
 }
 
 impl CommitSnapshot {

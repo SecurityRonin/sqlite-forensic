@@ -97,11 +97,16 @@ All three recover the 5 surviving OLD residue rows (rowids 6..=10; the other 5 O
 rows lost their cells to same-rowid reuse by the NEW rows) and none re-surface a
 live NEW row, so the *content* false-positive count is 0 for all three on this
 replication. **Our nuance (the Type-\* caveat):** we attribute the OLD residue by
-page ownership to the recreated `recovered_students` table; we do not explicitly
-detect the drop-recreate. A reader of `recovered_students` could mistake an
-OLD-NAME residue row for a prior state of the *new* students table.
-`bring2lite`/SQL-DRP sidestep this by attributing nothing — they emit the residue
-as schema-less unallocated blobs. (See "Ideas to steal" → rowid→table inference.)
+page ownership to the recreated `recovered_students` table; we do not reroute or
+re-tier it. Where the recreated table is `AUTOINCREMENT`, we now ALSO surface a
+`table_instance_risk` provenance flag on each residue row whose `rowid` exceeds the
+table's `sqlite_sequence` high-water mark — a **hint**, not a predecessor proof
+(the same `rowid > seq` is reachable by an `UPDATE` of the rowid or a
+`sqlite_sequence` edit), carrying its evidence (the rowid, the seq) so the examiner
+can cross-check. For a plain `INTEGER PRIMARY KEY` recreate the flag stays silent —
+the survey's genuinely-undecidable case. `bring2lite`/SQL-DRP sidestep the
+attribution question entirely by emitting the residue as schema-less unallocated
+blobs.
 
 ### 10 — WAL + secure_delete=ON (deleted denom = 20; residue only in `-wal`)
 
@@ -231,12 +236,16 @@ positives** and **substrate coverage**, not raw speed.
 
 - **Throughput benchmark.** Add a large-DB (≈100 MB) timing harness so we can
   report execution time alongside the survey's tools on comparable input.
-- **rowid → table inference for drop-recreate (the 0B nuance).** When residue is
-  attributed to a recreated same-name table, distinguish *prior states of the
-  current table* from *a previous dropped table with the same schema* — e.g. by
-  reconciling recovered rowids against the live table's rowid range and the
-  freelist-trunk history, and labelling drop-recreate residue distinctly rather
-  than folding it into `recovered_<table>`.
+- **rowid → table inference for drop-recreate (the 0B nuance).** *Shipped (Detector
+  A):* residue attributed to an `AUTOINCREMENT` table carries a `table_instance_risk`
+  flag when its `rowid` exceeds the table's `sqlite_sequence` high-water mark —
+  surfaced as a non-overclaiming **hint** (consistent with prior-incarnation
+  residue, but also explainable by an `UPDATE`/`sqlite_sequence` edit/current-instance
+  deletion), AUTOINCREMENT-only, never a predecessor assertion, never a reroute or
+  tier change. The plain-`INTEGER PRIMARY KEY` case stays unflagged (genuinely
+  undecidable from a bare snapshot). *Backlog (Detector B):* a sidecar `-wal`/`-journal`
+  DDL-boundary signal (`sidecar_schema_changed_for_table`) reusing the prior-schema
+  machinery — a table-level boundary, still not row-level provenance.
 - **WAL-checkpoint acquisition warning.** A `-wal` that a checkpoint would have
   reclaimed is forensically load-bearing; surface a warning when an evidence WAL
   is uncheckpointed (residue present) so an examiner copies the `-wal` before any

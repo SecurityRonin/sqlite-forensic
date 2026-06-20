@@ -54,6 +54,7 @@ SQLite-C / Rust:
 | **WAL version history** (current / superseded / deleted, rowid-reuse) | `sqlite3` minted mutation sequence | the per-rowid history matches a known insert/update/delete/reinsert script | `row_history_oracle.rs` |
 | **Output XLSX** (combined temporal workbook, in-cell images) | `calamine` (independent XLSX reader) + `zip` (embedded media) | sheet structure, cell values, the flag columns, and embedded image media read back and verified | `cli/tests/cli_binary.rs` |
 | **No-false-positive** regression | DC3 `sqlite_dissect` corpus — **third-party input** | 0 false positives on no-deletion / dropped-table DBs | `oracle_differential.rs` |
+| **Drop-recreate `table_instance_risk` hint** (Detector A) | real `sqlite3`-minted fixtures + the `sqlite3` `sqlite_sequence` reading | the flag fires on AUTOINCREMENT residue whose `rowid` exceeds `sqlite_sequence` (`b_autoinc` 6..=10, `upd_autoinc` 1000 — the Codex BLOCKER-1 current-instance row), never on the plain-PK recreate (`b_plainpk`), and on **zero** ordinary Nemetz deleted rows (0C-01, 0D-01) — proving no spurious firing | `drop_recreate_risk.rs` |
 | **WAL frame integrity** | SQLite WAL §4.2 cumulative checksum | valid commits vs post-reset residue distinguished | known-vector unit test + `wal_snapshot_oracle.rs` |
 
 ### Input provenance (what is committed vs minted)

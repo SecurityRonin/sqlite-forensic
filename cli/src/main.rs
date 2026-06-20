@@ -485,7 +485,10 @@ fn run_audit(args: &AuditArgs) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{open_db, recover_journal, resolve_journal_path, CarveArgs, Cli, Commands};
+    use super::{
+        audit_journal_for, open_db, recover_journal, resolve_journal_path, AuditArgs, CarveArgs,
+        Cli, Commands,
+    };
     use clap::Parser;
     use std::path::{Path, PathBuf};
 
@@ -493,6 +496,13 @@ mod tests {
         match Cli::try_parse_from(argv).expect("argv must parse").command {
             Commands::Carve(a) => a,
             Commands::Audit(_) => panic!("expected a carve command"),
+        }
+    }
+
+    fn audit_args(argv: &[&str]) -> AuditArgs {
+        match Cli::try_parse_from(argv).expect("argv must parse").command {
+            Commands::Audit(a) => a,
+            Commands::Carve(_) => panic!("expected an audit command"),
         }
     }
 
@@ -713,5 +723,75 @@ mod tests {
                 "--db must conflict with {argv:?}"
             );
         }
+    }
+
+    /// `audit --no-journal` parses and sets the opt-out flag, mirroring carve.
+    #[test]
+    fn audit_no_journal_flag_parses() {
+        let args = audit_args(&["sqlite4n6", "audit", "db.sqlite", "--no-journal"]);
+        assert!(args.no_journal, "audit --no-journal sets the opt-out");
+    }
+
+    /// `audit` over the committed SFT-03 PERSIST pair folds the rollback-journal
+    /// §6 observations in: the PERSIST journal is recoverable and journaled page 1
+    /// (a schema change), so both codes surface.
+    #[test]
+    fn audit_surfaces_journal_anomaly_codes() {
+        let s = JournalScratch::new("audit_jrnl", &[]);
+        let db_path = copy_sft03(&s.0);
+        let db = open_db(&db_path).expect("open SFT-03");
+        let args = audit_args(&["sqlite4n6", "audit", db_path.to_str().unwrap()]);
+
+        let anomalies = audit_journal_for(&args, &db).expect("journal read succeeds");
+        let codes: Vec<&str> = anomalies.iter().map(|a| a.code).collect();
+        assert!(
+            codes.contains(&"SQLITE-JOURNAL-RECOVERABLE"),
+            "audit folds in the recoverable journal observation; got {codes:?}"
+        );
+        assert!(
+            codes.contains(&"SQLITE-JOURNAL-SCHEMA-CHANGE"),
+            "audit folds in the journaled-page-1 observation; got {codes:?}"
+        );
+    }
+
+    /// `audit --no-journal` suppresses the journal observations (no journal read).
+    #[test]
+    fn audit_no_journal_suppresses_journal_anomalies() {
+        let s = JournalScratch::new("audit_nojrnl", &[]);
+        let db_path = copy_sft03(&s.0);
+        let db = open_db(&db_path).expect("open SFT-03");
+        let args = audit_args(&[
+            "sqlite4n6",
+            "audit",
+            db_path.to_str().unwrap(),
+            "--no-journal",
+        ]);
+
+        let anomalies = audit_journal_for(&args, &db).expect("opt-out is not an error");
+        assert!(
+            anomalies.is_empty(),
+            "--no-journal yields no journal observations; got {anomalies:?}"
+        );
+    }
+
+    /// An audit `<db>-journal` that exists but cannot be read fails loud rather
+    /// than silently dropping the journal observations.
+    #[test]
+    fn audit_unreadable_journal_errors_loudly() {
+        let s = JournalScratch::new("audit_badjrnl", &[]);
+        let db_path = copy_sft03(&s.0);
+        let mut jname = db_path.as_os_str().to_owned();
+        jname.push("-journal");
+        let jpath = PathBuf::from(jname);
+        std::fs::remove_file(&jpath).unwrap();
+        std::fs::create_dir(&jpath).unwrap();
+        let db = open_db(&db_path).expect("open the real db");
+        let args = audit_args(&["sqlite4n6", "audit", db_path.to_str().unwrap()]);
+
+        let err = audit_journal_for(&args, &db).expect_err("unreadable journal must error");
+        assert!(
+            err.contains("cannot read journal"),
+            "the error names the journal-read failure: {err}"
+        );
     }
 }

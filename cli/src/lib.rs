@@ -1211,6 +1211,65 @@ fn align_cells(values: &[Value], width: usize) -> Vec<Value> {
         .collect()
 }
 
+/// The result of routing carved records to their destination: a bucket of
+/// [`RecoveredRow`]s per live table (keyed by table name) plus the indices of the
+/// records that could not be folded into any live sheet (Tier-3, or an inferred
+/// guess whose table has no live sheet) — those go to `recovered_unattributed`.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RoutedRecovered {
+    /// Recovered rows per live table, in record order within each table.
+    pub by_table: std::collections::HashMap<String, Vec<RecoveredRow>>,
+    /// Indices into `records` of rows routed to `recovered_unattributed`.
+    pub unattributed: Vec<usize>,
+}
+
+/// Route every carved record to a live-table bucket or to the unattributed set,
+/// from its parallel [`Attribution`]. Pure (no DB access): the caller supplies
+/// the live-table names so the routing of an inferred guess to a non-existent
+/// sheet is decided here.
+///
+/// - **Tier-1 `Known(T)`** → `T`'s bucket, `is_guessed=false`.
+/// - **Tier-2 `Inferred{guess:T, ambiguous}`** → `T`'s bucket with
+///   `is_guessed=true` **iff** `T` is a live table; otherwise the record is
+///   unattributed (the guessed sheet does not exist).
+/// - **Tier-3 `Unattributed`** → unattributed.
+///
+/// A record's [`RecoveredRow::rowid`] is `Some(rowid)` for a recovered rowid and
+/// `None` when destroyed (`0`), so the merge step sinks it to the sheet bottom.
+#[must_use]
+pub fn route_recovered(
+    live_table_names: &[String],
+    records: &[CarvedRecord],
+    attributions: &[Attribution],
+) -> RoutedRecovered {
+    let is_live = |name: &str| live_table_names.iter().any(|n| n == name);
+    let mut routed = RoutedRecovered::default();
+    for (i, (rec, attr)) in records.iter().zip(attributions).enumerate() {
+        let (table, is_guessed, ambiguous) = match attr {
+            Attribution::Known(name) if is_live(name) => (name.clone(), false, false),
+            Attribution::Inferred { guess, ambiguous } if is_live(guess) => {
+                (guess.clone(), true, *ambiguous)
+            }
+            // Tier-3, or a guess/known with no matching live sheet → unattributed.
+            _ => {
+                routed.unattributed.push(i);
+                continue;
+            }
+        };
+        routed
+            .by_table
+            .entry(table)
+            .or_default()
+            .push(RecoveredRow {
+                rowid: (rec.rowid != 0).then_some(rec.rowid),
+                cells: rec.values.clone(),
+                is_guessed,
+                ambiguous,
+            });
+    }
+    routed
+}
+
 // ---- XLSX export: blob classification + human size ------------------------
 
 /// How a recovered BLOB should be presented in the XLSX export.
@@ -1403,6 +1462,61 @@ pub fn recovered_tables_xlsx_bytes(
 ) -> Result<Vec<u8>, String> {
     build_recovered_tables_xlsx(tables)
         .map_err(|e| format!("cannot build recovered xlsx {}: {e}", path.display()))
+}
+
+/// The pale-red fill marking a recovered (deleted) row across the combined
+/// workbook — a live row is left unfilled so deleted rows read at a glance.
+const RECOVERED_FILL: u32 = 0x00FF_E0E0;
+
+/// Render the **combined** live + recovered workbook to in-memory bytes.
+///
+/// One sheet per [`MergedSheet`] (a live table with its recovered rows folded in
+/// by rowid), followed by the `extra` tables (`recovered_unattributed`,
+/// `recovered_fragments`) as separate sheets. Sheet names are sanitized and
+/// de-duplicated via [`sanitize_sheet_name`]. The header row is bold; a recovered
+/// row (`MergedRow::is_deleted`) carries the pale-red fill while a live row is
+/// unfilled. Every cell follows its storage class — a `Blob` image (live OR
+/// recovered) is thumbnailed and embedded in-cell exactly as the recovered-only
+/// export does.
+pub fn render_combined_xlsx(
+    sheets: &[MergedSheet],
+    extra: &[RecoveredTable],
+) -> Result<Vec<u8>, XlsxError> {
+    let header_fmt = Format::new().set_bold();
+    let recovered_fmt = Format::new().set_background_color(RECOVERED_FILL);
+    let plain_fmt = Format::new();
+    let mut workbook = Workbook::new();
+    let mut taken: Vec<String> = Vec::new();
+
+    for sheet in sheets {
+        let sheet_name = sanitize_sheet_name(&sheet.name, &taken);
+        taken.push(sheet_name.clone());
+        let ws = workbook.add_worksheet().set_name(&sheet_name)?;
+        write_header(ws, &sheet.columns, &header_fmt)?;
+        for (r, mrow) in sheet.rows.iter().enumerate() {
+            let row = r as u32 + 1;
+            // A recovered row is tinted; a live row is left unfilled.
+            let fmt = if mrow.is_deleted {
+                &recovered_fmt
+            } else {
+                &plain_fmt
+            };
+            for (c, value) in mrow.cells.iter().enumerate() {
+                write_value_cell(ws, row, c as u16, value, fmt)?;
+            }
+        }
+    }
+
+    // The separate Tier-3 / fragment tables: every data row is recovered, so the
+    // existing all-rows-tinted rendering applies.
+    for table in extra {
+        let sheet_name = sanitize_sheet_name(&table.name, &taken);
+        taken.push(sheet_name.clone());
+        let ws = workbook.add_worksheet().set_name(&sheet_name)?;
+        write_table_sheet(ws, table, &header_fmt, &recovered_fmt)?;
+    }
+
+    workbook.save_to_buffer()
 }
 
 /// Write one [`RecoveredTable`] to a worksheet: bold header from `columns`, then
@@ -3204,10 +3318,10 @@ mod tests {
 
     // ---- routing recovered records into live-table buckets -----------------
 
-    /// Tier-1 Known routes to its table (certain: is_guessed=0); Tier-2 Inferred
-    /// routes to the guessed table (is_guessed=1, carrying ambiguity); Tier-3
-    /// Unattributed and an inferred guess with no live sheet both land in the
-    /// unattributed bucket. A destroyed rowid (0) becomes `None`.
+    /// Tier-1 Known routes to its table (certain: `is_guessed=0`); Tier-2
+    /// Inferred routes to the guessed table (`is_guessed=1`, carrying ambiguity);
+    /// Tier-3 Unattributed and an inferred guess with no live sheet both land in
+    /// the unattributed bucket. A destroyed rowid (0) becomes `None`.
     #[test]
     fn route_recovered_buckets_by_attribution_tier() {
         let live_names = vec!["people".to_string(), "notes".to_string()];

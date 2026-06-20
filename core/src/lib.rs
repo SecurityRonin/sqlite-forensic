@@ -6143,4 +6143,59 @@ mod tests {
         .expect("open upd_autoinc.db");
         assert_eq!(upd.sqlite_sequence().get("t"), Some(&5), "t high-water = 5");
     }
+
+    #[test]
+    fn schema_sql_reads_current_name_to_create_sql() {
+        // The live `name -> CREATE SQL` map mirrors live_tables, keyed by name.
+        let auto =
+            Database::open(include_bytes!("../../tests/data/drop_recreate/b_autoinc.db").to_vec())
+                .expect("open b_autoinc.db");
+        let schema = auto.schema_sql();
+        let sql = schema.get("students").expect("students present");
+        assert!(
+            sql.contains("AUTOINCREMENT"),
+            "current CREATE SQL carried verbatim: {sql}"
+        );
+    }
+
+    #[test]
+    fn prior_snapshot_schema_sql_reads_prior_create_sql() {
+        // b_journal_altered: the prior (-journal) schema for `students` has NO
+        // `extra` column, the current schema does → the CREATE SQL texts differ.
+        let main = include_bytes!("../../tests/data/drop_recreate/b_journal_altered.db").to_vec();
+        let journal = include_bytes!("../../tests/data/drop_recreate/b_journal_altered.db-journal");
+        let db = Database::open(main).expect("open b_journal_altered.db");
+        let prior = db
+            .rollback_prior(journal)
+            .expect("rollback_prior parses the PERSIST journal");
+        let prior_sql = prior.schema_sql();
+        let prior_students = prior_sql.get("students").expect("prior students present");
+        assert!(
+            !prior_students.contains("extra"),
+            "prior CREATE SQL lacks the ALTER-added column: {prior_students}"
+        );
+        let current = db.schema_sql();
+        assert_ne!(
+            current.get("students"),
+            prior_sql.get("students"),
+            "prior vs current CREATE SQL differ (the ALTER)"
+        );
+    }
+
+    #[test]
+    fn prior_snapshot_schema_sql_dml_only_matches_current() {
+        // b_journal_dml: the last transaction is DML only, so the prior (-journal)
+        // CREATE SQL for `students` EQUALS the current schema (anti-FP ground truth).
+        let main = include_bytes!("../../tests/data/drop_recreate/b_journal_dml.db").to_vec();
+        let journal = include_bytes!("../../tests/data/drop_recreate/b_journal_dml.db-journal");
+        let db = Database::open(main).expect("open b_journal_dml.db");
+        let prior = db
+            .rollback_prior(journal)
+            .expect("rollback_prior parses the PERSIST journal");
+        assert_eq!(
+            db.schema_sql().get("students"),
+            prior.schema_sql().get("students"),
+            "DML-only ⟹ prior and current CREATE SQL are identical"
+        );
+    }
 }

@@ -821,7 +821,7 @@ fn default_carve_writes_attributed_table_and_fragments() {
     );
 }
 
-/// Default `carve` on the NIST CFReDS SFT-03 PERSIST database (with its
+/// Default `carve` on the NIST `CFReDS` `SFT-03` PERSIST database (with its
 /// `-journal` sidecar present) must REPORT the rollback-journal recovery in the
 /// summary — not silently fold 200 prior rows into the workbook while the stdout
 /// summary counts only the free-space carve ("1 record(s)"). NIST ground truth:

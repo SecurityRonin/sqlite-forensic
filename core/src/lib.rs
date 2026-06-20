@@ -2392,7 +2392,7 @@ fn without_rowid_sql(create_sql: &str) -> bool {
 /// rowid to auto-increment). So this is true iff the normalized, unquoted CREATE
 /// text contains the exact token run `INTEGER PRIMARY KEY AUTOINCREMENT` and does
 /// NOT carry the `WITHOUT ROWID` clause. Quoted identifiers / string literals /
-/// comments are stripped first (mirroring [`without_rowid_sql`]), so a column
+/// comments are stripped first (mirroring `without_rowid_sql`), so a column
 /// merely named `"autoincrement"`, or the keyword inside a string, never matches.
 ///
 /// This is a HINT input only: a true result means the table has an AUTOINCREMENT
@@ -4391,7 +4391,7 @@ impl RollbackJournal {
 /// Returned by [`Database::rollback_prior`] as a DISTINCT type, never a
 /// [`Database`], so prior/deleted rows can never be read as "live"
 /// (secure-by-design). Shares ONE b-tree/overflow walk with the live and
-/// commit-snapshot reads via the internal [`PageSource`] seam.
+/// commit-snapshot reads via the internal `PageSource` seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriorSnapshot {
     /// The pre-transaction page images: journal-where-present overlaid on the main
@@ -4501,7 +4501,7 @@ impl PriorSnapshot {
     /// Read the table rooted at `rootpage` AS OF the prior state, returning each
     /// row's rowid, values, AND the 1-based LEAF page it was decoded from — the
     /// per-row page provenance the forensic diff attaches to a recovered prior
-    /// row. Shares [`decode_leaf_cell`] with the standard read; a typed [`Error`]
+    /// row. Shares `decode_leaf_cell` with the standard read; a typed [`Error`]
     /// (never a panic) on a cyclic/over-deep b-tree.
     pub fn read_table_with_pages(
         &self,

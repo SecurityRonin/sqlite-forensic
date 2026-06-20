@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use sqlite4n6::{
     carve_wal_snapshots, combined_xlsx_bytes, filter_by_confidence, group_attributed_tables,
     recovered_output_path, recovered_xlsx_path, render_audit, render_carve, render_carve_tiered,
-    render_carve_with_snapshot, render_fragments, MinConfidence, OutputFormat,
+    render_carve_with_snapshot, render_fragments, MinConfidence, OutputFormat, EXCEL_MAX_ROWS,
 };
 use sqlite_core::rebuild::build_recovered_db_tables;
 use sqlite_core::Database;
@@ -256,7 +256,8 @@ fn run_carve_rebuild(args: &CarveArgs) -> Result<(), String> {
     // bytes (and the library warns on stderr for any >1M-row sheet truncation).
     let xlsx_path = if args.xlsx {
         let path = recovered_xlsx_path(&out_path);
-        let xlsx_bytes = combined_xlsx_bytes(&db, &records, fragments.as_deref(), &path)?;
+        let xlsx_bytes =
+            combined_xlsx_bytes(&db, &records, fragments.as_deref(), &path, EXCEL_MAX_ROWS)?;
         std::fs::write(&path, &xlsx_bytes)
             .map_err(|e| format!("cannot write recovered xlsx {}: {e}", path.display()))?;
         Some(path)

@@ -1,10 +1,78 @@
-# Differential Validation — Deleted-Record Carving
+# Tool Validation — `sqlite-forensic`
 
-This document is the Doer-Checker evidence for `sqlite_forensic`'s deleted-record
-carving. It records how our carver's output was reconciled against an **independent
-reference tool** so that correctness is not asserted only by tests we wrote against a
-fixture we generated. The machine-checkable form of this evidence is
-`forensic/tests/oracle_differential.rs`.
+Validation, and a documented validation record, are a baseline requirement for a
+forensic tool: results have to be defensible, which means every capability is checked
+against a reference the authors did not write, and the regime is written down. This
+document is that record. It opens with the **whole-tool validation regime** (the
+coverage backstop and the independent-oracle suite across every capability), then gives
+the detailed **deleted-record carving differential** — the Doer-Checker evidence for how
+the carver's output was reconciled against independent reference tools so that
+correctness is not asserted only by tests we wrote against a fixture we generated. The
+machine-checkable form of the differential is `forensic/tests/oracle_differential.rs`.
+
+## Validation regime (whole-tool)
+
+Validation here has **two layers**: a regression backstop (test coverage) and the
+substantive validation (independent oracles + third-party ground truth). The first
+proves the code is *exercised*; the second is what establishes the results are *right*.
+
+### Layer 1 — coverage backstop (every function exercised)
+
+CI enforces **100% function coverage** of the workspace
+(`cargo llvm-cov --all-features --fail-under-functions 100`): every function in
+`sqlite-core`, `sqlite-forensic`, and the `sqlite4n6` CLI is executed by the test suite
+on every push, on **Linux, macOS, and Windows**. Per our coverage discipline this is a
+**regression backstop that proves real behaviour is exercised — not, by itself, proof of
+correctness** (line coverage runs lower where reader-generic code monomorphizes; the
+function gate is the meaningful invariant). The substantive validation is Layer 2. The
+full Paranoid-Gatekeeper gate runs alongside on every push: `rustfmt`, Clippy
+(`-D warnings`), the 3-OS test suite, `cargo-deny` (licenses/advisories/sources), an MSRV
+build (1.96), a `gitleaks` secret scan, docs-as-error, and libFuzzer harnesses over
+`Database::open`, the carver, and the auditor. The whole workspace is `forbid(unsafe)`.
+
+### Layer 2 — independent oracles (the substantive validation)
+
+No test we authored is independent of our own assumptions, so each capability is checked
+against a reference we did not write. Five distinct authors/engines (the SQLite team,
+undark's author, fqlite's author, the Nemetz team, the DC3 team) plus the `calamine`
+reader, across C / Java / SQLite-C / Rust:
+
+| Capability | Independent reference | What it establishes | Machine-checked in |
+|---|---|---|---|
+| Deleted-record **recall & precision** | **Nemetz SQLite Forensic Corpus** (DFRWS-EU 2018, CC0) — 32 DBs whose authors shipped a per-row deleted **answer key** | recall + precision as a reproducible per-DB confusion matrix against **third-party ground truth** (the authors wrote both the deletions *and* the key) | `nemetz_metrics.rs` · [`recovery-comparison.md`](recovery-comparison.md) |
+| Deleted-record **carving** | `undark` (C), `fqlite` (Java) — independent carvers | inter-tool **concordance** (agreement, page-level-diagnosed — *not* correctness) | `oracle_differential.rs` (below) |
+| **Live b-tree read** | `sqlite3 SELECT` — the engine that wrote the file | live rows read **byte-identical** to the canonical engine | `live_read_matches_sqlite3` |
+| **`.recover` differential** | `sqlite3 .recover` | ours ⊇ `.recover`, 100% content agreement on the overlap | `our_fixture_agrees_with_sqlite3_recover` |
+| **Rebuilt `.carved.db`** | `sqlite3` (`PRAGMA integrity_check`, `SELECT`) | the pure-Rust writer emits a valid DB an external engine reads identically | `rebuild_sqlite3_oracle.rs`, `rebuild_tables_oracle.rs` |
+| **Snapshot-aware reads** (WAL per-commit, overflow-correct) | `sqlite3` on per-commit file snapshots | each commit's table state read byte-for-byte, incl. a 12 KB overflow blob | `wal_snapshot_oracle.rs` |
+| **WAL version history** (current / superseded / deleted, rowid-reuse) | `sqlite3` minted mutation sequence | the per-rowid history matches a known insert/update/delete/reinsert script | `row_history_oracle.rs` |
+| **Output XLSX** (combined temporal workbook, in-cell images) | `calamine` (independent XLSX reader) + `zip` (embedded media) | sheet structure, cell values, the flag columns, and embedded image media read back and verified | `cli/tests/cli_binary.rs` |
+| **No-false-positive** regression | DC3 `sqlite_dissect` corpus — **third-party input** | 0 false positives on no-deletion / dropped-table DBs | `oracle_differential.rs` |
+| **WAL frame integrity** | SQLite WAL §4.2 cumulative checksum | valid commits vs post-reset residue distinguished | known-vector unit test + `wal_snapshot_oracle.rs` |
+
+### Input provenance (what is committed vs minted)
+
+The **carving core** is validated against committed inputs: the independently-authored
+**Nemetz corpus** (the gold standard — committed, CC0) and the committed synthetic
+fixtures in [`corpus-catalog.md`](corpus-catalog.md). Several newer capabilities (the WAL
+**version history / rowid-reuse**, **snapshot-aware reads**, **in-cell image blobs**,
+**WITHOUT ROWID** handling) are validated by fixtures **minted at test time** (a
+held-reader WAL retained per-commit, a generated image blob) checked against the
+independent reference engine (`sqlite3` / `calamine`) rather than a committed corpus
+file. The validation is real (the reference engine reads back what we produce); the input
+is generated rather than archived. Where a capability is proven only by a synthetic
+fixture with **no corpus instance** (e.g. the freeblock-clobbered *spilled* cell), it is
+marked **unproven-by-corpus** here and in code.
+
+### Epistemic stance
+
+Precision is **confirmed against independent ground truth** (0 live-row re-reads; the
+highest precision in the comparison); recall is **measured**, with a documented in-page
+gap. Differentials are **concordance**, not correctness. There are **no wall-clock
+timestamps** in the SQLite WAL — the temporal columns surface *logical* commit order
+(`commit_seq`), never time. Carved records remain **confidence-graded observations**
+("consistent with a deleted row"), never a verdict: the tool is validated as *consistent
+with* independent references, **not proven correct**.
 
 > **This document is the historical *differential* record; the current capability
 > matrix lives in [`recovery-comparison.md`](recovery-comparison.md).** The page-level

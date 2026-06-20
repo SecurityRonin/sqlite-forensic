@@ -3576,13 +3576,100 @@ mod tests {
 
     // ---- combined workbook renderer (tint + flags + image embed) -----------
 
+    fn sample_commit_id() -> sqlite_core::CommitId {
+        sqlite_core::CommitId {
+            segment: sqlite_core::WalSegmentId(0),
+            commit_frame_index: 2,
+            db_size_after_commit: 4,
+        }
+    }
+
     #[test]
     fn combined_fill_marks_guessed_yellow_and_certain_red() {
         // A guessed (Tier-2 inferred) row tints pale yellow; a certain recovered
-        // row pale red; a live row is left unfilled.
-        assert_eq!(fill_for(false, false), None);
-        assert_eq!(fill_for(true, false), Some(RECOVERED_FILL));
-        assert_eq!(fill_for(true, true), Some(GUESSED_FILL));
+        // row pale red; a live row is left unfilled. (5-arg precedence form: no
+        // reuse, no superseding.)
+        assert_eq!(fill_for(false, false, false, false), None);
+        assert_eq!(fill_for(false, false, true, false), Some(RECOVERED_FILL));
+        assert_eq!(fill_for(false, true, true, false), Some(GUESSED_FILL));
+    }
+
+    #[test]
+    fn fill_for_five_level_precedence() {
+        // Precedence (highest first):
+        //   1 rowid_reused → purple (overrides everything: rowid may span entities)
+        //   2 is_guessed   → yellow
+        //   3 is_deleted   → red
+        //   4 superseded   → blue
+        //   5 otherwise    → none
+        // (1) reused wins over guessed/deleted/superseded all set.
+        assert_eq!(
+            fill_for(true, true, true, true),
+            Some(REUSED_FILL),
+            "rowid_reused has highest precedence"
+        );
+        // (2) guessed wins over deleted + superseded.
+        assert_eq!(
+            fill_for(false, true, true, true),
+            Some(GUESSED_FILL),
+            "is_guessed beats deleted/superseded"
+        );
+        // (3) deleted wins over superseded.
+        assert_eq!(
+            fill_for(false, false, true, true),
+            Some(RECOVERED_FILL),
+            "is_deleted beats superseded"
+        );
+        // (4) superseded alone → blue.
+        assert_eq!(
+            fill_for(false, false, false, true),
+            Some(SUPERSEDED_FILL),
+            "superseded historical → blue"
+        );
+        // (5) nothing set → no fill (live current / present).
+        assert_eq!(fill_for(false, false, false, false), None);
+    }
+
+    #[test]
+    fn view_state_tokens_are_stable() {
+        use sqlite_core::row_history::ViewState;
+        assert_eq!(view_state_token(ViewState::PresentInFinalView), "present");
+        assert_eq!(
+            view_state_token(ViewState::ValueChangedLater),
+            "changed_later"
+        );
+        assert_eq!(
+            view_state_token(ViewState::AbsentInFinalView),
+            "absent_final"
+        );
+        assert_eq!(view_state_token(ViewState::CarvedResidue), "carved_residue");
+    }
+
+    #[test]
+    fn wal_commit_token_renders_origin() {
+        use sqlite_core::row_history::VersionOrigin;
+        use sqlite_core::WalLsn;
+        // Live → "live".
+        assert_eq!(wal_commit_token(&VersionOrigin::Live, None), "live");
+        // CarvedResidue → "residue".
+        assert_eq!(
+            wal_commit_token(&VersionOrigin::CarvedResidue, None),
+            "residue"
+        );
+        // A Commit resolves to commit:(salt1,salt2,frame_index) from its LSN.
+        let lsn = WalLsn {
+            salt1: 3_131_615_003,
+            salt2: 3_836_839_008,
+            frame_index: 2,
+        };
+        let origin = VersionOrigin::Commit(sample_commit_id());
+        assert_eq!(
+            wal_commit_token(&origin, Some(lsn)),
+            "commit:(3131615003,3836839008,2)"
+        );
+        // A Commit whose LSN could not be resolved degrades to a stable label,
+        // never a panic.
+        assert_eq!(wal_commit_token(&origin, None), "commit:?");
     }
 
     fn merged_row(cells: Vec<Value>, is_deleted: bool) -> MergedRow {

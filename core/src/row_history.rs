@@ -303,6 +303,14 @@ pub fn table_history(
     }
 }
 
+/// Re-sort a table's versions into the canonical order after a caller has
+/// appended more (e.g. the forensic layer merging carved residue): by `rowid`
+/// (`None` last), then `commit_seq` ascending with `None` (live / order-unknown
+/// residue) grouped LAST within the rowid. Stable.
+pub fn sort_table_versions(versions: &mut [RowVersion]) {
+    sort_versions(versions);
+}
+
 /// Sort versions by `rowid` (`None` last), then `commit_seq` ascending with a
 /// `None` `commit_seq` (live / order-unknown carved residue) grouped LAST within
 /// the rowid. Stable, so equal keys keep chronological insertion order.

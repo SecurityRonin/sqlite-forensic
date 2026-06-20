@@ -1157,7 +1157,113 @@ pub fn attribute_records(db: &Database, records: &[CarvedRecord]) -> Vec<Attribu
 /// higher fidelity), so a row is never double-listed.
 #[must_use]
 pub fn row_histories_with_residue(db: &Database) -> Vec<sqlite_core::row_history::TableHistory> {
-    db.row_histories()
+    use sqlite_core::row_history::{RowVersion, VersionOrigin, ViewState};
+
+    let mut histories = db.row_histories();
+
+    // Gather every carved residue record: the on-disk free space (Tier-1 full
+    // rows) plus each materialized commit snapshot of the WAL. carve_at_commit /
+    // carve_with_fragments already de-duplicate within their own pass; we collect
+    // across passes and de-duplicate by content identity below.
+    let mut records: Vec<CarvedRecord> = carve_with_fragments(db).full;
+    if let Some(timeline) = db.wal_timeline() {
+        for snapshot in timeline.commit_snapshots() {
+            records.extend(carve_at_commit(db, &timeline, snapshot.id()));
+        }
+    }
+    // Collapse byte-identical carves (a row can recur across commits / regions).
+    let records = dedup_keep_best(records);
+
+    // Attribute each carved record to a table. The strongest signal is page
+    // linkage: a record carved from a page still owned by a live table's b-tree
+    // (e.g. a PRIOR-version remnant in that table's slack) belongs to THAT table
+    // for certain — stronger than, and independent of, the source-class tiering in
+    // `attribute_record`. We consult the page→table map first, then fall back to
+    // the shape-based `attribute_records` for off-table (freelist-page) residue.
+    let page_table_map = db.page_to_table_map();
+    let attributions = attribute_records(db, &records);
+
+    // A residue carve is deduped against a WAL `AbsentInFinalView` version of the
+    // SAME rowid + values already in that table's history (the WAL holds it at
+    // higher fidelity). Build the set of those (table, rowid, values) keys.
+    let absent_keys: std::collections::HashSet<String> = histories
+        .iter()
+        .flat_map(|h| {
+            h.versions
+                .iter()
+                .filter(|v| v.view_state == ViewState::AbsentInFinalView)
+                .map(move |v| residue_key(&h.table, v.rowid, &v.values))
+        })
+        .collect();
+
+    // Group new residue versions by target table name.
+    let mut to_add: std::collections::BTreeMap<String, Vec<RowVersion>> =
+        std::collections::BTreeMap::new();
+    for (rec, attr) in records.iter().zip(attributions.iter()) {
+        // Page linkage (CERTAIN) wins; else the shape-based tier.
+        let (table, is_guessed) = if let Some(name) = page_table_map.get(&rec.page) {
+            (name.clone(), false)
+        } else {
+            match attr {
+                Attribution::Known(name) => (name.clone(), false),
+                Attribution::Inferred { guess, .. } => (guess.clone(), true),
+                // No surviving table to attach the residue to — skip rather than
+                // invent a home for it (no fabricated attribution).
+                Attribution::Unattributed => continue,
+            }
+        };
+        // A clobbered rowid (carving surfaces it as 0) is genuinely unknown.
+        let rowid = if rec.rowid == 0 {
+            None
+        } else {
+            Some(rec.rowid)
+        };
+        let key = residue_key(&table, rowid, &rec.values);
+        if absent_keys.contains(&key) {
+            continue; // already listed as a higher-fidelity WAL AbsentInFinalView
+        }
+        to_add.entry(table).or_default().push(RowVersion {
+            rowid,
+            values: rec.values.clone(),
+            origin: VersionOrigin::CarvedResidue,
+            // Order-unknown: a freeblock persists across commits, so a carve has
+            // no trustworthy commit position. NEVER fabricate one.
+            commit_seq: None,
+            view_state: ViewState::CarvedResidue,
+            is_deleted: true,
+            is_guessed,
+            rowid_reused: false,
+            // An inferred (shape-matched) attribution is uncertain by nature.
+            attribution_uncertain: is_guessed,
+        });
+    }
+
+    // Merge the residue versions into their tables, de-duplicating residue that is
+    // byte-identical to a version already present, then re-sort.
+    for h in &mut histories {
+        if let Some(extra) = to_add.remove(&h.table) {
+            let existing: std::collections::HashSet<String> = h
+                .versions
+                .iter()
+                .map(|v| residue_key(&h.table, v.rowid, &v.values))
+                .collect();
+            for v in extra {
+                if existing.contains(&residue_key(&h.table, v.rowid, &v.values)) {
+                    continue;
+                }
+                h.versions.push(v);
+            }
+            sqlite_core::row_history::sort_table_versions(&mut h.versions);
+        }
+    }
+    histories
+}
+
+/// A content-identity key for residue de-duplication: table + rowid + a stable
+/// `Debug` rendering of the values (`Value` carries an `f64`, so it is not
+/// `Hash`/`Eq` directly).
+fn residue_key(table: &str, rowid: Option<i64>, values: &[Value]) -> String {
+    format!("{table}:{rowid:?}:{values:?}")
 }
 
 #[cfg(test)]

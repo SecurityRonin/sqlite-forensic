@@ -1,11 +1,18 @@
 //! Rollback-journal anomaly detection (design §6) over [`audit_journal`].
 //!
+//! The anomaly arms validated against real sqlite3-engine artifacts (HOT,
+//! CHECKSUM-MISMATCH, DUPLICATE-PAGE, DBSIZE-DELTA, and the cookie-based
+//! SCHEMA-CHANGE) live in `hot_journal_anomaly.rs`. This file retains the
+//! hand-built **Tier-A** parser edge cases — `mx_page`-sentinel / growth /
+//! shrink direction and the no-fire boundary — and the real NIST PERSIST oracle
+//! for RECOVERABLE.
+//!
 //! Two oracles:
 //!   1. The real NIST CFReDS SFT-03 PERSIST artifact + its `-journal` (Tier B,
 //!      header zeroed on commit). Verified empirically: 14 page images, page 1
 //!      journaled, no checksum verification (nonce gone), no duplicate pgno. So
-//!      it triggers RECOVERABLE (>=1 image) and SCHEMA-CHANGE (page 1 present),
-//!      and nothing else.
+//!      it triggers RECOVERABLE (>=1 image), and — because the schema cookie did
+//!      not advance (DML only) — NOT SCHEMA-CHANGE.
 //!   2. A hand-built **Tier A** (valid-magic) journal per `pager.c` offsets,
 //!      paired with a tiny real `page_size=512` database, to drive the HOT,
 //!      CHECKSUM-MISMATCH, DUPLICATE-PAGE, and DBSIZE-DELTA arms — which only a
@@ -102,7 +109,7 @@ fn codes_of(db: &Database, journal: &[u8]) -> Vec<&'static str> {
 }
 
 #[test]
-fn persist_artifact_triggers_recoverable_and_schema_change() {
+fn persist_artifact_triggers_recoverable_only() {
     for platform in ["ios", "android"] {
         let main = std::fs::read(cfreds(&format!("SFT-03_PERSIST_{platform}.sqlite"))).unwrap();
         let journal =
@@ -116,9 +123,12 @@ fn persist_artifact_triggers_recoverable_and_schema_change() {
             codes.contains(&"SQLITE-JOURNAL-RECOVERABLE"),
             "{platform}: PERSIST post-commit journal with page images is recoverable; got {codes:?}"
         );
+        // DML only: the journal's prior page-1 image schema cookie equals the live
+        // db cookie, so SCHEMA-CHANGE must NOT fire (the cookie-comparison arm is
+        // validated end-to-end in `hot_journal_anomaly.rs`).
         assert!(
-            codes.contains(&"SQLITE-JOURNAL-SCHEMA-CHANGE"),
-            "{platform}: page 1 is journaled (verified empirically); got {codes:?}"
+            !codes.contains(&"SQLITE-JOURNAL-SCHEMA-CHANGE"),
+            "{platform}: DML-only PERSIST (cookie unchanged) must NOT raise SCHEMA-CHANGE; got {codes:?}"
         );
         // Tier B has no valid header / checksums / duplicate / mx_page, so none of
         // the Tier-A-only anomalies fire on the real artifact.
@@ -174,10 +184,8 @@ fn tier_a_journal_triggers_hot_checksum_duplicate_dbsize_shrink() {
         codes.contains(&"SQLITE-JOURNAL-DUPLICATE-PAGE"),
         "pgno 2 appears twice; got {codes:?}"
     );
-    assert!(
-        codes.contains(&"SQLITE-JOURNAL-SCHEMA-CHANGE"),
-        "pgno 1 is journaled; got {codes:?}"
-    );
+    // SCHEMA-CHANGE is cookie-driven and validated against real engine artifacts
+    // in `hot_journal_anomaly.rs`; this hand-built journal does not assert it.
     assert!(
         codes.contains(&"SQLITE-JOURNAL-DBSIZE-DELTA"),
         "mx_page (9) != db.page_count (1); got {codes:?}"
@@ -298,7 +306,6 @@ fn journal_findings_carry_source_and_code() {
     let findings = audit_journal_findings(&db, &journal, &source);
     let codes: Vec<String> = findings.iter().map(|f| f.code.to_string()).collect();
     assert!(codes.iter().any(|c| c == "SQLITE-JOURNAL-RECOVERABLE"));
-    assert!(codes.iter().any(|c| c == "SQLITE-JOURNAL-SCHEMA-CHANGE"));
     assert!(findings
         .iter()
         .all(|f| f.source.analyzer == "sqlite-forensic"));

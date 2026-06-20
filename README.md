@@ -69,13 +69,13 @@ By default `carve` **rebuilds a queryable SQLite database** — `<name>.recovere
 - **`recovered_unattributed` — UNKNOWN.** Dropped-table residue, or a shape matching no surviving table — recovered in full, attributed to nothing.
 - **`recovered_fragments`** — the **separate** Tier-2 partial-salvage table (a distinctive cell survived but the row's identity did not), kept distinct so a fragment is never mistaken for a full row. `--no-fragments` drops it.
 
-Need a spreadsheet for review? Add `--xlsx` to also write `<name>.recovered.xlsx` (same stem as the rebuilt db, `--out`'s stem honored). It carries **one sheet per recovered table** (sheet names sanitized to Excel's rules), every recovered row is visibly marked, and **recovered image BLOBs are shown as in-cell thumbnails** (PNG/JPEG/GIF/BMP/WebP/TIFF); a video BLOB shows a typed `video/<ext> · <size>` placeholder (first-frame extraction is deferred).
+Need a spreadsheet for review? Add `--xlsx` to also write `<name>.recovered.xlsx` (same stem as the rebuilt db, `--out`'s stem honored) — a **combined workbook**: the source database dumped **one sheet per live table** (its real column names) with the recovered (deleted) rows **folded back into their table by rowid**. Each recovered row is tinted **pale red** and carries three trailing flag columns — `is_deleted` (1 for a carved row), `is_guessed` (1 when the row was attributed by shape, consistent with that table rather than hard-linked), and `table_match_ambiguous` (1 when more than one table fit the shape). Rows whose rowid was destroyed sink to the bottom of their sheet. Tier-3 unattributed rows and partial fragments stay in their own `recovered_unattributed` / `recovered_fragments` tabs. **Image BLOBs — live and recovered — are shown as in-cell thumbnails** (PNG/JPEG/GIF/BMP/WebP/TIFF); a video BLOB shows a typed `video/<ext> · <size>` placeholder (first-frame extraction is deferred). A sheet exceeding Excel's 1,048,576-row limit is truncated with a warning naming the table and dropped count.
 
 Want a stream instead of a file? Pick a format; want the file elsewhere? Pick a path:
 
 ```console
 $ sqlite4n6 carve ChatStorage.sqlite --out /cases/2026-001/recovered.db  # choose the output path
-$ sqlite4n6 carve ChatStorage.sqlite --xlsx             # also write ChatStorage.recovered.xlsx (image thumbnails in-cell)
+$ sqlite4n6 carve ChatStorage.sqlite --xlsx             # also write a combined live + recovered workbook (image thumbnails in-cell)
 $ sqlite4n6 carve ChatStorage.sqlite --format table     # recovered rows to stdout (or: csv, jsonl)
 $ sqlite4n6 carve ChatStorage.sqlite --format jsonl     # one JSON object per record (BLOBs as base64)
 $ sqlite4n6 carve ChatStorage.sqlite --min-confidence medium  # drop low-confidence carves

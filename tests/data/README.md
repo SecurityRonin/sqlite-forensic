@@ -24,6 +24,9 @@ its own provenance README (source, NIST/author hashes, licence, ground truth):
   SFT-03 deleted/modified records) — U.S. Government public domain, MD5-verified
   against NIST-published hashes.
 - [`sharifctf/`](sharifctf/README.md) — a real damaged-header CTF database (robustness).
+- [`journal/`](journal/README.md) — real sqlite3-engine rollback-`-journal`
+  scenarios (a hot DML journal and a committed-DDL PERSIST journal) for the
+  `audit_journal` anomaly arms — minted with the public-domain SQLite engine.
 
 #### places.db
 

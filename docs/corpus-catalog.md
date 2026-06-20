@@ -387,6 +387,25 @@ manifest: `tests/data/cfreds/README.md` (the single detailed index for this set)
 Upstream write-ups repo has no licence; retained as an 8 KB CTF artifact under
 fair-use with attribution (see `tests/data/sharifctf/README.md`).
 
+## §L `tests/data/journal/`  (real-engine artifact / minted input, **committed**)
+
+Four small artifacts the **real SQLite engine** wrote for two minted
+rollback-`-journal` scenarios, driving the `audit_journal` anomaly arms in
+`forensic/tests/hot_journal_anomaly.rs` against real engine output rather than
+hand-encoded bytes. Real-engine / minted-input tier: the recipe is deterministic,
+the journal nonce is engine-random, so the committed bytes are what the engine
+produced. Public domain (minted with the public-domain SQLite engine, no
+third-party content); full provenance + recipes + md5s in
+`tests/data/journal/README.md`.
+
+- `hot.db` + `hot.db-journal` — a Tier-A **hot** journal (valid magic, `n_rec=5`,
+  5/5 checksum-valid, DML only). Page 1 is journaled but the schema cookie is
+  unchanged (1 == 1), so HOT fires and SCHEMA-CHANGE does **not** — the negative
+  oracle for the cookie comparison alongside NIST SFT-03 PERSIST.
+- `ddl_persist.db` + `ddl_persist.db-journal` — a committed-DDL PERSIST journal
+  (`ALTER TABLE … ADD COLUMN`). Live schema cookie (2) advanced past the journal's
+  prior page-1 image cookie (1), so SCHEMA-CHANGE fires with both values shown.
+
 ## §H MD5 manifest
 
 Committed fixtures (under `tests/data/`, `tests/data/`):
@@ -401,6 +420,10 @@ Committed fixtures (under `tests/data/`, `tests/data/`):
 | `tests/data/wal_carve.db-wal` | `598e80ad38536f4b7a6cb51ddaedc767` | 8272 |
 | `tests/data/deleted_places.db` | `16682d7df99b1e8a89287a508d95eb47` | 53248 |
 | `tests/data/updated_messages.db` | `e1edbb56bf37efa6a7c1e738040f1360` | 8192 |
+| `tests/data/journal/hot.db` | `6dfd120f216ff997b819bdc755ea6431` | 20480 |
+| `tests/data/journal/hot.db-journal` | `d428e2fcf8e6f3d9c71a58b18c6f4dcc` | 22016 |
+| `tests/data/journal/ddl_persist.db` | `0271673fb35215d80f313e5f549dbbaf` | 16384 |
+| `tests/data/journal/ddl_persist.db-journal` | `fe785dd18b5eb58b6dd4176ae5864130` | 8720 |
 
 The 141 committed Nemetz databases under `tests/data/nemetz/` (CC0, §I) have their
 own md5 manifest in `tests/data/nemetz/README.md` to avoid duplicating it here.

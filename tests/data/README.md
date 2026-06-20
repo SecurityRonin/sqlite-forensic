@@ -27,6 +27,11 @@ its own provenance README (source, NIST/author hashes, licence, ground truth):
 - [`journal/`](journal/README.md) — real sqlite3-engine rollback-`-journal`
   scenarios (a hot DML journal and a committed-DDL PERSIST journal) for the
   `audit_journal` anomaly arms — minted with the public-domain SQLite engine.
+- [`paper_fp/`](paper_fp/README.md) — REAL-engine REPLICATIONS of the three
+  false-positive scenarios from the 2025 SQLite-recovery survey (Lee, Park, Lee &
+  Choi, FSI:DI 55, art. 302031): B-tree rebalancing, overwritten same-schema
+  table, and WAL+`secure_delete`. CC0; consumed by
+  `forensic/tests/paper_fp_scenarios.rs` and `docs/competitive-landscape.md`.
 
 #### places.db
 

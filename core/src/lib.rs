@@ -5247,6 +5247,90 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_read_resolves_overflow_through_snapshot_pages_not_live_view() {
+        // The DEFINING property of the snapshot-scoped read: a spilled (overflow)
+        // row must decode from the snapshot's OWN pages, even when the live view
+        // would supply different overflow content. Build a db whose table `t` holds
+        // one large-blob row (forcing an overflow chain), capture it as the
+        // snapshot, then CLOBBER the overflow pages in the live main-file image.
+        // The snapshot read still returns the original blob; a live read sees the
+        // clobbered bytes — proving the snapshot path does not consult the live view.
+        use crate::rebuild::{build_recovered_db_tables, RecoveredTable as RT};
+        let blob: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+        let seed = vec![RT {
+            name: "t".to_string(),
+            columns: vec!["id".to_string(), "big".to_string()],
+            rows: vec![vec![Value::Integer(1), Value::Blob(blob.clone())]],
+        }];
+        let minted = build_recovered_db_tables(&seed);
+        let ps = parse_header(&minted).unwrap().page_size;
+        // The WAL commits the TRUE pages; the snapshot materializes them.
+        let wal = wrap_db_in_wal(&minted, ps);
+
+        // Now clobber the live main image's overflow pages (every page after the
+        // first two: page 1 schema, page 2 table-leaf, page 3+ overflow) to a
+        // distinct byte so a live read would mis-decode the blob.
+        let mut clobbered_main = minted.clone();
+        for p in clobbered_main.iter_mut().skip(2 * ps as usize) {
+            *p = 0xEE;
+        }
+
+        let db = Database::open_with_wal(clobbered_main, &wal).unwrap();
+        let tl = db.wal_timeline().unwrap();
+        let snap = tl.commit_snapshots().last().unwrap();
+        let t = snap
+            .tables()
+            .into_iter()
+            .find(|t| t.name == "t")
+            .expect("table t in snapshot");
+
+        let rows = snap.read_table(t.rootpage, t.columns.len()).unwrap();
+        assert_eq!(rows.len(), 1, "one row at this commit");
+        let (rowid, values) = &rows[0];
+        assert_eq!(*rowid, 1);
+        // The 9000-byte blob reassembles from the SNAPSHOT's overflow pages, intact.
+        assert_eq!(
+            values.get(1),
+            Some(&Value::Blob(blob)),
+            "overflow blob must reassemble from the snapshot's pages, not the clobbered live view"
+        );
+    }
+
+    #[test]
+    fn snapshot_read_walks_interior_btree_in_rowid_order() {
+        // Many rows force an interior (0x05) table b-tree; the snapshot read must
+        // descend it and return rows in ascending rowid order — exercising the
+        // shared walk's interior branch through the snapshot page source.
+        use crate::rebuild::{build_recovered_db_tables, RecoveredTable as RT};
+        let rows_seed: Vec<Vec<Value>> = (1..=500i64)
+            .map(|i| vec![Value::Integer(i), Value::Text(format!("name-{i}"))])
+            .collect();
+        let seed = vec![RT {
+            name: "big".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: rows_seed,
+        }];
+        let minted = build_recovered_db_tables(&seed);
+        let ps = parse_header(&minted).unwrap().page_size;
+        let wal = wrap_db_in_wal(&minted, ps);
+
+        let db = Database::open_with_wal(minted, &wal).unwrap();
+        let tl = db.wal_timeline().unwrap();
+        let snap = tl.commit_snapshots().last().unwrap();
+        let t = snap
+            .tables()
+            .into_iter()
+            .find(|t| t.name == "big")
+            .expect("table big");
+        let rows = snap.read_table(t.rootpage, t.columns.len()).unwrap();
+        assert_eq!(rows.len(), 500, "all rows across the interior b-tree");
+        let ids: Vec<i64> = rows.iter().map(|(r, _)| *r).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "ascending rowid order");
+        assert_eq!(*ids.first().unwrap(), 1);
+        assert_eq!(*ids.last().unwrap(), 500);
+    }
+
+    #[test]
     fn without_rowid_sql_detects_the_clause() {
         // The WITHOUT ROWID detector keys off the CREATE TABLE tail, tolerant of
         // case and whitespace, and does NOT misfire on the literal appearing inside

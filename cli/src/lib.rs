@@ -2865,4 +2865,179 @@ mod tests {
             vec!["_page", "_offset", "_rowid", "_source", "_confidence"]
         );
     }
+
+    // ---- combined live + recovered merge helper ----------------------------
+
+    use sqlite_core::Row;
+
+    fn row(rowid: i64, vals: Vec<Value>) -> Row {
+        Row {
+            rowid,
+            values: vals,
+        }
+    }
+
+    /// The merged sheet header is the real columns followed by the three trailing
+    /// flag columns, in order.
+    #[test]
+    fn merged_sheet_appends_three_flag_columns() {
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let (sheet, dropped) = merge_table_sheet("people", &cols, &[], Vec::new(), 1_048_576);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            sheet.columns,
+            vec![
+                "id",
+                "name",
+                "is_deleted",
+                "is_guessed",
+                "table_match_ambiguous"
+            ]
+        );
+    }
+
+    /// Live rows and recovered rows interleave by rowid; the trailing flags read
+    /// live = 0,0,0 and certain-recovered = 1,0,0. Cells pad/truncate to the real
+    /// column count.
+    #[test]
+    fn merged_sheet_interleaves_recovered_by_rowid() {
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let live = vec![
+            row(1, vec![Value::Integer(1), Value::Text("live-a".into())]),
+            row(3, vec![Value::Integer(3), Value::Text("live-c".into())]),
+        ];
+        // A certain recovered row at rowid 2 lands between the two live rows.
+        let recovered = vec![RecoveredRow {
+            rowid: Some(2),
+            cells: vec![Value::Integer(2), Value::Text("del-b".into())],
+            is_guessed: false,
+            ambiguous: false,
+        }];
+        let (sheet, _) = merge_table_sheet("people", &cols, &live, recovered, 1_048_576);
+        // Order by rowid: live(1), recovered(2), live(3).
+        let names: Vec<&str> = sheet
+            .rows
+            .iter()
+            .map(|r| match &r.cells[1] {
+                Value::Text(t) => t.as_str(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(names, vec!["live-a", "del-b", "live-c"]);
+        // Flag triple lives in the last 3 cells (after the 2 real columns).
+        let flags = |r: &MergedRow| {
+            (
+                r.cells[2].clone(),
+                r.cells[3].clone(),
+                r.cells[4].clone(),
+                r.is_deleted,
+            )
+        };
+        assert_eq!(
+            flags(&sheet.rows[0]),
+            (
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                false
+            ),
+            "live row = 0,0,0 untinted"
+        );
+        assert_eq!(
+            flags(&sheet.rows[1]),
+            (
+                Value::Integer(1),
+                Value::Integer(0),
+                Value::Integer(0),
+                true
+            ),
+            "certain-recovered = 1,0,0 tinted"
+        );
+    }
+
+    /// A Tier-2 inferred row reads is_guessed = 1 and carries its ambiguity flag;
+    /// an unknown-rowid recovered row is appended at the bottom, after the
+    /// rowid-sorted rows.
+    #[test]
+    fn merged_sheet_inferred_flags_and_unknown_rowid_at_bottom() {
+        let cols = vec!["id".to_string()];
+        let live = vec![row(5, vec![Value::Integer(5)])];
+        let recovered = vec![
+            // Unknown rowid → bottom, even though "2" would sort first.
+            RecoveredRow {
+                rowid: None,
+                cells: vec![Value::Integer(99)],
+                is_guessed: true,
+                ambiguous: true,
+            },
+            // Inferred, known rowid 2 → sorts before live rowid 5.
+            RecoveredRow {
+                rowid: Some(2),
+                cells: vec![Value::Integer(2)],
+                is_guessed: true,
+                ambiguous: false,
+            },
+        ];
+        let (sheet, _) = merge_table_sheet("t", &cols, &live, recovered, 1_048_576);
+        // Order: recovered(2, inferred), live(5), then unknown-rowid at bottom.
+        let ids: Vec<Value> = sheet.rows.iter().map(|r| r.cells[0].clone()).collect();
+        assert_eq!(
+            ids,
+            vec![Value::Integer(2), Value::Integer(5), Value::Integer(99)]
+        );
+        // Inferred row: is_deleted=1, is_guessed=1, ambiguous=0.
+        assert_eq!(sheet.rows[0].cells[1], Value::Integer(1));
+        assert_eq!(sheet.rows[0].cells[2], Value::Integer(1));
+        assert_eq!(sheet.rows[0].cells[3], Value::Integer(0));
+        // Bottom row: inferred + ambiguous.
+        let last = sheet.rows.last().unwrap();
+        assert_eq!(last.cells[2], Value::Integer(1), "is_guessed");
+        assert_eq!(last.cells[3], Value::Integer(1), "table_match_ambiguous");
+    }
+
+    /// A recovered row's cells pad with NULL / truncate to the real column count
+    /// before the flag columns are appended.
+    #[test]
+    fn merged_sheet_pads_and_truncates_recovered_cells() {
+        let cols = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let recovered = vec![
+            // Too few cells → padded with NULL.
+            RecoveredRow {
+                rowid: Some(1),
+                cells: vec![Value::Integer(1)],
+                is_guessed: false,
+                ambiguous: false,
+            },
+            // Too many cells → truncated to 3.
+            RecoveredRow {
+                rowid: Some(2),
+                cells: vec![
+                    Value::Integer(2),
+                    Value::Integer(2),
+                    Value::Integer(2),
+                    Value::Integer(2),
+                ],
+                is_guessed: false,
+                ambiguous: false,
+            },
+        ];
+        let (sheet, _) = merge_table_sheet("t", &cols, &[], recovered, 1_048_576);
+        // 3 real columns + 3 flag columns = 6 cells per row.
+        assert!(sheet.rows.iter().all(|r| r.cells.len() == 6));
+        // Padded row: cell[1], cell[2] are NULL.
+        assert_eq!(sheet.rows[0].cells[1], Value::Null);
+        assert_eq!(sheet.rows[0].cells[2], Value::Null);
+    }
+
+    /// The Excel row cap truncates the sheet and reports the dropped count; the
+    /// cap counts live + recovered data rows together.
+    #[test]
+    fn merged_sheet_respects_row_cap_and_reports_dropped() {
+        let cols = vec!["id".to_string()];
+        let live: Vec<Row> = (1..=5).map(|i| row(i, vec![Value::Integer(i)])).collect();
+        // Cap data rows at 3 → 2 dropped.
+        let (sheet, dropped) = merge_table_sheet("t", &cols, &live, Vec::new(), 3);
+        assert_eq!(sheet.rows.len(), 3, "truncated to the cap");
+        assert_eq!(dropped, 2, "two rows dropped past the cap");
+    }
 }

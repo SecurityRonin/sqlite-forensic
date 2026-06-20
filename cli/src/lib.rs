@@ -700,25 +700,52 @@ fn render_audit_jsonl(anomalies: &[Anomaly]) -> Vec<String> {
         .collect()
 }
 
-// ---- rebuilt-db output (default carve behavior) ----------------------------
+// ---- carve output paths (.carved.db / .recovered.xlsx) ---------------------
 
-/// Resolve the output path for the rebuilt recovered database, enforcing the
-/// forensic-soundness guard.
+/// Resolve the output path for the rebuilt **carved** database (`<stem>.carved.db`),
+/// enforcing the forensic-soundness guard.
 ///
-/// With no `--out`, the path is `<stem>.recovered.db` in the **current working
-/// directory** (`History.db` → `History.recovered.db`), never beside the
-/// evidence. An explicit `out` overrides it. Either way the resolved path is
-/// **refused** (an `Err`) when it equals the evidence database or any of its
-/// `-wal` / `-shm` / `-journal` sidecars, so a rebuilt db can never overwrite the
-/// evidence set. This is the pure decision the binary shell delegates to.
-pub fn recovered_output_path(db: &Path, out: Option<&Path>) -> Result<PathBuf, String> {
-    let resolved = match out {
-        Some(p) => p.to_path_buf(),
-        None => PathBuf::from(default_recovered_filename(db)),
-    };
+/// The db holds the raw carved records, hence the `.carved.db` suffix. With no
+/// `--out`, the stem is the evidence file's own stem in the **current working
+/// directory** (`History.db` → `History.carved.db`), never beside the evidence.
+/// An explicit `out` sets the stem instead (its directory + filename stem, with
+/// any extension dropped), so `--out /p/foo` and `--out /p/foo.db` both yield
+/// `/p/foo.carved.db`. Either way the resolved path is **refused** (an `Err`)
+/// when it equals the evidence database or any of its `-wal` / `-shm` /
+/// `-journal` sidecars, so a carved db can never overwrite the evidence set.
+pub fn carved_db_path(db: &Path, out: Option<&Path>) -> Result<PathBuf, String> {
+    resolve_output_path(db, out, "carved.db", "carved db")
+}
+
+/// Resolve the output path for the **recovered** combined workbook
+/// (`<stem>.recovered.xlsx`) — the reconstructed live + recovered view.
+///
+/// Stem resolution mirrors [`carved_db_path`] (evidence stem by default, `--out`
+/// sets the stem), and the same evidence-set guard applies, so `History.db` →
+/// `History.recovered.xlsx` and `--out /p/foo[.db]` → `/p/foo.recovered.xlsx`.
+/// The two output paths are derived independently from the stem (the db and xlsx
+/// suffixes differ), never one from the other.
+pub fn recovered_xlsx_path(db: &Path, out: Option<&Path>) -> Result<PathBuf, String> {
+    resolve_output_path(db, out, "recovered.xlsx", "recovered xlsx")
+}
+
+/// Shared stem resolution + evidence guard for a carve output: append the
+/// two-part `suffix` (e.g. `carved.db`, `recovered.xlsx`) to the resolved stem
+/// (the evidence stem in the CWD, or `--out`'s directory + stem), then refuse the
+/// result if it lands on the evidence db or a sidecar (`label` names the output
+/// in the diagnostic). Suffix is appended via `set_extension` on the stem path so
+/// no input extension leaks through.
+fn resolve_output_path(
+    db: &Path,
+    out: Option<&Path>,
+    suffix: &str,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let mut resolved = stem_path(db, out);
+    resolved.set_extension(suffix);
     if let Some(clash) = evidence_path_clash(db, &resolved) {
         return Err(format!(
-            "refusing to write recovered db to {} — it is the evidence {}; \
+            "refusing to write {label} to {} — it is the evidence {}; \
              choose a different --out",
             resolved.display(),
             clash
@@ -727,27 +754,22 @@ pub fn recovered_output_path(db: &Path, out: Option<&Path>) -> Result<PathBuf, S
     Ok(resolved)
 }
 
-/// Derive the `.xlsx` companion path from a resolved recovered-db path by
-/// swapping its final extension for `xlsx`. This keeps the xlsx beside the
-/// rebuilt db with the same stem, so `--out /p/foo.db` ⇒ `/p/foo.xlsx` and the
-/// default `History.recovered.db` ⇒ `History.recovered.xlsx`. A db path with no
-/// extension simply gains `.xlsx`.
-#[must_use]
-pub fn recovered_xlsx_path(recovered_db: &Path) -> PathBuf {
-    recovered_db.with_extension("xlsx")
-}
-
-/// The default recovered-db filename: the input's filename with its final
-/// extension replaced by `.recovered.db`. A filename with no extension keeps its
-/// whole stem (`wal_only` → `wal_only.recovered.db`).
-fn default_recovered_filename(db: &Path) -> String {
-    // A path with no filename component (e.g. `/`) degrades to a fixed name
-    // rather than panicking — the rebuilt db is still written somewhere safe.
-    let stem = db.file_stem().map_or_else(
+/// The stem path the carve outputs are built on. With `--out`, it is that path's
+/// directory joined with its filename stem (any extension dropped), so the output
+/// lands exactly where the caller asked. With no `--out`, it is just the evidence
+/// file's own stem — a bare filename, so the outputs land in the **current working
+/// directory**, never beside the evidence. A source with no filename component
+/// degrades to the fixed `recovered` stem rather than panicking.
+fn stem_path(db: &Path, out: Option<&Path>) -> PathBuf {
+    let source = out.unwrap_or(db);
+    let stem = source.file_stem().map_or_else(
         || "recovered".to_string(),
         |s| s.to_string_lossy().into_owned(),
     );
-    format!("{stem}.recovered.db")
+    match out.and_then(Path::parent) {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(stem),
+        _ => PathBuf::from(stem),
+    }
 }
 
 /// If `out` names the evidence db or one of its sidecars, return a label for the

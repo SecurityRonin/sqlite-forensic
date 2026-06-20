@@ -2,22 +2,23 @@
 //!
 //! The binary is the irreducible Humble-Object shell: it parses arguments,
 //! reads the evidence file into owned bytes, opens a read-only [`Database`],
-//! drives the `sqlite4n6` library's pure decision helpers, and either writes a
-//! **rebuilt recovered database** (the default) or renders the records to stdout
-//! (`--format` / `--rowid-only`). **The evidence file and its sidecars are never
-//! written** — the evidence bytes are owned by the [`Database`] and never flushed
-//! back, and the rebuilt db is a *separate* output file (guarded so it can never
-//! resolve to the evidence db or a `-wal`/`-shm`/`-journal` sidecar). Every
-//! decision (path derivation, projection, filtering, rendering) lives in the
-//! unit-tested library; this file owns only I/O.
+//! drives the `sqlite4n6` library's pure decision helpers, and either writes the
+//! **combined recovered workbook** (`<stem>.recovered.xlsx`, the default) plus —
+//! when `--db` is given — the **rebuilt carved database** (`<stem>.carved.db`),
+//! or renders the records to stdout (`--format` / `--rowid-only`). **The evidence
+//! file and its sidecars are never written** — the evidence bytes are owned by
+//! the [`Database`] and never flushed back, and both outputs are *separate* files
+//! (guarded so neither can resolve to the evidence db or a `-wal`/`-shm`/`-journal`
+//! sidecar). Every decision (path derivation, projection, filtering, rendering)
+//! lives in the unit-tested library; this file owns only I/O.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlite4n6::{
-    carve_wal_snapshots, combined_xlsx_bytes, filter_by_confidence, group_attributed_tables,
-    recovered_output_path, recovered_xlsx_path, render_audit, render_carve, render_carve_tiered,
+    carve_wal_snapshots, carved_db_path, combined_xlsx_bytes, filter_by_confidence,
+    group_attributed_tables, recovered_xlsx_path, render_audit, render_carve, render_carve_tiered,
     render_carve_with_snapshot, render_fragments, MinConfidence, OutputFormat, EXCEL_MAX_ROWS,
 };
 use sqlite_core::rebuild::build_recovered_db_tables;
@@ -83,7 +84,7 @@ enum Commands {
 }
 
 // Each bool is an independent CLI toggle (`--rowid-only`, `--no-wal`,
-// `--no-fragments`, `--xlsx`); a bitflags struct would only obscure the clap
+// `--no-fragments`, `--db`); a bitflags struct would only obscure the clap
 // surface, so the >3-bools lint does not apply to an args struct.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
@@ -92,15 +93,18 @@ struct CarveArgs {
     #[arg(value_name = "DB")]
     db: PathBuf,
 
-    /// Render the recovered records to stdout in this format instead of writing a
-    /// rebuilt database. Omit to write a rebuilt `<stem>.recovered.db` (the
-    /// default).
+    /// Render the recovered records to stdout in this format instead of writing
+    /// output files. Omit to write the combined `<stem>.recovered.xlsx` workbook
+    /// (the default).
     #[arg(long, value_enum)]
     format: Option<FormatArg>,
 
-    /// Output path for the rebuilt recovered database (default-write mode only).
-    /// Defaults to `<stem>.recovered.db` in the current directory; refused if it
-    /// resolves to the evidence db or a `-wal`/`-shm`/`-journal` sidecar.
+    /// Output stem for the written files (default-write mode only). Defaults to
+    /// the evidence file's stem in the current directory; any extension is
+    /// dropped, so `--out /p/foo` and `--out /p/foo.db` both yield
+    /// `/p/foo.recovered.xlsx` (and, with `--db`, `/p/foo.carved.db`). A derived
+    /// path resolving to the evidence db or a `-wal`/`-shm`/`-journal` sidecar is
+    /// refused.
     #[arg(long, value_name = "PATH")]
     out: Option<PathBuf>,
 
@@ -130,13 +134,14 @@ struct CarveArgs {
     #[arg(long)]
     no_fragments: bool,
 
-    /// Also write a spreadsheet `<stem>.recovered.xlsx` beside the rebuilt
-    /// `<stem>.recovered.db` (honoring `--out`'s stem). Its two sheets mirror the
-    /// rebuilt tables; image blobs are shown as in-cell thumbnails, video blobs as
-    /// a typed `video/<ext> · <size>` placeholder. A rebuild-mode-only option:
-    /// conflicts with the stdout text modes (`--format`, `--rowid-only`).
-    #[arg(long, conflicts_with = "format", conflicts_with = "rowid_only")]
-    xlsx: bool,
+    /// ALSO write the rebuilt carved SQLite database `<stem>.carved.db` beside the
+    /// default `<stem>.recovered.xlsx` (honoring `--out`'s stem). The db holds the
+    /// raw carved records split into attribution-tiered `recovered_*` tables, each
+    /// cell in its native type (a recovered BLOB stored byte-for-byte), so it is
+    /// directly queryable with `sqlite3`. A file-output-only option: conflicts with
+    /// the stdout text modes (`--format`, `--rowid-only`).
+    #[arg(long = "db", conflicts_with = "format", conflicts_with = "rowid_only")]
+    db_flag: bool,
 }
 
 impl CarveArgs {
@@ -147,10 +152,10 @@ impl CarveArgs {
         !self.no_fragments && !self.rowid_only
     }
 
-    /// Whether to write a rebuilt recovered database (the default). True only when
-    /// neither a stdout `--format` nor `--rowid-only` was given — both of those
-    /// keep the historical stdout behavior exactly.
-    fn writes_rebuilt_db(&self) -> bool {
+    /// Whether to write the combined recovered workbook (the default file output).
+    /// True only when neither a stdout `--format` nor `--rowid-only` was given —
+    /// both of those keep the historical stdout behavior exactly.
+    fn writes_xlsx(&self) -> bool {
         self.format.is_none() && !self.rowid_only
     }
 
@@ -217,69 +222,73 @@ fn resolve_wal_path(args: &CarveArgs) -> Option<PathBuf> {
 }
 
 fn run_carve(args: &CarveArgs) -> Result<(), String> {
-    if args.writes_rebuilt_db() {
-        return run_carve_rebuild(args);
+    if args.writes_xlsx() {
+        return run_carve_files(args);
     }
     run_carve_stdout(args)
 }
 
-/// Default mode: carve the full recovered records and write them as a rebuilt
-/// `SQLite` database (never the evidence file). The output path is derived (and
-/// guarded against the evidence set) by the pure [`recovered_output_path`]; this
-/// shell only performs the I/O.
-fn run_carve_rebuild(args: &CarveArgs) -> Result<(), String> {
-    // Resolve + guard the destination BEFORE carving, so an evidence-clobbering
-    // path fails fast and nothing is read or written under it.
-    let out_path = recovered_output_path(&args.db, args.out.as_deref())?;
+/// Default mode: carve the full recovered records and write the combined
+/// `<stem>.recovered.xlsx` workbook (always), plus — when `--db` is given — the
+/// rebuilt `<stem>.carved.db`. Neither is the evidence file. Output paths are
+/// derived (and guarded against the evidence set) by the pure [`carved_db_path`] /
+/// [`recovered_xlsx_path`]; this shell only performs the I/O.
+fn run_carve_files(args: &CarveArgs) -> Result<(), String> {
+    // Resolve + guard EVERY destination BEFORE carving, so an evidence-clobbering
+    // path fails fast and nothing is read or written under it. The carved db path
+    // is resolved only when `--db` is requested.
+    let xlsx_path = recovered_xlsx_path(&args.db, args.out.as_deref())?;
+    let db_path = args
+        .db_flag
+        .then(|| carved_db_path(&args.db, args.out.as_deref()))
+        .transpose()?;
 
     // Tier-1 full rows and (when enabled) Tier-2 fragments come from one carve over
-    // the same evidence bytes; the two sets land in two SEPARATE tables. With
-    // `--no-fragments` the fragment set is `None`, omitting the table (single-table
-    // db, as before); when enabled but none are found, an empty table is still
-    // created (predictable).
+    // the same evidence bytes. With `--no-fragments` the fragment set is `None`.
     let (db, records, fragments) = collect_for_rebuild(args)?;
-    // Group every carved record into its attribution tier: recovered_<table>
-    // (CERTAIN, real column names), recovered_inferred (consistent-with + an
-    // ambiguity flag), recovered_unattributed (unknown), plus recovered_fragments
-    // (unchanged). The db and the xlsx are built from this same table set.
-    let tables = group_attributed_tables(&db, &records, fragments.as_deref());
 
-    let bytes = build_recovered_db_tables(&tables);
-    std::fs::write(&out_path, &bytes)
-        .map_err(|e| format!("cannot write recovered db {}: {e}", out_path.display()))?;
+    // `--db`: ALSO write the rebuilt carved database. Group every carved record
+    // into its attribution tier — recovered_<table> (CERTAIN, real column names),
+    // recovered_inferred (consistent-with + an ambiguity flag),
+    // recovered_unattributed (unknown), plus recovered_fragments. Written first so
+    // an unwritable db path fails before the (larger) xlsx work.
+    if let Some(path) = &db_path {
+        let tables = group_attributed_tables(&db, &records, fragments.as_deref());
+        let bytes = build_recovered_db_tables(&tables);
+        std::fs::write(path, &bytes)
+            .map_err(|e| format!("cannot write carved db {}: {e}", path.display()))?;
+    }
 
-    // `--xlsx`: additionally write the COMBINED workbook companion beside the db,
-    // honoring the db's stem. The source DB is dumped one sheet per live table
+    // The default COMBINED workbook: the source DB dumped one sheet per live table
     // with the recovered (deleted) rows folded back in by rowid (marked
     // is_deleted / is_guessed, tinted), unattributed rows + fragments in separate
     // tabs. Built to an in-memory buffer by the library; this shell only writes
     // bytes (and the library warns on stderr for any >1M-row sheet truncation).
-    let xlsx_path = if args.xlsx {
-        let path = recovered_xlsx_path(&out_path);
-        let xlsx_bytes =
-            combined_xlsx_bytes(&db, &records, fragments.as_deref(), &path, EXCEL_MAX_ROWS)?;
-        std::fs::write(&path, &xlsx_bytes)
-            .map_err(|e| format!("cannot write recovered xlsx {}: {e}", path.display()))?;
-        Some(path)
-    } else {
-        None
-    };
+    let xlsx_bytes = combined_xlsx_bytes(
+        &db,
+        &records,
+        fragments.as_deref(),
+        &xlsx_path,
+        EXCEL_MAX_ROWS,
+    )?;
+    std::fs::write(&xlsx_path, &xlsx_bytes)
+        .map_err(|e| format!("cannot write recovered xlsx {}: {e}", xlsx_path.display()))?;
 
-    let xlsx_suffix = xlsx_path
+    let db_suffix = db_path
         .as_ref()
         .map(|p| format!(" (+ {})", p.display()))
         .unwrap_or_default();
     match &fragments {
         Some(frags) => println!(
-            "wrote {} record(s) and {} fragment(s) to {}{xlsx_suffix}",
+            "wrote {} record(s) and {} fragment(s) to {}{db_suffix}",
             records.len(),
             frags.len(),
-            out_path.display()
+            xlsx_path.display()
         ),
         None => println!(
-            "wrote {} record(s) to {}{xlsx_suffix}",
+            "wrote {} record(s) to {}{db_suffix}",
             records.len(),
-            out_path.display()
+            xlsx_path.display()
         ),
     }
     Ok(())

@@ -7,7 +7,7 @@
 
 # sqlite-forensic
 
-**The deleted rows are the evidence — and `sqlite3` can't see them.** `sqlite4n6` carves deleted records back out of any SQLite database — browser history, chat apps, mobile artifacts — into a **review-ready spreadsheet you can open in seconds**: each table as a per-rowid **version history** (live, prior-changed, and deleted versions interleaved in WAL commit order) recovered from the uncheckpointed WAL and free space. It opens the evidence read-only, never writes it, and never re-surfaces a live row as "deleted".
+**The deleted rows are the evidence — and `sqlite3` can't see them.** `sqlite4n6` carves deleted records back out of any SQLite database — browser history, chat apps, mobile artifacts — into a **review-ready spreadsheet you can open in seconds**: each table as a per-rowid **version history** (live, prior-changed, and deleted versions interleaved in WAL commit order) recovered from the uncheckpointed WAL, the **rollback journal** (the default `DELETE`/`PERSIST` mode the WAL path doesn't cover), and free space. It opens the evidence read-only, never writes it, and never re-surfaces a live row as "deleted".
 
 ```bash
 brew install securityronin/tap/sqlite4n6
@@ -25,7 +25,7 @@ $ sqlite4n6 carve History.db
 wrote 412 record(s) and 9 fragment(s) to History.recovered.xlsx
 ```
 
-Open `History.recovered.xlsx` and each table is its own **version history** — live rows interleaved with the **prior (changed) and deleted versions** recovered from the uncheckpointed WAL and free space, ordered by the WAL's logical commit sequence and tinted by state (current / superseded / deleted / guessed / rowid-reused), with `wal_commit` / `commit_seq` / `view_state` / `is_deleted` columns. A review-ready view, no schema to reconstruct by hand. **Image BLOBs come back as in-cell thumbnails; every cell is recovered natively and losslessly.** Prefer a queryable database? Add `--db` and you also get `History.carved.db`:
+Open `History.recovered.xlsx` and each table is its own **version history** — live rows interleaved with the **prior (changed) and deleted versions** recovered from the uncheckpointed WAL, the rollback journal, and free space, ordered by the WAL's logical commit sequence and tinted by state (current / superseded / deleted / guessed / rowid-reused), with `wal_commit` / `commit_seq` / `view_state` / `is_deleted` columns. A review-ready view, no schema to reconstruct by hand. **Image BLOBs come back as in-cell thumbnails; every cell is recovered natively and losslessly.** Prefer a queryable database? Add `--db` and you also get `History.carved.db`:
 
 ```console
 $ sqlite4n6 carve History.db --db
@@ -37,7 +37,7 @@ $ sqlite3 History.carved.db 'SELECT _rowid, url FROM recovered_moz_places LIMIT 
 586|https://example.com/account/settings
 ```
 
-Deleted rows, in tools already on your box. The evidence database and its `-wal`/`-shm` sidecars are **never** touched.
+Deleted rows, in tools already on your box. The evidence database and its `-wal`/`-shm`/`-journal` sidecars are **never** touched.
 
 Precision-first, and **measured against independent ground truth** (the Nemetz *SQLite Forensic Corpus*, DFRWS-EU 2018): the **highest precision of any tool in the comparison**, **0 live-row re-reads**, and freeblock-aware recall of **0.833** on the cleanest category — ahead of `fqlite`'s 0.798. [How it's measured →](#trust-but-verify)
 
@@ -69,7 +69,7 @@ cargo install --git https://github.com/SecurityRonin/sqlite-forensic sqlite4n6
 
 ## What you get
 
-By default `carve` writes a **combined review workbook** — `<name>.recovered.xlsx` — so there is nothing to parse and nothing to reconstruct by hand. The source database is dumped **one sheet per live table**, and each sheet is that table's **per-rowid VERSION HISTORY**: its live rows interleaved with the **prior (changed) and deleted versions** recovered from the uncheckpointed `-wal` and from free space. The versions of one rowid are ordered by `commit_seq` — the WAL's **logical commit order**; there is **no wall-clock timestamp in a SQLite WAL**, only this commit sequence. Each version row carries, after the real columns:
+By default `carve` writes a **combined review workbook** — `<name>.recovered.xlsx` — so there is nothing to parse and nothing to reconstruct by hand. The source database is dumped **one sheet per live table**, and each sheet is that table's **per-rowid VERSION HISTORY**: its live rows interleaved with the **prior (changed) and deleted versions** recovered from the uncheckpointed `-wal`, the **rollback `-journal`**, and free space. When no WAL is in play and a `<db>-journal` sits beside the database, `carve` folds in the **last transaction's deletes and edits** recovered from it — the deleted rows (red) and the pre-edit values of modified rows (blue) — the temporal inverse of the WAL: where the WAL holds *after*-images, the journal holds the *before*-image of the last transaction. The versions of one rowid are ordered by `commit_seq` — the WAL's **logical commit order**; there is **no wall-clock timestamp in a SQLite WAL**, only this commit sequence. Each version row carries, after the real columns:
 
 - `_rowid` — the rowid (blank when destroyed);
 - `wal_commit` — `live` for the current view, `commit:(salt1,salt2,frame_index)` for a WAL commit version, `residue` for order-unknown carved residue;
@@ -100,7 +100,7 @@ $ sqlite4n6 carve ChatStorage.sqlite --rowid-only       # just the recovered row
 $ sqlite4n6 audit ChatStorage.sqlite                    # severity-graded anomaly findings
 ```
 
-Under the hood `sqlite4n6` reads the raw file format itself — freelist pages, in-page free blocks, dropped-table pages, and an uncheckpointed WAL overlay — recovering what the live `sqlite3`/rusqlite path cannot, because that path reads the live b-tree and stops.
+Under the hood `sqlite4n6` reads the raw file format itself — freelist pages, in-page free blocks, dropped-table pages, an uncheckpointed WAL overlay, and the **rollback journal** — recovering what the live `sqlite3`/rusqlite path cannot, because that path reads the live b-tree and stops.
 
 | | sqlite-forensic | rusqlite / `sqlite3` |
 |---|:-:|:-:|
@@ -114,6 +114,7 @@ Under the hood `sqlite4n6` reads the raw file format itself — freelist pages, 
 | Rebuild recovered rows into a queryable SQLite db (native types, lossless BLOBs) | ✅ | — |
 | Read uncheckpointed WAL overlay as a separate view | ✅ | applied silently |
 | Carve every WAL commit snapshot, LSN-labelled (per-commit timeline) | ✅ | — |
+| Recover the last transaction's deletes **and edits** from the rollback `-journal` (default `DELETE`/`PERSIST` mode) | ✅ | — |
 | Graded, confidence-scored anomaly findings | ✅ | — |
 | Refuses to ever re-surface a live row as "deleted" | ✅ | n/a |
 | `forbid(unsafe)`, panic-free on hostile input | ✅ | C / FFI |
@@ -135,6 +136,42 @@ $ sqlite4n6 carve chat.db --no-wal                     # on-disk image only, no 
 ```
 
 The `snapshot` column carries the salt-qualified LSN — `commit:(salt1,salt2,commit_frame_index)` for a committed snapshot, `wal-frame:(salt1,salt2,frame_index)` for raw frame residue, `on-disk` for the base image. A record identical across views is collapsed to its earliest committed coordinate. `--no-wal` carves the on-disk image alone (single view, no snapshot column). The evidence file and its sidecars are **never** written.
+
+---
+
+## The rollback journal: the last transaction's deletes and edits
+
+`DELETE` (the default) and `PERSIST` are SQLite's *rollback-journal* modes — the
+common case the WAL feature doesn't cover. Before a transaction modifies a page,
+SQLite copies that page's **original** bytes into a `<db>-journal` sidecar; in
+`PERSIST` mode the header is zeroed on commit but those page images remain. That
+makes the journal the **temporal inverse of the WAL**: the WAL holds *after*-images
+(roll forward to the present), the journal holds the *before*-image of the **last
+transaction** (roll back to the state just before it). When `carve` finds a
+`<db>-journal` (and no WAL takes precedence), it diffs that prior state against the
+live database and recovers:
+
+- **deletions** — a rowid present in the prior state but gone now → the full
+  deleted row (tinted **red**), and
+- **modifications** — a rowid present in both with changed values → the **pre-edit
+  value** (tinted **blue**), with the live row kept as current.
+
+```console
+$ sqlite4n6 carve case.sqlite                  # auto-detects case.sqlite-journal
+wrote 1 record(s) and 0 fragment(s) to case.recovered.xlsx
+recovered 100 deleted + 100 modified row(s) from the rollback journal
+
+$ sqlite4n6 carve case.sqlite --no-journal     # ignore the -journal sidecar
+```
+
+Validated end-to-end against the **NIST CFReDS** SFT-03 PERSIST set (NIST-authored
+ground truth): **100/100** documented deletions and **100/100** modifications
+recovered. Two-tier parser — a valid (hot/crash) journal header, or a `PERSIST`
+zeroed header reconstructed from the database's own page size; journal-header
+offsets verified against SQLite's `pager.c`. The journal also drives a set of
+`audit` observations (see *Anomaly codes*). Limits: only the *last* transaction's
+state survives in a rollback journal; `DELETE`-mode (file unlinked) and
+`TRUNCATE`-mode (file zeroed) leave no in-band residue.
 
 ---
 
@@ -178,8 +215,8 @@ This is one workspace (`sqlite-forensic`): two library crates following the flee
 
 | Crate | Role | Entry points |
 |---|---|---|
-| [`sqlite-core`](core) | The raw, read-only, panic-free file-format reader: header parse, b-tree walk, freelist + overflow chains, a read-only WAL overlay that maps onto the canonical `forensicnomicon::history` temporal cohort, plus a small pure-Rust writer (`rebuild`) that materializes recovered rows into a fresh database. | `Database::open`, `Database::open_with_wal`, `freelist_pages`, `read_table`, `carve_free_regions`, `live_rowids`, `wal_timeline`, `rebuild::build_recovered_db` |
-| [`sqlite-forensic`](forensic) | The anomaly auditor + deleted-record carver: grades observations into `forensicnomicon::report::Finding`s and recovers deleted rows. Depends on `sqlite-core`. | `audit`, `audit_findings`, `carve_all_deleted_records`, `carve_with_fragments` |
+| [`sqlite-core`](core) | The raw, read-only, panic-free file-format reader: header parse, b-tree walk, freelist + overflow chains, a read-only WAL overlay that maps onto the canonical `forensicnomicon::history` temporal cohort, a rollback-journal parser + prior-state snapshot, plus a small pure-Rust writer (`rebuild`) that materializes recovered rows into a fresh database. | `Database::open`, `Database::open_with_wal`, `freelist_pages`, `read_table`, `carve_free_regions`, `live_rowids`, `wal_timeline`, `Database::rollback_prior`, `RollbackJournal::parse`, `rebuild::build_recovered_db` |
+| [`sqlite-forensic`](forensic) | The anomaly auditor + deleted-record carver: grades observations into `forensicnomicon::report::Finding`s and recovers deleted rows (free space, WAL frames, and the rollback journal). Depends on `sqlite-core`. | `audit`, `audit_findings`, `audit_journal`, `carve_all_deleted_records`, `carve_with_fragments`, `carve_rollback_journal` |
 
 `sqlite-forensic` accepts an in-memory `Database` (built from `&[u8]`) — it is medium-agnostic and has no dependency on any image format or container layer. Findings flow into the shared `forensicnomicon::report` model, so a SQLite database's anomalies aggregate uniformly with the partition / container / filesystem layers in a triage report.
 
@@ -196,8 +233,16 @@ This is one workspace (`sqlite-forensic`): two library crates following the flee
 | `SQLITE-WAL-UNCHECKPOINTED` | Medium | A `-wal` sidecar carries committed page versions the main file does not reflect — the main file alone under-reports the true state. |
 | `SQLITE-PAGECOUNT-MISMATCH` | High | The in-header page count disagrees with the count implied by file length — consistent with truncation, carving, or out-of-band modification. |
 | `SQLITE-RESERVED-SPACE-NONZERO` | Low | The header reserves bytes per page — non-standard; consistent with a page-level extension such as encryption (SQLCipher/SEE) or a checksum VFS. |
+| `SQLITE-JOURNAL-HOT` | High | A `-journal` with a valid header sits beside the database — consistent with an interrupted or in-progress write transaction (the main db may require rollback). |
+| `SQLITE-JOURNAL-RECOVERABLE` | Medium | A `PERSIST` rollback journal carries pre-transaction page images — consistent with a committed transaction whose deleted/modified rows remain recoverable. |
+| `SQLITE-JOURNAL-CHECKSUM-MISMATCH` | High | A journal page record failed its page checksum — consistent with corruption, a torn page write, or post-write modification. Names the offending page(s). |
+| `SQLITE-JOURNAL-SCHEMA-CHANGE` | Medium | The schema page (page 1) is among the journal's images — consistent with a DDL change (CREATE/DROP/ALTER) in the last transaction; the prior schema is recoverable. |
+| `SQLITE-JOURNAL-DUPLICATE-PAGE` | Medium | A page number repeats across the journal's records (the spec journals a page at most once) — consistent with corruption, a savepoint/super-journal artifact, or tampering. |
+| `SQLITE-JOURNAL-DBSIZE-DELTA` | Low | The journal's transaction-start page count differs from the current size — the last transaction grew (INSERTs) or shrank (auto-vacuum / truncation) the database. |
 
-The `AnomalyKind` enum is `#[non_exhaustive]`: new codes can be added without a breaking change, so downstream `match` arms must carry a `_` arm.
+The journal anomalies are emitted by `audit_journal(&db, &journal_bytes)`; the
+`audit` subcommand auto-folds them when a `<db>-journal` is present (`--no-journal`
+opts out). The `AnomalyKind` enum is `#[non_exhaustive]`: new codes can be added without a breaking change, so downstream `match` arms must carry a `_` arm.
 
 ---
 

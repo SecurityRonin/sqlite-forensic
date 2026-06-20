@@ -17,12 +17,12 @@ for rec in carve_all_deleted_records(&db) { /* recovered deleted rows */ }
 
 ## What it does
 
-sqlite-forensic reads the raw SQLite file format — header, b-tree, freelist + overflow chains, and a read-only WAL overlay — and does two things the live `sqlite3`/rusqlite path cannot:
+sqlite-forensic reads the raw SQLite file format — header, b-tree, freelist + overflow chains, a read-only WAL overlay, and the rollback journal — and does two things the live `sqlite3`/rusqlite path cannot:
 
-- **Grades anomalies** (`sqlite-forensic::audit`) into severity-ranked, confidence-scored `forensicnomicon::report::Finding`s: non-empty freelist, uncheckpointed WAL state, page-count mismatch, non-standard reserved space.
-- **Carves deleted records** (`carve_all_deleted_records`) from freelist pages, in-page free blocks, dropped-table pages, and freed overflow-page chains (reassembled when every chain page survives as a freelist leaf) — column count inferred per record — while structurally refusing to re-surface a live row. A separate Tier-2 surface (`carve_with_fragments`; shown by default in the `sqlite4n6 carve` CLI, `--no-fragments` to suppress) salvages partial rows where a distinctive cell survives but full identity is destroyed.
+- **Grades anomalies** (`sqlite-forensic::audit`, `audit_journal`) into severity-ranked, confidence-scored `forensicnomicon::report::Finding`s: non-empty freelist, uncheckpointed WAL state, page-count mismatch, non-standard reserved space, and rollback-journal observations (hot journal, recoverable prior state, checksum mismatch, …).
+- **Carves deleted records** (`carve_all_deleted_records`) from freelist pages, in-page free blocks, dropped-table pages, and freed overflow-page chains (reassembled when every chain page survives as a freelist leaf) — column count inferred per record — while structurally refusing to re-surface a live row. A separate Tier-2 surface (`carve_with_fragments`; shown by default in the `sqlite4n6 carve` CLI, `--no-fragments` to suppress) salvages partial rows where a distinctive cell survives but full identity is destroyed. The **rollback journal** (`carve_rollback_journal`) adds the last transaction's deletes **and** edits — the default `DELETE`/`PERSIST` mode the WAL path doesn't cover — by diffing the journal's pre-transaction snapshot against the live db.
 
-By default the `sqlite4n6 carve` CLI writes a **combined review workbook** (`evidence.recovered.xlsx`) — the source database dumped one sheet per live table, where each sheet is that table's **per-rowid version history**: live rows interleaved with the prior-changed and deleted versions recovered from the uncheckpointed WAL and free space, ordered by the WAL's logical commit sequence (there is no wall-clock timestamp in a SQLite WAL) and tinted by state, with image BLOBs shown as in-cell thumbnails. Add `--db` to also write a **queryable SQLite database** (`evidence.carved.db`) of the raw carved records — attribution-tiered `recovered_*` tables with carved cells in their native types (a recovered `BLOB` is stored losslessly) — so you can `sqlite3 evidence.carved.db "SELECT …"` immediately. `--format table|csv|jsonl` streams to stdout instead (JSONL carries BLOBs as base64).
+By default the `sqlite4n6 carve` CLI writes a **combined review workbook** (`evidence.recovered.xlsx`) — the source database dumped one sheet per live table, where each sheet is that table's **per-rowid version history**: live rows interleaved with the prior-changed and deleted versions recovered from the uncheckpointed WAL, the rollback journal, and free space, ordered by the WAL's logical commit sequence (there is no wall-clock timestamp in a SQLite WAL) and tinted by state, with image BLOBs shown as in-cell thumbnails. Add `--db` to also write a **queryable SQLite database** (`evidence.carved.db`) of the raw carved records — attribution-tiered `recovered_*` tables with carved cells in their native types (a recovered `BLOB` is stored losslessly) — so you can `sqlite3 evidence.carved.db "SELECT …"` immediately. `--format table|csv|jsonl` streams to stdout instead (JSONL carries BLOBs as base64).
 
 ---
 
@@ -44,12 +44,13 @@ By default the `sqlite4n6 carve` CLI writes a **combined review workbook** (`evi
 | `SQLITE-WAL-UNCHECKPOINTED` | Medium | `-wal` overlay the main file does not reflect. |
 | `SQLITE-PAGECOUNT-MISMATCH` | High | Header page count disagrees with file length. |
 | `SQLITE-RESERVED-SPACE-NONZERO` | Low | Non-standard per-page reserved bytes (e.g. SQLCipher). |
+| `SQLITE-JOURNAL-*` | Low–High | Rollback-journal observations: hot journal, recoverable prior state, checksum mismatch, schema-page journaled, duplicate page, db-size delta. |
 
 ---
 
 ## Validation
 
-The deleted-record carver is reconciled against two independent reference tools, **undark** (C) and **fqlite** (Java):
+The deleted-record carver is reconciled against independent reference tools — **undark** (C) and **fqlite** (Java) — and validated against third-party ground truth: the **Nemetz SQLite Forensic Corpus** (DFRWS-EU 2018) and the **NIST CFReDS / CFTT** SQLite sets (encoding/header reporting; WAL and rollback-journal deleted/modified-record recovery, 100/100 on SFT-03 PERSIST):
 
 - [Validation methodology](https://github.com/SecurityRonin/sqlite-forensic/blob/main/docs/validation.md)
 - [Recovery capability comparison](https://github.com/SecurityRonin/sqlite-forensic/blob/main/docs/recovery-comparison.md)

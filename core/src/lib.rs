@@ -20,6 +20,7 @@
 
 pub mod attribution;
 pub mod rebuild;
+pub mod row_history;
 
 use forensicnomicon::sqlite::{
     SQLITE_FREELIST_TRUNK_OFFSET, SQLITE_HEADER_SIZE, SQLITE_MAGIC, SQLITE_PAGE_SIZE_OFFSET,

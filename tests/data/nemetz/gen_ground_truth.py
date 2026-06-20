@@ -54,7 +54,20 @@ import struct
 import xml.etree.ElementTree as ET
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CATEGORIES = ["0A", "0B", "0C", "0D", "0E"]
+
+# Every category whose `.xml` answer key tags one or more rows `deleted="1"` — the
+# deleted-record ground truth this manifest exists to carry. The remaining
+# vendored categories (01-06, 08, 09, 11-16, 19) describe only LIVE content; they
+# are parse/format fixtures exercised by the panic-free robustness harness
+# (`forensic/tests/nemetz_robustness.rs`) and are deliberately NOT scored as
+# deleted-recall, so no fictitious deleted ground truth is invented for them.
+#
+#   07 Fragmented contents               (1 deleted row, in 07-03)
+#   0A Deleted tables / 0B Overwritten tables  (dropped-table proxy)
+#   0C Deleted records / 0D Overwritten records / 0E Deleted overflow pages
+#   17 Manipulated Freeblock Structures  (anti-forensic; still ships deleted rows)
+#   18 Manipulated Freelist Trunks       (anti-forensic; still ships deleted rows)
+CATEGORIES = ["07", "0A", "0B", "0C", "0D", "0E", "17", "18"]
 
 
 def parse_columns(element: ET.Element) -> list[dict]:
@@ -492,8 +505,23 @@ def main() -> None:
     manifest: dict[str, dict] = {}
     for category in CATEGORIES:
         for xml_path in sorted(glob.glob(os.path.join(HERE, category, "*.xml"))):
-            nid = os.path.basename(xml_path)[:-4]
-            db_path = os.path.join(HERE, category, nid + ".db")
+            stem = os.path.basename(xml_path)[:-4]
+            # The deletion categories name their db `NN-MM.db`; the anti-forensic
+            # categories (17, 18) name it `NN-MM_antifor.db` while keeping the
+            # plain `NN-MM.xml` answer key. Resolve whichever exists and key the
+            # manifest by the ACTUAL db stem, so every consumer that builds
+            # `{nid}.db` (the metrics harness path construction) resolves the real
+            # file rather than a phantom `NN-MM.db`.
+            plain = os.path.join(HERE, category, stem + ".db")
+            antifor = os.path.join(HERE, category, stem + "_antifor.db")
+            if os.path.exists(plain):
+                db_path, nid = plain, stem
+            elif os.path.exists(antifor):
+                db_path, nid = antifor, stem + "_antifor"
+            else:
+                raise FileNotFoundError(
+                    f"no .db for {xml_path} (tried {plain} and {antifor})"
+                )
             raw = open(db_path, "rb").read()
             root = ET.parse(xml_path).getroot()
             elements = []

@@ -3735,6 +3735,195 @@ mod tests {
         assert_eq!(wal_commit_token(&origin, None), "commit:?");
     }
 
+    // ---- TableHistory → temporal sheet plan (pure) -------------------------
+
+    use sqlite_core::row_history::{RowVersion, TableHistory, VersionOrigin, ViewState};
+
+    fn version(
+        rowid: Option<i64>,
+        values: Vec<Value>,
+        origin: VersionOrigin,
+        commit_seq: Option<u32>,
+        view_state: ViewState,
+        is_deleted: bool,
+        is_guessed: bool,
+        rowid_reused: bool,
+        attribution_uncertain: bool,
+    ) -> RowVersion {
+        RowVersion {
+            rowid,
+            values,
+            origin,
+            commit_seq,
+            view_state,
+            is_deleted,
+            is_guessed,
+            rowid_reused,
+            attribution_uncertain,
+        }
+    }
+
+    fn no_lsn(_: &sqlite_core::CommitId) -> Option<sqlite_core::WalLsn> {
+        None
+    }
+
+    #[test]
+    fn temporal_sheet_header_appends_flag_columns() {
+        let h = TableHistory {
+            table: "t".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            without_rowid: false,
+            versions: vec![],
+        };
+        let (sheet, dropped) = temporal_sheet(&h, no_lsn, EXCEL_MAX_ROWS);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            sheet.columns,
+            [
+                "id",
+                "name",
+                "_rowid",
+                "wal_commit",
+                "commit_seq",
+                "view_state",
+                "is_deleted",
+                "is_guessed",
+                "rowid_reused",
+                "attribution_uncertain",
+            ]
+            .map(String::from)
+        );
+        assert_eq!(sheet.name, "t");
+        assert!(sheet.rows.is_empty(), "no versions → no data rows");
+    }
+
+    #[test]
+    fn temporal_sheet_without_rowid_emits_single_annotation_row() {
+        let h = TableHistory {
+            table: "idx_tbl".to_string(),
+            columns: vec!["k".to_string()],
+            without_rowid: true,
+            versions: vec![],
+        };
+        let (sheet, _) = temporal_sheet(&h, no_lsn, EXCEL_MAX_ROWS);
+        assert_eq!(sheet.rows.len(), 1, "exactly one annotation row");
+        let note = &sheet.rows[0].cells[0];
+        assert_eq!(
+            *note,
+            Value::Text("WITHOUT ROWID — not version-tracked".to_string()),
+            "annotation note in the first cell"
+        );
+    }
+
+    #[test]
+    fn temporal_sheet_row_carries_temporal_and_flag_cells() {
+        // A changed_later historical version of rowid 1 from a commit.
+        let v = version(
+            Some(1),
+            vec![Value::Integer(1), Value::Text("a".into())],
+            VersionOrigin::Commit(sample_commit_id()),
+            Some(7),
+            ViewState::ValueChangedLater,
+            false,
+            false,
+            false,
+            false,
+        );
+        let h = TableHistory {
+            table: "t".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            without_rowid: false,
+            versions: vec![v],
+        };
+        let resolve = |_: &sqlite_core::CommitId| {
+            Some(sqlite_core::WalLsn {
+                salt1: 11,
+                salt2: 22,
+                frame_index: 3,
+            })
+        };
+        let (sheet, _) = temporal_sheet(&h, resolve, EXCEL_MAX_ROWS);
+        assert_eq!(sheet.rows.len(), 1);
+        let cells = &sheet.rows[0].cells;
+        // Real columns first.
+        assert_eq!(cells[0], Value::Integer(1));
+        assert_eq!(cells[1], Value::Text("a".into()));
+        // _rowid, wal_commit, commit_seq, view_state, then the 4 flags.
+        assert_eq!(cells[2], Value::Integer(1));
+        assert_eq!(cells[3], Value::Text("commit:(11,22,3)".into()));
+        assert_eq!(cells[4], Value::Integer(7));
+        assert_eq!(cells[5], Value::Text("changed_later".into()));
+        assert_eq!(cells[6], Value::Integer(0)); // is_deleted
+        assert_eq!(cells[7], Value::Integer(0)); // is_guessed
+        assert_eq!(cells[8], Value::Integer(0)); // rowid_reused
+        assert_eq!(cells[9], Value::Integer(0)); // attribution_uncertain
+                                                 // A ValueChangedLater version is superseded → blue.
+        let row = &sheet.rows[0];
+        assert!(row.superseded);
+        assert!(!row.is_deleted && !row.is_guessed && !row.rowid_reused);
+    }
+
+    #[test]
+    fn temporal_sheet_blank_commit_seq_and_none_rowid() {
+        // A carved-residue version: rowid None, commit_seq None, residue token.
+        let v = version(
+            None,
+            vec![Value::Text("ghost".into())],
+            VersionOrigin::CarvedResidue,
+            None,
+            ViewState::CarvedResidue,
+            true,
+            true,
+            false,
+            true,
+        );
+        let h = TableHistory {
+            table: "t".to_string(),
+            columns: vec!["name".to_string()],
+            without_rowid: false,
+            versions: vec![v],
+        };
+        let (sheet, _) = temporal_sheet(&h, no_lsn, EXCEL_MAX_ROWS);
+        let cells = &sheet.rows[0].cells;
+        assert_eq!(cells[0], Value::Text("ghost".into()));
+        assert_eq!(cells[1], Value::Null, "None rowid → blank _rowid");
+        assert_eq!(cells[2], Value::Text("residue".into()));
+        assert_eq!(cells[3], Value::Null, "None commit_seq → blank");
+        assert_eq!(cells[4], Value::Text("carved_residue".into()));
+        assert_eq!(cells[5], Value::Integer(1)); // is_deleted
+        assert_eq!(cells[6], Value::Integer(1)); // is_guessed
+        assert_eq!(cells[7], Value::Integer(0)); // rowid_reused
+        assert_eq!(cells[8], Value::Integer(1)); // attribution_uncertain
+    }
+
+    #[test]
+    fn temporal_sheet_truncates_to_row_cap() {
+        let versions: Vec<RowVersion> = (0..5)
+            .map(|i| {
+                version(
+                    Some(i),
+                    vec![Value::Integer(i)],
+                    VersionOrigin::Live,
+                    None,
+                    ViewState::PresentInFinalView,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+            })
+            .collect();
+        let h = TableHistory {
+            table: "t".to_string(),
+            columns: vec!["id".to_string()],
+            without_rowid: false,
+            versions,
+        };
+        let (sheet, dropped) = temporal_sheet(&h, no_lsn, 2);
+        assert_eq!(sheet.rows.len(), 2);
+        assert_eq!(dropped, 3);
+    }
+
     fn merged_row(cells: Vec<Value>, is_deleted: bool) -> MergedRow {
         MergedRow {
             cells,

@@ -950,6 +950,40 @@ fn is_structural_noise(values: &[Value]) -> bool {
     values.len() >= 2 && values.iter().skip(1).all(|v| matches!(v, Value::Null))
 }
 
+/// A schema-table (`sqlite_master`) row recovered from free space — a **dropped
+/// or replaced** table/index/view/trigger whose definition no longer appears in
+/// the live schema. Recovering it tells the examiner an object *existed* and its
+/// structure (the `CREATE` statement), which in turn explains residual data on
+/// the freelist. A finding, not a certainty: it is "consistent with a dropped
+/// `<name>`" — the examiner draws the conclusion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredSchema {
+    /// `sqlite_master.type` — `table`, `index`, `view`, or `trigger`.
+    pub object_type: String,
+    /// `sqlite_master.name` — the object's name.
+    pub name: String,
+    /// `sqlite_master.tbl_name` — the table the object belongs to (== `name` for
+    /// a table).
+    pub tbl_name: String,
+    /// `sqlite_master.rootpage` — the (now-freed) b-tree root, `None` when the
+    /// recovered cell stored it as NULL (views/triggers).
+    pub rootpage: Option<i64>,
+    /// `sqlite_master.sql` — the recovered `CREATE` statement.
+    pub sql: String,
+}
+
+/// Recover **dropped or replaced** schema definitions from free space: carved
+/// `sqlite_master`-shaped rows whose `(name, sql)` no longer matches a live
+/// schema entry. A `DROP TABLE`/`DROP INDEX` deletes the object's `sqlite_master`
+/// row (its bytes survive in page-1 free space under `secure_delete=OFF`); this
+/// surfaces that residue as a structured [`RecoveredSchema`] rather than a raw
+/// 5-column carved record.
+#[must_use]
+pub fn recover_dropped_schemas(db: &Database) -> Vec<RecoveredSchema> {
+    let _ = db;
+    Vec::new() // RED stub — implemented in the GREEN commit.
+}
+
 /// Two-tier deleted-record recovery: Tier-1 full rows **plus** Tier-2 partial
 /// fragments, in one pass.
 ///

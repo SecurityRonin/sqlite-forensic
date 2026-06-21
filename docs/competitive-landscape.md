@@ -293,10 +293,11 @@ local Undark row, run on the **same** bytes as our carve. As with recall,
 throughput is not the headline: the survey's contribution and ours is **false
 positives** and **substrate coverage**, not raw speed.
 
-## Ideas to steal (survey → our backlog)
+## Survey ideas → our backlog
 
-- **Throughput benchmark.** Add a large-DB (≈100 MB) timing harness so we can
-  report execution time alongside the survey's tools on comparable input.
+- **Throughput benchmark.** *Shipped:* a large-DB (≈100 MB) timing harness —
+  `carve --format jsonl` measures ~15.3 s on a 100 MB database, reported alongside
+  the survey's tools (see the Throughput section above).
 - **rowid → table inference for drop-recreate (the 0B nuance).** *Shipped (Detector
   A):* residue attributed to an `AUTOINCREMENT` table carries a `table_instance_risk`
   flag when its `rowid` exceeds the table's `sqlite_sequence` high-water mark —
@@ -310,7 +311,7 @@ positives** and **substrate coverage**, not raw speed.
   (`sidecar_schema_changed(table)`) — a table-level boundary hint, still not the
   same-schema case (a same-schema drop+recreate is indistinguishable from a benign
   page move) and never row-level provenance.
-- **WAL-checkpoint acquisition warning.** A `-wal` that a checkpoint would have
-  reclaimed is forensically load-bearing; surface a warning when an evidence WAL
-  is uncheckpointed (residue present) so an examiner copies the `-wal` before any
-  tool checkpoints it away.
+- **WAL-checkpoint acquisition warning.** *Shipped:* the `SQLITE-WAL-UNCHECKPOINTED`
+  audit note now carries the acquisition warning — a `-wal` a checkpoint would
+  reclaim is forensically load-bearing, so the note tells the examiner to acquire
+  the live `-wal` before any tool checkpoints it away.

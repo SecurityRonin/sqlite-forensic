@@ -1,0 +1,33 @@
+# fqlite.patch — NO edits to the fqlite source are required.
+#
+# This file is intentionally empty (no hunks).
+#
+# The documented recipe anticipated wrapping the unguarded `gui.add_table(...)` /
+# `gui.update_table(...)` calls in `src/fqlite/base/Job.java` in `if (gui != null)`.
+# At the pinned commit (26922bd9e3cdc60c93b72dfb1fb2f5972a0af6a6, fqlite v4.22),
+# those guards are ALREADY present upstream:
+#
+#   * Every `gui.add_table(...)` call (Job.java lines 1236, 1252, 1261, 1302, 1319,
+#     1328, 1405, 1430, 1441) sits inside an enclosing `if (null != gui) { ... }`
+#     block. Verified by brace-balance: the table-descriptor loop opens its guard at
+#     line 1231 and the sqlite_master block opens its guard at line 1370 (closing at
+#     line 1450), so all add_table sites are covered.
+#   * The `Platform.runLater(...)` + `gui.update_table(...)` cluster at line 1638 is
+#     inside `if (gui != null) {` (line 1630).
+#   * `gui.doLog(...)` (line 3223) is inside `Job.info(...)`, which is already
+#     `if (gui != null) gui.doLog(message); else System.out.println(message);`.
+#
+# Because `HeadlessTap` leaves `job.gui == null`, none of these GUI calls execute, so
+# no null-guard patch is needed. The `git status` / `git diff` of the checkout is empty.
+#
+# The headless instrumentation that *is* required lives OUTSIDE the checkout, so it does
+# not appear here:
+#   1. tools/fqlite/stubs/  — six compile-only stubs replacing the langchain4j/llama.cpp
+#      `fqlite.rag.*` and `fqlite.erm.*` classes (referenced only by GUI.java, which the
+#      carving path never instantiates). They let the engine + GUI compile without the
+#      heavy LLM dependencies; the real rag/erm packages are excluded from the source set.
+#   2. tools/fqlite/tap/HeadlessTap.java — the driver: boots the JavaFX toolkit headlessly,
+#      sets GUI.baseDir, runs Job.run(path), and emits the DELETED rows as CSV.
+#
+# To re-verify that the checkout is pristine:
+#   (cd tools/fqlite/checkout && git diff --stat HEAD)   # -> empty

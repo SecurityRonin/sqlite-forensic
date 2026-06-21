@@ -1,0 +1,80 @@
+--- undark.c.orig	2026-06-22 00:49:35
++++ undark-master/undark.c	2026-06-22 00:51:12
+@@ -37,7 +37,33 @@
+ 
+ #define DECODE_MODE_FREESPACE 1
+ #define DECODE_MODE_NORMAL 0
++
++/* Hoisted out of decode_row(): clang rejects GCC nested functions. ntohll
++ * renamed -> u_ntohll to avoid the macOS <sys/_endian.h> ntohll macro. */
++static uint64_t swap64(uint64_t x) {
++	uint8_t i;
++	uint64_t y;
++	uint8_t *px, *py;
++
++	px = (uint8_t *)&x;
++	py = (uint8_t *)&y;
++
++	for (i=0; i<8; i++) {
++		*(py+i) = *(px +(7-i));
++	}
++	return y;
++}
+ 
++static uint64_t u_ntohll(uint64_t value) {
++	uint64_t t;
++	if (1==ntohl(1)) {
++		return value;
++	} else {
++		t = swap64(value);
++		return t;
++	}
++}
++
+ #define PAYLOAD_SIZE_MINIMUM 10
+ #define PAYLOAD_CELLS_MAX 1000
+ #define OVERFLOW_PAGES_MAX 10000
+@@ -865,31 +891,9 @@
+ 
+ \------------------------------------------------------------------*/
+ 
+-	uint64_t swap64(uint64_t x) {
+-		uint8_t i;
+-		uint64_t y ;
+-		uint8_t *px, *py;
+-
+-		px = (uint8_t *)&x;
+-		py = (uint8_t *)&y;
+-
+-		for (i=0; i<8; i++) {
+-			*(py+i) = *(px +(7-i));
+-		}
+-		return y;
+-	}
+-
+-	uint64_t ntohll(uint64_t value) {
+-		uint64_t t;
+-//		hdump( &value, 8, "\nUxx: ");
+-		if (1==ntohl(1)) {
+-			return value;
+-		} else {
+-			t = swap64(value);
+-//			hdump( &t, 8, "\nSWP: ");
+-			return t;
+-		}
+-	}
++	/* swap64 / u_ntohll hoisted to file scope (clang rejects GCC nested
++	 * functions); ntohll renamed -> u_ntohll to avoid the macOS
++	 * <sys/_endian.h> ntohll macro collision. See definitions near the top. */
+ 
+ 	/*-----------------------------------------------------------------\
+ 	  Date Code:	: 20131008-182215
+@@ -1009,7 +1013,7 @@
+ 								  uint64_t nn;
+ 								  double *zz;
+ 								  memcpy(&n, payload->mapped_data +payload->cells[t].o, 8 );
+-								  nn = (double) ntohll(n);
++								  nn = (double) u_ntohll(n);
+ //									hdump( &nn, 8, "\nFPPP: ");
+ 									zz = (double *)&nn;
+ 								  fprintf(stdout,"%f",*zz); 

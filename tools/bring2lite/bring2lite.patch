@@ -1,0 +1,84 @@
+--- a/classes/gui.py
++++ b/classes/gui.py
+@@ -46,7 +46,7 @@
+             argparser.print_help()
+             exit(666)
+ 
+-        if args.gui is '1':
++        if args.gui == '1':
+             self.gui_on = TRUE
+ 
+         if self.gui_on:
+@@ -107,9 +107,9 @@
+                 self.output = os.path.abspath(args.out)
+ 
+             #CSV = 0 | XML = 1 | JSON = 2
+-            if args.format is 'XML':
++            if args.format == 'XML':
+                 self.format = 1
+-            elif args.format is 'JSON':
++            elif args.format == 'JSON':
+                 self.format = 2
+ 
+     def radio_select(self):
+--- a/classes/sqlite_parser.py
++++ b/classes/sqlite_parser.py
+@@ -137,7 +137,7 @@
+                                                             str(counter) + "-page-freeblocks", freeblocks)
+                 """search for unallocated areas or empty pages"""
+                 p_parser = PotentiallyParser()
+-                if result is not 2 and result is not 10:
++                if result != 2 and result != 10:
+                     result = p_parser.parse_page(one_page, self.filename)
+                     if result:
+                         d["body"][self.current_page]["unalloc"] = result
+--- a/classes/journal_parser.py
++++ b/classes/journal_parser.py
+@@ -62,9 +62,9 @@
+             self.magic = self.journal_header[0]
+             self.page_count = self.journal_header[1]
+             self.initial_size_of_the_database_in_pages = self.journal_header[3]
+-            if self.journal_header[4] is not 0:
++            if self.journal_header[4] != 0:
+                 self.header_padding = self.journal_header[4]
+-            if self.page_size is 0:
++            if self.page_size == 0:
+                 self.page_size = self.journal_header[5]
+         self.logger.debug("end read journal header ")
+         if not self.page_size:
+--- a/classes/visualizer.py
++++ b/classes/visualizer.py
+@@ -155,13 +155,13 @@
+         counter_unalloc = 0
+         for j, number in enumerate(iter_list):
+             for k, v in (self.data["body"][number]).items():
+-                if k is 'page':
++                if k == 'page':
+                     for i, entrys in enumerate(v):
+                         self.result_table_data.setItem(counter_regular, 0, QTableWidgetItem(str(number)))
+                         for l, single_entry in enumerate(entrys):
+                             self.result_table_data.setItem(counter_regular, l+1,  QTableWidgetItem(str(single_entry[1])))
+                         counter_regular += 1
+-                elif k is 'unalloc':
++                elif k == 'unalloc':
+                     for i, entrys in enumerate(v):
+                         self.result_table_unallocated.setItem(counter_unalloc, 0, QTableWidgetItem(str(number)))
+                         for l, single_entry in enumerate(entrys):
+@@ -172,7 +172,7 @@
+         result = 0
+         for j, number in enumerate(self.data["schema_related_pages"][self.selected_root_page]):
+             for k, v in (self.data["body"][number]).items():
+-                if k is "page":
++                if k == "page":
+                     result += len(v)
+         return result
+ 
+@@ -180,7 +180,7 @@
+         result = 0
+         for j, number in enumerate(self.data["schema_related_pages"][self.selected_root_page]):
+             for k, v in (self.data["body"][number]).items():
+-                if k is "unalloc":
++                if k == "unalloc":
+                     result += len(v)
+         return result
+ 

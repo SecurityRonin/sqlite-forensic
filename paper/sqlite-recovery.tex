@@ -1,16 +1,17 @@
 % =============================================================================
 % Deleted-Record Recovery from SQLite Databases
 % A reference implementation and a multi-oracle forensic evaluation
-% pdfLaTeX + CJKutf8, two-column  (builds under Overleaf/arXiv default engine)
-% Build: pdflatex -> bibtex -> pdflatex x2   (see Makefile)
+% XeLaTeX + xeCJK, two-column  (Overleaf: set the compiler to XeLaTeX)
+% Build: xelatex -> bibtex -> xelatex x2   (see Makefile)
 % =============================================================================
 \documentclass[10pt,a4paper]{article}
 
 % --- Packages ----------------------------------------------------------------
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{CJKutf8}
-\usepackage{lmodern}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{Songti TC}
+\setCJKsansfont{Songti TC}
+\setCJKmonofont{Songti TC}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{booktabs}
 \usepackage{multirow}
@@ -45,8 +46,8 @@
     urlcolor=blue!60!black,
 }
 
-% inline simplified-Chinese helper (pdfLaTeX + CJKutf8)
-\newcommand{\zh}[1]{\begin{CJK}{UTF8}{gbsn}#1\end{CJK}}
+% xeCJK handles CJK natively
+\newcommand{\zh}[1]{#1}
 \newcommand{\orcidlink}[1]{%
   \href{https://orcid.org/#1}{\textcolor{green!50!black}{\textsf{iD}}}%
 }

@@ -26,14 +26,17 @@ CSV_PATH = HERE / "img" / "comparison_metrics.csv"
 PNG_PATH = HERE / "img" / "recovery-comparison.png"
 
 # Tool -> colour; category -> marker.
+# SQL-DRP is omitted from the chart: it emits space-joined string blobs, not
+# per-column records, so it scores 0 under the (col1,col2) identity metric -- a
+# capability boundary, not a recovery failure (see recovery-comparison.md). It is
+# kept in the table and prose, but plotting a metric-artifact 0 misrepresents it.
 TOOL_COLOR = {
     "ours": "#1b9e8a",        # teal
     "fqlite": "#e6840f",      # orange
     "undark": "#d62728",      # red
     "bring2lite": "#7570b3",  # purple
-    "sqldrp": "#666666",      # grey
 }
-TOOL_ORDER = ["ours", "fqlite", "undark", "bring2lite", "sqldrp"]
+TOOL_ORDER = ["ours", "fqlite", "undark", "bring2lite"]
 CAT_MARKER = {"0C": "o", "0D": "s", "0E": "^"}
 CAT_ORDER = ["0C", "0D", "0E"]
 

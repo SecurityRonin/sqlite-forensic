@@ -292,26 +292,3 @@ are not an apples-to-apples leaderboard — the apples-to-apples cell is the
 local Undark row, run on the **same** bytes as our carve. As with recall,
 throughput is not the headline: the survey's contribution and ours is **false
 positives** and **substrate coverage**, not raw speed.
-
-## Survey-informed capabilities
-
-The survey's analysis surfaced these needs — now shipped `sqlite4n6` features:
-
-- **Throughput measurement.** A large-DB (≈100 MB) timing harness — `carve
-  --format jsonl` runs in ~15.3 s on a 100 MB database, reported alongside the
-  survey's tools (see the Throughput section above).
-- **`table_instance_risk` drop-recreate hint.** Residue attributed to an
-  `AUTOINCREMENT` table carries a `table_instance_risk` flag when its `rowid`
-  exceeds the table's `sqlite_sequence` high-water mark (Detector A), plus a
-  table-level flag when a `-wal`/`-journal` sidecar's prior `sqlite_master` shows a
-  table absent or with a different CREATE SQL (Detector B,
-  `sidecar_schema_changed(table)`). It is a non-overclaiming **hint** — consistent
-  with prior-incarnation residue, but also explainable by an `UPDATE` /
-  `sqlite_sequence` edit / current-instance deletion — AUTOINCREMENT-only for
-  Detector A, never a predecessor assertion, never a reroute or tier change. The
-  plain-`INTEGER PRIMARY KEY` and same-schema drop+recreate cases stay unflagged
-  (genuinely undecidable from a bare snapshot / indistinguishable from a benign
-  page move).
-- **WAL-checkpoint acquisition warning.** The `SQLITE-WAL-UNCHECKPOINTED` audit
-  note tells the examiner to acquire the live `-wal` before any tool checkpoints it
-  away — a `-wal` a checkpoint would reclaim is forensically load-bearing.

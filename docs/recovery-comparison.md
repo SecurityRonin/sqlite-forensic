@@ -200,14 +200,18 @@ the same answer key and the same `(col1,col2)` matcher (`BRING2LITE_CMD` =
   [`competitive-landscape.md`](competitive-landscape.md).
 
 ![Precision-recall plane plus F1 and F0.5 grouped bars for ours, undark,
-fqlite, bring2lite, and SQL-DRP across categories 0C/0D/0E](img/recovery-comparison.png)
+fqlite, and bring2lite across categories 0C/0D/0E](img/recovery-comparison.png)
 
 The figure plots the **same harness-computed numbers** as the table above:
 `forensic/tests/nemetz_tool_comparison.rs` writes the per-(tool, category)
 `recall_substrate`, `precision`, `F1`, and `F0.5` to
 [`img/comparison_metrics.csv`](img/comparison_metrics.csv) when run with the
 undark/fqlite oracles, and `docs/plot_comparison.py` renders the chart straight
-from that CSV — chart and table are the same dataset by construction. By **F1**
+from that CSV — chart and table are the same dataset by construction. SQL-DRP is
+omitted from the chart: it scores 0 under the `(col1,col2)` identity metric because
+it emits space-joined string blobs, not per-column records — a measured capability
+boundary (kept in the table and detailed below), not a recovery failure, and a
+metric-artifact 0 would misrepresent it as plotted. By **F1**
 (balanced), sqlite-forensic leads `0C` (0.909 vs fqlite 0.798); under **F0.5**
 (precision-weighted — the forensic β, since a phantom row costs an examiner more
 than a missed low-confidence one) the `0C` lead widens (0.962 vs fqlite 0.798). The `0E`

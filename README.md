@@ -105,19 +105,19 @@ Need a queryable database instead? Choose `-f db` to write `<name>.carved.db` (o
 
 Each `recovered_<table>` row also carries a `table_instance_risk` column — a non-overclaiming **hint** (not an attribution tier), empty unless the residue is consistent with predating the current table instance: `rowid_exceeds_autoinc_highwater(r=…,seq=…)` (Detector A — a carved rowid above the `AUTOINCREMENT` high-water mark) or `sidecar_schema_changed(table)` (Detector B — a `-wal`/`-journal` sidecar whose prior schema differs). The hint is framed honestly: *consistent with* prior-incarnation residue, but also explainable by an `UPDATE`, a manual `sqlite_sequence` edit, or a current-instance deletion — it never asserts a predecessor or a drop+recreate, and a same-schema drop+recreate (indistinguishable from a benign `VACUUM` page move) is deliberately never flagged.
 
-Want a queryable database, the file elsewhere, or a stream instead? One `-f` choice picks one output (`xlsx` the default workbook, `db` the carved-only database, or a stdout rendering):
+Want a queryable database, a different file, or a stream instead? One `-f` choice picks one output. Every format writes a derived-name file by default (`<stem>.recovered.xlsx` for the workbook, `<stem>.carved.{db,jsonl,csv,txt}` for the raw carved records); `-o <FILE>` sets an exact path and `-o -` streams to stdout:
 
 ```console
-$ sqlite4n6 carve ChatStorage.sqlite -f db              # write the queryable <name>.carved.db instead
+$ sqlite4n6 carve ChatStorage.sqlite -f db              # → ChatStorage.carved.db (queryable)
+$ sqlite4n6 carve ChatStorage.sqlite -f jsonl           # → ChatStorage.carved.jsonl (one JSON object/record)
+$ sqlite4n6 carve ChatStorage.sqlite -f csv             # → ChatStorage.carved.csv
 $ sqlite4n6 carve ChatStorage.sqlite -o /cases/2026-001/case.xlsx  # exact output path (honored verbatim)
-$ sqlite4n6 carve ChatStorage.sqlite -f table           # recovered rows to stdout (or: csv, jsonl)
-$ sqlite4n6 carve ChatStorage.sqlite -f jsonl           # one JSON object per record (BLOBs as base64)
+$ sqlite4n6 carve ChatStorage.sqlite -f jsonl -o - | jq # stream to stdout for piping (no summary line)
 $ sqlite4n6 carve ChatStorage.sqlite --min-confidence medium  # drop low-confidence carves
-$ sqlite4n6 carve ChatStorage.sqlite -f rowids          # just the recovered rowids
 $ sqlite4n6 audit ChatStorage.sqlite                    # severity-graded anomaly findings
 ```
 
-The workbook (`xlsx`) and the carved database (`db`) are now one-output-per-run choices — pick whichever you need; run twice for both.
+One output per run — pick the format you need; run again for another. **Blob fidelity differs by format:** `db` (native bytes) and `jsonl` (`blob_base64`) preserve blob *content* losslessly; `csv` and `table` render a blob as a `<blob:N bytes>` placeholder (only the byte count survives), so reach for `db` or `jsonl` when blob content — recovered images, say — must be kept.
 
 Under the hood `sqlite4n6` reads the raw file format itself — freelist pages, in-page free blocks, dropped-table pages, an uncheckpointed WAL overlay, and the **rollback journal** — recovering what the live `sqlite3`/rusqlite path cannot, because that path reads the live b-tree and stops.
 
@@ -147,7 +147,7 @@ Under the hood `sqlite4n6` reads the raw file format itself — freelist pages, 
 When a `-wal` sidecar is present, `carve` auto-detects it and carves the **full per-commit WAL timeline** — every materializable state, each labelled with its log-sequence coordinate: the on-disk base image, **each commit snapshot** of the WAL, and the uncheckpointed WAL-frame residue. A row deleted late in a transaction history is still a live cell in an *earlier* commit's page image, so the snapshot column tells you the exact committed state a deleted row was last alive in. This is the real N-snapshot temporal model — not a two-point on-disk-vs-latest approximation.
 
 ```console
-$ sqlite4n6 carve chat.db -f table                   # auto-detects chat.db-wal
+$ sqlite4n6 carve chat.db -f table -o -               # auto-detects chat.db-wal; stream to stdout
   page    offset     rowid  recovery_source   conf  snapshot                            values
      2      1581       130  commit-snapshot   0.90  commit:(3131615003,3836839008,0)    130 | bob | secret body 130
      2      1261         ?  commit-snapshot   0.40  commit:(3131615003,3836839008,1)    NULL | NULL | ...
@@ -204,7 +204,7 @@ state survives in a rollback journal; `DELETE`-mode (file unlinked) and
 
 **Set 2 — fragments (Tier-2, shown by default).** When a row's full identity is destroyed but a single distinctive cell survives contiguously (a `TEXT` of `≥ 4` bytes, or a `REAL`), that lone value is salvaged as a **fragment**. A fragment has no rowid and is *not a row* — it is the partial evidence one surviving cell can still anchor ("this value was here"), never the stronger claim a full row makes ("this row was here").
 
-The two sets stay apart by construction: separate tables in the rebuilt db (and separate sections in the text output), suppressed together with `--no-fragments`, and excluded from `-f rowids` (a fragment carries no rowid). Set 1 is the precision-first surface; Set 2 is the recall safety net that refuses to overclaim.
+The two sets stay apart by construction: separate tables in the rebuilt db (and separate sections in the text output), suppressed together with `--no-fragments`. Set 1 is the precision-first surface; Set 2 is the recall safety net that refuses to overclaim.
 
 ---
 

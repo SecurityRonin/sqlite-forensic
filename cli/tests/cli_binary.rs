@@ -55,65 +55,125 @@ fn fragment_fixture() -> PathBuf {
     data_dir().join("nemetz/0D/0D-01.db")
 }
 
-/// `carve -f table` renders deleted records from a real database with
-/// deletions to stdout and exits 0. The table stdout mode keeps the Tier-2
-/// fragment section, so this also drives the fragment render + dedup path.
+/// `carve -f table` writes the carved records to the derived-name file
+/// `<stem>.carved.txt` by default (no `-o`), prints a `wrote …` summary, and
+/// exits 0. The table format keeps the Tier-2 fragment section, so this also
+/// drives the fragment render + dedup path.
 #[test]
-fn carve_table_happy_path() {
+fn carve_table_writes_derived_txt_file() {
+    let dir = Scratch::new("stream_table");
+    let db = dir.join("deleted_places.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+
     let out = bin()
-        .args(["carve"])
-        .arg(data_dir().join("deleted_places.db"))
-        .args(["-f", "table"])
+        .current_dir(&dir.0)
+        .args(["carve", "deleted_places.db", "-f", "table"])
         .output()
         .expect("run carve");
-    assert!(out.status.success(), "carve must exit 0");
-    assert!(!out.stdout.is_empty(), "carve must emit output");
+    assert!(out.status.success(), "carve -f table must exit 0");
+
+    let txt = dir.join("deleted_places.carved.txt");
+    assert!(
+        txt.exists(),
+        "default -f table writes <stem>.carved.txt in the CWD"
+    );
+    assert!(
+        !std::fs::read_to_string(&txt).unwrap().is_empty(),
+        "the written table file must carry the rendered rows"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("record(s)") && stdout.contains("deleted_places.carved.txt"),
+        "summary line names the count and the derived file, got: {stdout:?}"
+    );
 }
 
-/// The `-f csv` and `-f jsonl` branches each drive a distinct
-/// renderer and the `FormatArg -> OutputFormat` conversion.
+/// The `-f csv` and `-f jsonl` branches each write their own derived-name file
+/// (`<stem>.carved.csv` / `.carved.jsonl`) by default.
 #[test]
-fn carve_csv_and_jsonl_formats() {
+fn carve_csv_and_jsonl_write_derived_files() {
     for fmt in ["csv", "jsonl"] {
+        let dir = Scratch::new(&format!("stream_{fmt}"));
+        let db = dir.join("deleted_places.db");
+        std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+
         let out = bin()
-            .args(["carve"])
-            .arg(data_dir().join("deleted_places.db"))
-            .args(["-f", fmt])
+            .current_dir(&dir.0)
+            .args(["carve", "deleted_places.db", "-f", fmt])
             .output()
             .expect("run carve");
         assert!(out.status.success(), "carve -f {fmt} must exit 0");
-        assert!(!out.stdout.is_empty(), "carve -f {fmt} must emit output");
+
+        let file = dir.join(&format!("deleted_places.carved.{fmt}"));
+        assert!(file.exists(), "default -f {fmt} writes <stem>.carved.{fmt}");
+        assert!(
+            !std::fs::read_to_string(&file).unwrap().is_empty(),
+            "the {fmt} file must carry the rendered rows"
+        );
     }
 }
 
-/// `-f rowids` prints recovered rowids, one per line — every non-empty line is
-/// a bare integer, and the fragment section is coherently omitted.
+/// `-o -` streams a format to STDOUT (the piping escape): the rendered rows go to
+/// stdout, NO file is written, and NO `wrote …` summary line is printed.
 #[test]
-fn carve_rowid_only_prints_integers() {
+fn carve_dash_out_streams_to_stdout_without_summary() {
+    let dir = Scratch::new("stream_dash");
+    let db = dir.join("deleted_places.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "deleted_places.db", "-f", "jsonl", "-o", "-"])
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "carve -f jsonl -o - must exit 0");
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(!stdout.is_empty(), "the stream must reach stdout");
+    assert!(
+        !stdout.contains("wrote ") || !stdout.contains("record(s) "),
+        "no summary line on a -o - stream, got: {stdout:?}"
+    );
+    assert!(
+        !dir.join("deleted_places.carved.jsonl").exists(),
+        "-o - must NOT write a derived file"
+    );
+}
+
+/// The dropped `rowids` format value is rejected by clap (a flat rowid list is
+/// misleading under WAL/journal multi-version recovery + rowid reuse + destroyed
+/// rowids), with a nonzero exit rather than a silent fallback.
+#[test]
+fn carve_rowids_format_is_rejected() {
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("deleted_places.db"))
         .args(["-f", "rowids"])
         .output()
         .expect("run carve");
-    assert!(out.status.success());
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
-        assert!(
-            line.trim().parse::<i64>().is_ok(),
-            "--rowid-only line must be a bare rowid, got {line:?}"
-        );
-    }
+    assert!(
+        !out.status.success(),
+        "-f rowids must be rejected as an unknown value"
+    );
 }
 
-/// `--no-fragments` opts into the high-precision full-row-only stdout output and
-/// still exits 0 (a stdout-mode flag, paired here with `-f table`).
+/// `--no-fragments` opts into the high-precision full-row-only stream output and
+/// still exits 0 (paired here with `-f table`, written to its derived file).
 #[test]
 fn carve_no_fragments() {
+    let dir = Scratch::new("stream_nofrag");
+    let db = dir.join("deleted_places.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+
     let out = bin()
-        .args(["carve"])
-        .arg(data_dir().join("deleted_places.db"))
-        .args(["-f", "table", "--no-fragments"])
+        .current_dir(&dir.0)
+        .args([
+            "carve",
+            "deleted_places.db",
+            "-f",
+            "table",
+            "--no-fragments",
+        ])
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve --no-fragments must exit 0");
@@ -135,6 +195,84 @@ fn carve_auto_detects_wal_sidecar() {
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve over a WAL db must exit 0");
+}
+
+/// A stream format over a WAL db (`-f csv -o -`) drives the WAL-applied stream
+/// branch — the snapshot (LSN) column path — and emits the carved rows (with the
+/// `snapshot` header) to stdout.
+#[test]
+fn carve_stream_over_wal_renders_snapshot_column() {
+    let out = bin()
+        .args(["carve"])
+        .arg(data_dir().join("wal_places.db"))
+        .args(["-f", "csv", "-o", "-"])
+        .output()
+        .expect("run carve");
+    assert!(
+        out.status.success(),
+        "carve -f csv -o - over a WAL db must exit 0"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("snapshot"),
+        "the WAL stream carries the snapshot (LSN) column header: {stdout:?}"
+    );
+}
+
+/// `-o -` works for the binary file formats too: `-f db -o -` writes the rebuilt
+/// SQLite database bytes to stdout (the `emit_bytes` stdout arm), re-openable as a
+/// valid database, with no summary line and no file written.
+#[test]
+fn carve_db_streams_bytes_to_stdout() {
+    let dir = Scratch::new("db_dash");
+    let db = dir.join("deleted_places.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "deleted_places.db", "-f", "db", "-o", "-"])
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "carve -f db -o - must exit 0");
+    // The stdout bytes re-open as a valid SQLite database.
+    let rebuilt = sqlite_core::Database::open(out.stdout).expect("stdout must be valid SQLite");
+    let schema = rebuilt.read_table(1, 5).unwrap();
+    assert!(
+        schema.iter().any(|r| matches!(
+            r.values.get(1),
+            Some(sqlite_core::Value::Text(n)) if n.starts_with("recovered_")
+        )),
+        "the streamed db carries a recovered_* table"
+    );
+    assert!(
+        !dir.join("deleted_places.carved.db").exists(),
+        "-o - must NOT write a derived file"
+    );
+}
+
+/// `-f xlsx -o -` streams the workbook bytes to stdout (the xlsx `emit_bytes`
+/// stdout arm) — a valid zip (xlsx) container, no file written, no summary line.
+#[test]
+fn carve_xlsx_streams_bytes_to_stdout() {
+    let dir = Scratch::new("xlsx_dash");
+    let db = dir.join("deleted_places.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "deleted_places.db", "-f", "xlsx", "-o", "-"])
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "carve -f xlsx -o - must exit 0");
+    // xlsx is a zip container — it starts with the PK local-file-header magic.
+    assert!(
+        out.stdout.starts_with(b"PK\x03\x04"),
+        "stdout must be xlsx (zip) bytes"
+    );
+    assert!(
+        !dir.join("deleted_places.recovered.xlsx").exists(),
+        "-o - must NOT write a derived file"
+    );
 }
 
 /// `--no-wal` collapses a WAL database to the on-disk-only view (the
@@ -310,6 +448,64 @@ fn carve_db_format_out_flag_honors_exact_path() {
     );
 }
 
+/// `-f jsonl -o <FILE>` writes the JSONL stream to exactly the path given (verbatim,
+/// no extension rewriting) and prints the `wrote …` summary naming that file.
+#[test]
+fn carve_stream_out_flag_honors_exact_path() {
+    let dir = Scratch::new("out_exact_jsonl");
+    let target = dir.join("custom.jsonl");
+    let out = bin()
+        .args(["carve"])
+        .arg(data_dir().join("deleted_places.db"))
+        .args(["-f", "jsonl"])
+        .arg("-o")
+        .arg(&target)
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "carve -f jsonl -o must exit 0");
+    assert!(
+        target.exists(),
+        "the jsonl stream must land at exactly the -o path"
+    );
+    assert!(
+        !dir.join("custom.carved.jsonl").exists(),
+        "-o is verbatim: no <stem>.carved.jsonl is derived"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("record(s)") && stdout.contains("custom.jsonl"),
+        "the summary names the -o file, got: {stdout:?}"
+    );
+}
+
+/// The evidence-clobber guard fires for a STREAM `-o` too: pointing `-f jsonl -o`
+/// at the evidence db itself is refused and leaves the evidence byte-identical.
+#[test]
+fn carve_stream_out_collision_with_evidence_is_refused() {
+    let dir = Scratch::new("stream_guard");
+    let db = dir.join("case.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+    let before = std::fs::read(&db).unwrap();
+
+    let out = bin()
+        .args(["carve"])
+        .arg(&db)
+        .args(["-f", "jsonl"])
+        .arg("-o")
+        .arg(&db)
+        .output()
+        .expect("run carve");
+    assert!(
+        !out.status.success(),
+        "a stream -o onto the evidence db must be refused"
+    );
+    let after = std::fs::read(&db).unwrap();
+    assert_eq!(
+        before, after,
+        "the evidence file must be left byte-identical"
+    );
+}
+
 /// The safety guard refuses to write an output over the evidence database. Here
 /// the evidence is named `case.recovered.xlsx` and `-o` points exactly at it, so
 /// the workbook would land on the evidence: refused, evidence untouched.
@@ -372,6 +568,39 @@ fn audit_happy_path() {
         .output()
         .expect("run audit");
     assert!(out.status.success(), "audit must exit 0");
+}
+
+/// The non-default `audit --format` values (`csv`, `jsonl`) drive the remaining
+/// `AuditFormatArg -> OutputFormat` conversion arms.
+#[test]
+fn audit_csv_and_jsonl_formats() {
+    for fmt in ["csv", "jsonl"] {
+        let out = bin()
+            .args(["audit"])
+            .arg(data_dir().join("deleted_places.db"))
+            .args(["--format", fmt])
+            .output()
+            .expect("run audit");
+        assert!(out.status.success(), "audit --format {fmt} must exit 0");
+    }
+}
+
+/// The non-default `--min-confidence` levels drive the remaining
+/// `ConfidenceArg -> MinConfidence` conversion arms (low/medium/high/critical).
+#[test]
+fn carve_min_confidence_levels_all_parse() {
+    for level in ["low", "medium", "high", "critical"] {
+        let out = bin()
+            .args(["carve"])
+            .arg(data_dir().join("deleted_places.db"))
+            .args(["-f", "jsonl", "-o", "-", "--min-confidence", level])
+            .output()
+            .expect("run carve");
+        assert!(
+            out.status.success(),
+            "carve --min-confidence {level} must exit 0"
+        );
+    }
 }
 
 /// A nonexistent file is a read error: the shell must turn it into a nonzero exit
@@ -1626,10 +1855,10 @@ fn xlsx_combined_folds_rollback_journal_recovery() {
     assert_eq!(superseded, 100, "target is the full 100/100 modifications");
 }
 
-/// The stdout text surfaces (here `--format jsonl`) also surface the rollback
-/// journal's recovered prior rows, tagged `rollback-journal`, when a `<db>-journal`
-/// is in play. Drives the stdout journal-records path end to end against the
-/// committed `CFReDS` SFT-03 PERSIST pair (copied to a scratch dir).
+/// The stream text surfaces (here `-f jsonl -o -` to stdout) also surface the
+/// rollback journal's recovered prior rows, tagged `rollback-journal`, when a
+/// `<db>-journal` is in play. Drives the stream journal-records path end to end
+/// against the committed `CFReDS` SFT-03 PERSIST pair (copied to a scratch dir).
 #[test]
 fn stdout_carve_surfaces_rollback_journal_records() {
     let dir = Scratch::new("journal_stdout");
@@ -1647,12 +1876,19 @@ fn stdout_carve_surfaces_rollback_journal_records() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "SFT-03_PERSIST_ios.sqlite", "-f", "jsonl"])
+        .args([
+            "carve",
+            "SFT-03_PERSIST_ios.sqlite",
+            "-f",
+            "jsonl",
+            "-o",
+            "-",
+        ])
         .output()
         .expect("run carve");
     assert!(
         out.status.success(),
-        "carve --format jsonl must exit 0: {}",
+        "carve -f jsonl -o - must exit 0: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -1673,6 +1909,8 @@ fn stdout_carve_surfaces_rollback_journal_records() {
             "SFT-03_PERSIST_ios.sqlite",
             "-f",
             "jsonl",
+            "-o",
+            "-",
             "--no-journal",
         ])
         .output()
@@ -1733,7 +1971,7 @@ fn carved_db_carries_table_instance_risk_column() {
     );
 }
 
-/// `carve --format jsonl` over the AUTOINCREMENT fixture emits a
+/// `carve -f jsonl -o -` over the AUTOINCREMENT fixture emits a
 /// `table_instance_risk` field on every record: the evidence token for the
 /// residue rows above the high-water mark, `null` otherwise.
 #[test]
@@ -1741,10 +1979,10 @@ fn carve_jsonl_carries_table_instance_risk_field() {
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("drop_recreate/b_autoinc.db"))
-        .args(["-f", "jsonl"])
+        .args(["-f", "jsonl", "-o", "-"])
         .output()
-        .expect("run carve --format jsonl");
-    assert!(out.status.success(), "carve --format jsonl must exit 0");
+        .expect("run carve -f jsonl -o -");
+    assert!(out.status.success(), "carve -f jsonl -o - must exit 0");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
         stdout.contains("\"table_instance_risk\""),
@@ -1753,5 +1991,130 @@ fn carve_jsonl_carries_table_instance_risk_field() {
     assert!(
         stdout.contains("rowid_exceeds_autoinc_highwater"),
         "the residue rows above the high-water mark carry the evidence token"
+    );
+}
+
+// ---- lossy-format BLOB-truncation warning -----------------------------------
+
+/// A `secure_delete=OFF` db with a single deleted row carrying a distinctive BLOB,
+/// so the carve recovers exactly one blob cell. `auto_vacuum=0` keeps the freed
+/// bytes in place for recovery.
+const DELETED_BLOB_SCRIPT: &str = "\
+PRAGMA secure_delete=OFF;\n\
+PRAGMA auto_vacuum=0;\n\
+CREATE TABLE t (id INTEGER, data BLOB);\n\
+INSERT INTO t VALUES (1, x'deadbeefcafe0011223344');\n\
+DELETE FROM t WHERE id=1;\n";
+
+/// A blob-free `secure_delete=OFF` db: a deleted text row, no BLOB anywhere, so the
+/// lossy-format warning must stay silent (no noise on clean data).
+const DELETED_TEXT_SCRIPT: &str = "\
+PRAGMA secure_delete=OFF;\n\
+PRAGMA auto_vacuum=0;\n\
+CREATE TABLE t (id INTEGER, name TEXT);\n\
+INSERT INTO t VALUES (1, 'alice');\n\
+DELETE FROM t WHERE id=1;\n";
+
+/// `-f csv` and `-f table` over a db whose carve recovers a BLOB warn LOUDLY on
+/// stderr that blob content was truncated to a `<blob:N bytes>` placeholder (the
+/// fail-loud discipline — silent evidence loss is the bug), with a count ≥ 1.
+/// stdout stays clean (the warning is on stderr). Skips when `sqlite3` is absent.
+#[test]
+fn lossy_csv_and_table_warn_on_blob_truncation() {
+    let Some(sqlite3) = sqlite3_bin() else {
+        eprintln!("SKIP lossy_csv_and_table_warn_on_blob_truncation: no sqlite3");
+        return;
+    };
+    for fmt in ["csv", "table"] {
+        let dir = Scratch::new(&format!("blobwarn_{fmt}"));
+        let db = dir.join("blob.db");
+        mint_db(&sqlite3, &db, DELETED_BLOB_SCRIPT);
+
+        let out = bin()
+            .current_dir(&dir.0)
+            .args(["carve", "blob.db", "-f", fmt, "-o", "-"])
+            .output()
+            .expect("run carve");
+        assert!(out.status.success(), "carve -f {fmt} -o - must exit 0");
+
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("BLOB value(s) were truncated")
+                && stderr.contains(&format!("in {fmt} output"))
+                && stderr.contains("-f db` or `-f jsonl`"),
+            "-f {fmt} must warn about truncated blobs on stderr, got: {stderr:?}"
+        );
+        // The count is real: at least the one recovered blob cell.
+        let count: i64 = stderr
+            .split_whitespace()
+            .find_map(|w| w.parse().ok())
+            .unwrap_or(0);
+        assert!(
+            count >= 1,
+            "-f {fmt} warning must carry a count ≥ 1: {stderr}"
+        );
+
+        // stdout carries the rendered stream, never the warning.
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            !stdout.contains("BLOB value(s) were truncated"),
+            "the warning must go to stderr, not stdout"
+        );
+    }
+}
+
+/// The blob-preserving formats (`jsonl`, `db`) NEVER warn, even when the carve
+/// recovers a BLOB — they export the content losslessly. Skips without `sqlite3`.
+#[test]
+fn lossless_formats_never_warn_on_blobs() {
+    let Some(sqlite3) = sqlite3_bin() else {
+        eprintln!("SKIP lossless_formats_never_warn_on_blobs: no sqlite3");
+        return;
+    };
+    // jsonl streams to stdout; db writes a file. Neither warns.
+    for args in [
+        vec!["carve", "blob.db", "-f", "jsonl", "-o", "-"],
+        vec!["carve", "blob.db", "-f", "db"],
+    ] {
+        let dir = Scratch::new("blobnowarn");
+        let db = dir.join("blob.db");
+        mint_db(&sqlite3, &db, DELETED_BLOB_SCRIPT);
+
+        let out = bin()
+            .current_dir(&dir.0)
+            .args(&args)
+            .output()
+            .expect("run carve");
+        assert!(out.status.success(), "carve {args:?} must exit 0");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            !stderr.contains("truncated"),
+            "{args:?} preserves blobs and must NOT warn, got: {stderr:?}"
+        );
+    }
+}
+
+/// A blob-free carve never warns, even in the lossy `csv`/`table` formats — no
+/// noise on data that has nothing to lose. Skips without `sqlite3`.
+#[test]
+fn lossy_formats_silent_when_no_blobs() {
+    let Some(sqlite3) = sqlite3_bin() else {
+        eprintln!("SKIP lossy_formats_silent_when_no_blobs: no sqlite3");
+        return;
+    };
+    let dir = Scratch::new("noblob");
+    let db = dir.join("text.db");
+    mint_db(&sqlite3, &db, DELETED_TEXT_SCRIPT);
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "text.db", "-f", "csv", "-o", "-"])
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "carve -f csv -o - must exit 0");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        !stderr.contains("truncated"),
+        "blob-free data must not warn, got: {stderr:?}"
     );
 }

@@ -119,6 +119,17 @@ $ sqlite4n6 audit ChatStorage.sqlite                    # severity-graded anomal
 
 One output per run — pick the format you need; run again for another. **Blob fidelity differs by format:** `db` (native bytes) and `jsonl` (`blob_base64`) preserve blob *content* losslessly; `csv` and `table` render a blob as a `<blob:N bytes>` placeholder (only the byte count survives), so reach for `db` or `jsonl` when blob content — recovered images, say — must be kept.
 
+**Filter by confidence with `--min-confidence`.** Every carved item carries a confidence set by *how* it was recovered; the flag keeps only items at or above a level (default `info`), trading recall for a cleaner sheet:
+
+| `--min-confidence` | keeps |
+|---|---|
+| `info` *(default)*, `low` | everything, including Tier-2 fragments |
+| `medium` | full-row records; drops Tier-2 fragments |
+| `high` | high-confidence rows; also drops free-block reconstructions and text-poor rows |
+| `critical` | only rows with distinctive recovered TEXT |
+
+`--fragments` forces the Tier-2 fragments in regardless of the level; `--no-fragments` drops them entirely. (`info` and `low` behave identically today — no carved item scores between them.) The full confidence-to-recovery-path mapping is in [`recovery-comparison.md`](docs/recovery-comparison.md#filtering-recovered-items-by-confidence).
+
 Under the hood `sqlite4n6` reads the raw file format itself — freelist pages, in-page free blocks, dropped-table pages, an uncheckpointed WAL overlay, and the **rollback journal** — recovering what the live `sqlite3`/rusqlite path cannot, because that path reads the live b-tree and stops.
 
 | | sqlite-forensic | rusqlite / `sqlite3` |

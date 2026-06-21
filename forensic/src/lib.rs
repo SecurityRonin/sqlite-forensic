@@ -58,6 +58,16 @@ pub enum AnomalyKind {
         /// Recovered rowid.
         rowid: i64,
     },
+    /// A `sqlite_master` row was recovered from page-1 free space whose
+    /// definition is absent from the live schema — consistent with a **dropped
+    /// (or replaced)** table/index/view/trigger whose `CREATE` statement and
+    /// existence survive the drop under `secure_delete=OFF`.
+    DroppedSchemaRecovered {
+        /// `sqlite_master.type` — `table`, `index`, `view`, or `trigger`.
+        object_type: String,
+        /// Name of the dropped object.
+        name: String,
+    },
     /// The freelist is non-empty: the database holds free (unallocated) pages.
     /// Consistent with prior deletions (`DELETE` without `VACUUM`); those pages
     /// may retain recoverable deleted records.
@@ -147,6 +157,7 @@ impl AnomalyKind {
                 Severity::Low
             }
             AnomalyKind::DeletedRecordRecovered { .. }
+            | AnomalyKind::DroppedSchemaRecovered { .. }
             | AnomalyKind::WalUncheckpointedState { .. }
             | AnomalyKind::JournalRecoverable { .. }
             | AnomalyKind::JournalSchemaChange { .. }
@@ -164,6 +175,7 @@ impl AnomalyKind {
         match self {
             AnomalyKind::NonZeroReservedSpace { .. } => "SQLITE-RESERVED-SPACE-NONZERO",
             AnomalyKind::DeletedRecordRecovered { .. } => "SQLITE-DELETED-RECORD-RECOVERED",
+            AnomalyKind::DroppedSchemaRecovered { .. } => "SQLITE-DROPPED-SCHEMA-RECOVERED",
             AnomalyKind::NonEmptyFreelist { .. } => "SQLITE-FREELIST-NONEMPTY",
             AnomalyKind::WalUncheckpointedState { .. } => "SQLITE-WAL-UNCHECKPOINTED",
             AnomalyKind::PageCountMismatch { .. } => "SQLITE-PAGECOUNT-MISMATCH",
@@ -193,6 +205,11 @@ impl AnomalyKind {
                 "recovered a record-shaped cell (rowid {rowid}) from unallocated \
                  space at page {page} offset {offset} — consistent with a deleted \
                  row not yet overwritten"
+            ),
+            AnomalyKind::DroppedSchemaRecovered { object_type, name } => format!(
+                "recovered a deleted sqlite_master row for {object_type} \"{name}\" \
+                 from page-1 free space — consistent with a dropped (or replaced) \
+                 {object_type} whose definition survives the drop"
             ),
             AnomalyKind::NonEmptyFreelist { free_pages } => format!(
                 "{free_pages} free page(s) on the freelist — consistent with prior \
@@ -338,6 +355,7 @@ impl Observation for Anomaly {
             // so are a recoverable PERSIST journal and a journaled schema page
             // (the prior schema/rows are recoverable from the journal images).
             AnomalyKind::DeletedRecordRecovered { .. }
+            | AnomalyKind::DroppedSchemaRecovered { .. }
             | AnomalyKind::NonEmptyFreelist { .. }
             | AnomalyKind::JournalRecoverable { .. }
             | AnomalyKind::JournalSchemaChange { .. } => Category::Residue,
@@ -378,6 +396,18 @@ impl Observation for Anomaly {
                     field: "cell_offset".to_string(),
                     value: offset.to_string(),
                     location: Some(Location::ByteOffset(*offset as u64)),
+                },
+            ],
+            AnomalyKind::DroppedSchemaRecovered { object_type, name } => vec![
+                Evidence {
+                    field: "object_type".to_string(),
+                    value: object_type.clone(),
+                    location: None,
+                },
+                Evidence {
+                    field: "name".to_string(),
+                    value: name.clone(),
+                    location: None,
                 },
             ],
             AnomalyKind::NonEmptyFreelist { free_pages } => vec![Evidence {
@@ -1466,6 +1496,16 @@ pub fn audit(db: &Database) -> Vec<Anomaly> {
         out.push(Anomaly::new(AnomalyKind::PageCountMismatch {
             header_pages,
             file_pages,
+        }));
+    }
+
+    // Dropped/replaced schema objects whose sqlite_master row survives in page-1
+    // free space (a DROP under secure_delete=OFF). Surfaced as findings so a
+    // dropped table's existence + name is reported, not just buried in the carve.
+    for schema in recover_dropped_schemas(db) {
+        out.push(Anomaly::new(AnomalyKind::DroppedSchemaRecovered {
+            object_type: schema.object_type,
+            name: schema.name,
         }));
     }
 

@@ -40,6 +40,7 @@ By default the `sqlite4n6 carve` CLI writes a **combined review workbook** (`evi
 | Code | Severity | Observes |
 |---|:-:|---|
 | `SQLITE-DELETED-RECORD-RECOVERED` | Medium | A record-shaped cell recovered from unallocated space. |
+| `SQLITE-DROPPED-SCHEMA-RECOVERED` | Medium | A deleted `sqlite_master` row recovered from page-1 free space — a dropped/replaced table/index/view/trigger and its `CREATE` statement. |
 | `SQLITE-FREELIST-NONEMPTY` | Low | Free pages present — consistent with prior deletions. |
 | `SQLITE-WAL-UNCHECKPOINTED` | Medium | `-wal` overlay the main file does not reflect. |
 | `SQLITE-PAGECOUNT-MISMATCH` | High | Header page count disagrees with file length. |

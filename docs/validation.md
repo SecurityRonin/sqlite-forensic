@@ -36,43 +36,93 @@ No test we authored is independent of our own assumptions, so each capability is
 against a reference we did not write. Seven distinct authors/engines (the SQLite team,
 undark's author, fqlite's author, bring2lite's author, Mari DeGrazia / SQL-DRP, the
 Nemetz team, the DC3 team) plus the `calamine` reader, across C / Java / Python /
-SQLite-C / Rust:
+SQLite-C / Rust. The **Tier** column is the trust axis defined in *Input provenance*
+below: **1** = real third-party ground truth / real-device data; **2** = real-engine
+bytes checked by a derivable answer key or an independent oracle (`sqlite3` / `calamine`),
+with the scenario chosen by us; **3** = we authored both fixture and expected answer with
+no independent check:
 
-| Capability | Independent reference | What it establishes | Machine-checked in |
-|---|---|---|---|
-| Deleted-record **recall & precision** | **Nemetz SQLite Forensic Corpus** (DFRWS-EU 2018, CC0) — the full **141-DB** v2.0 corpus (incl. 9 anti-forensic categories) whose authors shipped a per-row deleted **answer key** | recall + precision as a reproducible per-DB confusion matrix against **third-party ground truth** (the authors wrote both the deletions *and* the key) | `nemetz_metrics.rs` · [`recovery-comparison.md`](recovery-comparison.md) |
-| **Header / encoding reporting** (UTF-8, UTF-16LE, UTF-16BE; page size) | **NIST CFReDS / CFTT** SFT-01 — real-device DBs, NIST-published ground truth + MD5s | page size + text encoding + 100-row table read correctly across all three on-disk encodings (real-device replacement for the self-minted UTF-16 fixtures) | `cfreds_encoding.rs` |
-| **Deleted/modified records** (WAL substrate) | **NIST CFReDS / CFTT** SFT-03 — 100 documented deletes in an uncheckpointed WAL | main-only (pre-delete, 2240 rows) and WAL-applied (post-delete, 2140) states both surfaced, matching NIST's documented delta of 100 | `cfreds_recovery.rs` |
-| **Deleted + modified records** (rollback-journal substrate) | **NIST CFReDS / CFTT** SFT-03 PERSIST — 100 documented deletes + 100 modifications in a `-journal` (ios + android) | `carve_rollback_journal` recovers **100/100 deletes + 100/100 modified prior values** by diffing the journal's pre-transaction snapshot against the live db; the derived oracle (`{1..=2240} \ live PKs`) is cross-checked against NIST's documented IDs | `cfreds_journal_recovery.rs` |
-| **Rollback-journal anomalies** | real sqlite3-engine journals (hot DML, committed-DDL PERSIST) + NIST SFT-03 PERSIST | `audit_journal` emits "consistent with" observations (hot journal, PERSIST-recoverable, checksum mismatch, schema-cookie advance, duplicate page, db-size delta), each showing the offending value; SCHEMA-CHANGE fires only when the journal's prior page-1 image schema cookie differs from the live db's (so DML-only NIST PERSIST does not raise it) | `hot_journal_anomaly.rs`, `cfreds_journal_anomaly.rs` |
-| Deleted-record **carving** | `undark` (C), `fqlite` (Java) — independent carvers | inter-tool **concordance** (agreement, page-level-diagnosed — *not* correctness) | `oracle_differential.rs` (below) |
-| Deleted-record **head-to-head** (carving) | `undark`, `fqlite`, **`bring2lite`** (Python 3), **SQL-DRP / `sqlparse`** (Python 2→3) — four independent carvers, each gated (`UNDARK_BIN` / `FQLITE_TAP` / `BRING2LITE_CMD` / `SQLDRP_CMD`), all scored against the same Nemetz answer key | per-tool precision/recall on the **same** `(col1,col2)` matcher; SQL-DRP's string-carver boundary recorded explicitly (0 cross-tool identities, not a confounded score) | `nemetz_tool_comparison.rs` · [`recovery-comparison.md`](recovery-comparison.md) |
-| **Live b-tree read** | `sqlite3 SELECT` — the engine that wrote the file | live rows read **byte-identical** to the canonical engine | `live_read_matches_sqlite3` |
-| **`.recover` differential** | `sqlite3 .recover` | ours ⊇ `.recover`, 100% content agreement on the overlap | `our_fixture_agrees_with_sqlite3_recover` |
-| **Rebuilt `.carved.db`** | `sqlite3` (`PRAGMA integrity_check`, `SELECT`) | the pure-Rust writer emits a valid DB an external engine reads identically | `rebuild_sqlite3_oracle.rs`, `rebuild_tables_oracle.rs` |
-| **Snapshot-aware reads** (WAL per-commit, overflow-correct) | `sqlite3` on per-commit file snapshots | each commit's table state read byte-for-byte, incl. a 12 KB overflow blob | `wal_snapshot_oracle.rs` |
-| **WAL version history** (current / superseded / deleted, rowid-reuse) | `sqlite3` minted mutation sequence | the per-rowid history matches a known insert/update/delete/reinsert script | `row_history_oracle.rs` |
-| **Output XLSX** (combined temporal workbook, in-cell images) | `calamine` (independent XLSX reader) + `zip` (embedded media) | sheet structure, cell values, the flag columns, and embedded image media read back and verified | `cli/tests/cli_binary.rs` |
-| **No-false-positive** regression | DC3 `sqlite_dissect` corpus — **third-party input** | 0 false positives on no-deletion / dropped-table DBs | `oracle_differential.rs` |
-| **Drop-recreate `table_instance_risk` hint** (Detector A) | real `sqlite3`-minted fixtures + the `sqlite3` `sqlite_sequence` reading | the flag fires on AUTOINCREMENT residue whose `rowid` exceeds `sqlite_sequence` (`b_autoinc` 6..=10, `upd_autoinc` 1000 — the Codex BLOCKER-1 current-instance row), never on the plain-PK recreate (`b_plainpk`), and on **zero** ordinary Nemetz deleted rows (0C-01, 0D-01) — proving no spurious firing | `drop_recreate_risk.rs` |
-| **WAL frame integrity** | SQLite WAL §4.2 cumulative checksum | valid commits vs post-reset residue distinguished | known-vector unit test + `wal_snapshot_oracle.rs` |
+| Capability | Independent reference | What it establishes | Tier | Machine-checked in |
+|---|---|---|:-:|---|
+| Deleted-record **recall & precision** | **Nemetz SQLite Forensic Corpus** (DFRWS-EU 2018, CC0) — the full **141-DB** v2.0 corpus (incl. 9 anti-forensic categories) whose authors shipped a per-row deleted **answer key** | recall + precision as a reproducible per-DB confusion matrix against **third-party ground truth** (the authors wrote both the deletions *and* the key) | 1 | `nemetz_metrics.rs` · [`recovery-comparison.md`](recovery-comparison.md) |
+| **Header / encoding reporting** (UTF-8, UTF-16LE, UTF-16BE; page size) | **NIST CFReDS / CFTT** SFT-01 — real-device DBs, NIST-published ground truth + MD5s | page size + text encoding + 100-row table read correctly across all three on-disk encodings (real-device replacement for the self-minted UTF-16 fixtures) | 1 | `cfreds_encoding.rs` |
+| **Deleted/modified records** (WAL substrate) | **NIST CFReDS / CFTT** SFT-03 — 100 documented deletes in an uncheckpointed WAL | main-only (pre-delete, 2240 rows) and WAL-applied (post-delete, 2140) states both surfaced, matching NIST's documented delta of 100 | 1 | `cfreds_recovery.rs` |
+| **Deleted + modified records** (rollback-journal substrate) | **NIST CFReDS / CFTT** SFT-03 PERSIST — 100 documented deletes + 100 modifications in a `-journal` (ios + android) | `carve_rollback_journal` recovers **100/100 deletes + 100/100 modified prior values** by diffing the journal's pre-transaction snapshot against the live db; the derived oracle (`{1..=2240} \ live PKs`) is cross-checked against NIST's documented IDs | 1 | `cfreds_journal_recovery.rs` |
+| **Rollback-journal anomalies** — RECOVERABLE, SCHEMA-CHANGE arms | the real **NIST SFT-03 PERSIST** artifact + a real-engine committed-DDL PERSIST journal (`ddl_persist`) | `audit_journal` fires PERSIST-RECOVERABLE on the NIST artifact, and SCHEMA-CHANGE only when the journal's prior page-1 schema cookie differs from the live db's — so DML-only NIST PERSIST does **not** raise it | 1 | `cfreds_journal_anomaly.rs`, `hot_journal_anomaly.rs` |
+| **Rollback-journal anomalies** — HOT, CHECKSUM-MISMATCH, DUPLICATE-PAGE, DBSIZE-DELTA arms | a real-engine-minted **hot** journal (`hot.db-journal`) + crafted variants (NIST's artifact is PERSIST-only, so these arms have no real-corpus instance) | `audit_journal` emits the "consistent with" observation for each arm, each showing the offending value; ground truth derivable from the journal-header construction | 2 | `hot_journal_anomaly.rs` |
+| Deleted-record **carving** | `undark` (C), `fqlite` (Java) — independent carvers | inter-tool **concordance** (agreement, page-level-diagnosed — *not* correctness) | 1 | `oracle_differential.rs` (below) |
+| Deleted-record **head-to-head** (carving) | `undark`, `fqlite`, **`bring2lite`** (Python 3), **SQL-DRP / `sqlparse`** (Python 2→3) — four independent carvers, each gated (`UNDARK_BIN` / `FQLITE_TAP` / `BRING2LITE_CMD` / `SQLDRP_CMD`), all scored against the same Nemetz answer key | per-tool precision/recall on the **same** `(col1,col2)` matcher; SQL-DRP's string-carver boundary recorded explicitly (0 cross-tool identities, not a confounded score) | 1 | `nemetz_tool_comparison.rs` · [`recovery-comparison.md`](recovery-comparison.md) |
+| **False-positive benchmark** (B-tree rebalancing, drop+recreate, WAL+secure_delete) | a real-engine **replication** of the 2025 survey's Table-5 construction (Lee, Park, Lee & Choi, *FSI:DI* 55) — **not** the official corpus (not public yet) — scored vs `bring2lite` / SQL-DRP on identical bytes | 0 live-row false positives on the rebalancing scenario where `bring2lite` re-surfaces 13 live rows; FQLite scenario-10 figure is **cited from the paper**, not measured here (its WAL recovery is GUI-coupled) | 2 | `paper_fp_scenarios.rs` · [`competitive-landscape.md`](competitive-landscape.md) |
+| **Live b-tree read** | `sqlite3 SELECT` — the engine that wrote the file | live rows read **byte-identical** to the canonical engine | 2 | `live_read_matches_sqlite3` |
+| **`.recover` differential** | `sqlite3 .recover` | ours ⊇ `.recover`, 100% content agreement on the overlap | 2 | `our_fixture_agrees_with_sqlite3_recover` |
+| **Rebuilt `.carved.db`** | `sqlite3` (`PRAGMA integrity_check`, `SELECT`) | the pure-Rust writer emits a valid DB an external engine reads identically | 2 | `rebuild_sqlite3_oracle.rs`, `rebuild_tables_oracle.rs` |
+| **Snapshot-aware reads** (WAL per-commit, overflow-correct) | `sqlite3` on per-commit file snapshots | each commit's table state read byte-for-byte, incl. a 12 KB overflow blob | 2 | `wal_snapshot_oracle.rs` |
+| **WAL version history** (current / superseded / deleted, rowid-reuse) | `sqlite3` minted mutation sequence | the per-rowid history matches a known insert/update/delete/reinsert script | 2 | `row_history_oracle.rs` |
+| **Output XLSX** (combined temporal workbook, in-cell images) | `calamine` (independent XLSX reader) + `zip` (embedded media) | sheet structure, cell values, the flag columns, and the embedded image media read back and verified — the round-trip is independently checked; only the input image is synthetic | 2 | `cli/tests/cli_binary.rs` |
+| **No-false-positive** regression | DC3 `sqlite_dissect` corpus — **third-party input** | 0 false positives on no-deletion / dropped-table DBs | 1 | `oracle_differential.rs` |
+| **`table_instance_risk` hint** — Detector A (rowid > `sqlite_sequence`) | real `sqlite3`-minted drop-recreate fixtures + the `sqlite3` `sqlite_sequence` reading (answer derivable from construction) | the flag fires on AUTOINCREMENT residue whose `rowid` exceeds the high-water mark (`b_autoinc` 6..=10, `upd_autoinc` 1000 — a current-instance row, proving the flag is a hint, not a predecessor claim), never on the plain-PK recreate (`b_plainpk`), and on **zero** ordinary Nemetz deleted rows | 2 | `drop_recreate_risk.rs` |
+| **`table_instance_risk` hint** — Detector B (sidecar schema change) | real `sqlite3`-minted `-journal` fixtures (answer derivable from construction) | the table-level flag fires when the sidecar's prior CREATE SQL differs (`b_journal_altered`, an `ALTER`), never on a DML-only sidecar (`b_journal_dml`) | 2 | `detector_b.rs` |
+| **Real-device robustness** (no panic) | genuine **Josh Hickman iOS-17** application databases (env-gated, manually downloaded) | the full open → audit → carve pipeline survives every real iOS db **without panic** — a robustness sweep, NOT a known-answer recall test | 1 | `ios_realdata_robustness.rs` |
+| **WAL frame integrity** | SQLite WAL §4.2 cumulative checksum | valid commits vs post-reset residue distinguished | 2 | known-vector unit test + `wal_snapshot_oracle.rs` |
 
-### Input provenance (what is committed vs minted)
+### Input provenance — the three validation tiers
 
-The **carving core** is validated against committed inputs: the independently-authored
-**Nemetz corpus** (the gold standard — committed, CC0), the **NIST CFReDS / CFTT** SQLite
-sets (committed, U.S.-Government public domain, MD5-verified against NIST's published
-hashes — SFT-01 encodings + SFT-03 deleted/modified records across WAL and rollback-journal
-substrates), and the committed synthetic fixtures in
-[`corpus-catalog.md`](corpus-catalog.md). Several newer capabilities (the WAL
-**version history / rowid-reuse**, **snapshot-aware reads**, **in-cell image blobs**,
-**WITHOUT ROWID** handling) are validated by fixtures **minted at test time** (a
-held-reader WAL retained per-commit, a generated image blob) checked against the
-independent reference engine (`sqlite3` / `calamine`) rather than a committed corpus
-file. The validation is real (the reference engine reads back what we produce); the input
-is generated rather than archived. Where a capability is proven only by a synthetic
-fixture with **no corpus instance** (e.g. the freeblock-clobbered *spilled* cell), it is
-marked **unproven-by-corpus** here and in code.
+The axis that matters for a forensic tool is **whether the correctness check is
+trustworthy**, not whether the input bytes were "synthetic". A fixture minted by the real
+SQLite engine and read back by an independent reader is far better validated than a
+hand-encoded fixture we also hand-scored — even though both are "synthetic input". So each
+capability sits in one of three tiers. The one-line rule: **Tier 2 = an independent thing
+(a derivable answer key, or `sqlite3` / `calamine`) confirms we're right; Tier 3 = only we
+say we're right.**
+
+**Tier 1 — real third-party ground truth / real-device data.** An independent third party
+authored the artifact AND (for recall/precision) the answer key, or it is genuine device
+data. Members:
+
+- deleted-record carving **recall + precision** → the Nemetz **141-DB** corpus (its authors
+  wrote both the deletions and the key);
+- **text encoding** (UTF-8 / 16LE / 16BE) → NIST CFReDS **SFT-01**;
+- **WAL** deleted/modified recovery → NIST CFReDS **SFT-03 WAL**;
+- **rollback-journal** recovery (100/100 deletes + 100/100 modifications) → NIST CFReDS
+  **SFT-03 PERSIST**;
+- journal-anomaly **RECOVERABLE** and **SCHEMA-CHANGE** arms → fire on the real NIST PERSIST
+  artifact;
+- **overflow / fragments / freeblock** recovery → the Nemetz corpus;
+- **corrupted-header robustness** → the SharifCTF damaged-header db;
+- **no-false-positives** regression → the DC3 corpus;
+- **inter-tool concordance** → undark / fqlite / bring2lite / SQL-DRP;
+- **real-device no-panic robustness** → the Josh Hickman iOS-17 images (a robustness sweep,
+  NOT a known-answer recall test).
+
+**Tier 2 — real `sqlite3` engine bytes plus a *checkable* answer.** The input is produced by
+the real engine (or read back by an independent reader), and ground truth is either
+DERIVABLE from the documented construction OR confirmed by an INDEPENDENT oracle (`sqlite3`
+/ `calamine`). The validation genuinely confirms correctness; the only weakness is that **we
+chose the scenarios** (a coverage gap — it can miss real-world quirks we did not construct),
+not that the check is untrustworthy. Members:
+
+- `table_instance_risk` **Detector A** (rowid vs `sqlite_sequence`) and **Detector B**
+  (sidecar schema-change) → real-engine-minted drop-recreate fixtures (answer derivable from
+  the construction);
+- journal anomalies **HOT / CHECKSUM-MISMATCH / DUPLICATE-PAGE / DBSIZE-DELTA** → a
+  real-engine-minted hot journal + crafted variants (NIST's artifact is PERSIST-only, so
+  these four arms have no real-corpus instance);
+- the survey **false-positive benchmark** (0F / 0B / 10) → a real-engine **replication** of
+  the paper's Table-5 construction (NOT the byte-identical official corpus, which is not
+  public yet);
+- **throughput** → a minted ~100 MB db;
+- plus the pre-existing WAL **version history / rowid-reuse**, **snapshot reads**, the
+  rebuilt `.carved.db`, and the **in-cell image thumbnails** (`calamine` reads the embedded
+  media back, so the round-trip IS checked; only the input image is synthetic) →
+  minted-at-test-time and checked against `sqlite3` / `calamine`.
+
+**Tier 3 — only WE vouch for it.** We authored BOTH the fixture AND the expected answer, with
+NO independent check, and the scenario is not confirmed to occur in real data (the maximal
+Doer-Checker / "LZNT1 trap" risk). By this strict definition Tier 3 is essentially **just the
+freeblock-clobbered *spilled*-cell path** — `core/src/lib.rs` notes its "real-data behavior is
+not yet observed", and it is flagged **`unproven-by-corpus`** in the code and here. Note in
+particular that the **in-cell image thumbnail is Tier 2, not Tier 3**: `calamine` independently
+reads the embedded media back, so the round-trip is checked.
 
 ### Epistemic stance
 
@@ -83,6 +133,23 @@ timestamps** in the SQLite WAL — the temporal columns surface *logical* commit
 (`commit_seq`), never time. Carved records remain **confidence-graded observations**
 ("consistent with a deleted row"), never a verdict: the tool is validated as *consistent
 with* independent references, **not proven correct**.
+
+**Limitations that bound these tiers, stated plainly:**
+
+- A **same-schema drop+recreate** is undecidable from a single snapshot AND from a sidecar
+  (it is indistinguishable from a benign `VACUUM` page-move). `table_instance_risk` flags only
+  AUTOINCREMENT rowid-overflow (Detector A — a *hint*, not proof) and UNAMBIGUOUS sidecar
+  schema changes (Detector B — different CREATE SQL, or the table absent in the prior), never
+  the same-schema case.
+- **DELETE-mode** (the `-journal` is unlinked) and **TRUNCATE-mode** (it is zeroed) rollback
+  journals leave no in-band residue — recovering those is a disk-carving-layer concern, out of
+  scope here.
+- **Encrypted databases** (SQLCipher / SEE) are out of scope.
+- The survey **false-positive benchmark is a replication** of the paper's construction, not the
+  official corpus (which is not public yet); and **FQLite scenario-10** (WAL + `secure_delete`)
+  is **cited from the paper**, not measured here, because FQLite's WAL recovery is GUI-coupled.
+- A **Boyer-Moore signature scan** is inapplicable by design — this carver is structural (it
+  reads the b-tree / freelist / journal layout), not signature-based.
 
 > **This document is the historical *differential* record; the current capability
 > matrix lives in [`recovery-comparison.md`](recovery-comparison.md).** The page-level

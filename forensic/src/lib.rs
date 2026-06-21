@@ -980,8 +980,61 @@ pub struct RecoveredSchema {
 /// 5-column carved record.
 #[must_use]
 pub fn recover_dropped_schemas(db: &Database) -> Vec<RecoveredSchema> {
-    let _ = db;
-    Vec::new() // RED stub — implemented in the GREEN commit.
+    use std::collections::HashSet;
+    // Live `(name, sql)` pairs — an exactly-live definition carved from page-1
+    // residue is a re-surfaced live row, never a drop.
+    let live: HashSet<(String, String)> = db.schema_sql().into_iter().collect();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out = Vec::new();
+    for rec in carve_all_deleted_records(db) {
+        // A `sqlite_master` row lives only on page 1 (plus its overflow); restrict
+        // there so a 5-column data record elsewhere is never mistaken for schema.
+        if rec.page != 1 {
+            continue;
+        }
+        let Some(schema) = as_schema_row(&rec.values) else {
+            continue;
+        };
+        let key = (schema.name.clone(), schema.sql.clone());
+        if live.contains(&key) {
+            continue;
+        }
+        if seen.insert(key) {
+            out.push(schema);
+        }
+    }
+    out
+}
+
+/// Interpret a carved record as a `sqlite_master` row
+/// `(type, name, tbl_name, rootpage, sql)`, or `None` if it does not match that
+/// shape. `type` must be one of the four schema object kinds, the `name` /
+/// `tbl_name` / `sql` columns TEXT, and `rootpage` an INTEGER (or NULL for
+/// views/triggers).
+fn as_schema_row(values: &[Value]) -> Option<RecoveredSchema> {
+    let [type_v, name_v, tbl_v, root_v, sql_v] = values else {
+        return None;
+    };
+    let object_type = match type_v {
+        Value::Text(t) if matches!(t.as_str(), "table" | "index" | "view" | "trigger") => t.clone(),
+        _ => return None,
+    };
+    let (Value::Text(name), Value::Text(tbl_name), Value::Text(sql)) = (name_v, tbl_v, sql_v)
+    else {
+        return None;
+    };
+    let rootpage = match root_v {
+        Value::Integer(n) => Some(*n),
+        Value::Null => None,
+        _ => return None,
+    };
+    Some(RecoveredSchema {
+        object_type,
+        name: name.clone(),
+        tbl_name: tbl_name.clone(),
+        rootpage,
+        sql: sql.clone(),
+    })
 }
 
 /// Two-tier deleted-record recovery: Tier-1 full rows **plus** Tier-2 partial

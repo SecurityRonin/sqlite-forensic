@@ -606,6 +606,34 @@ large artifacts.
 - Generate: `python3 tests/data/paper_fp/gen_large.py [out.db]` (defaults to
   `$SQLITE_FORENSIC_PERF_DB` or `large_messages.db` beside the script).
 
+## §Q Freeblock / dropped-schema / NIST-DLC fixtures  (**committed**)
+
+Small committed fixtures backing the recovery work added in v0.7.x. Full
+provenance + generators are co-located in [`tests/data/README.md`](https://github.com/SecurityRonin/sqlite-forensic/blob/main/tests/data/README.md).
+
+- **`tests/data/nist_dlc_snapshot.db`** — **REAL-ext, Tier 1, NIST public domain.**
+  The Google Drive `snapshot.db` from the **NIST CFReDS Data Leakage Case**,
+  recovered from a **Volume Shadow Copy** of the case's 20 GB PC image (the image
+  itself is not committed). NIST's published answer to "what files were deleted
+  from Google Drive?" is the independent ground truth; both deleted `cloud_entry`
+  records — `do_u_wanna_build_a_snow_man.mp3` (clean) and the freeblock-clobbered
+  `happy_holiday.jpg` — are recovered, the live `root` never re-surfaced
+  (`nist_dlc_snapshot.rs`). Extraction recipe (7z → `.dd`, `mmls`, libvshadow VSC,
+  pytsk3 NTFS) in `tests/data/README.md`.
+- **`tests/data/freeblock_2byte_rowid.db`** — SYNTHETIC, Tier 2 (`sqlite3`-built;
+  ground truth from construction). Non-adjacent high-rowid deletions; pins
+  freeblock-clobbered **2-byte-rowid** (rowid ≥ 128) recovery (`freeblock_highrowid.rs`).
+  Real-corpus twin: the env-gated `sqlite-unhide` `09.db`.
+- **`tests/data/freeblock_coalesced.db`** — SYNTHETIC, Tier 2. **Adjacent**
+  deletions coalesced into one multi-cell freeblock; pins span-level exact-tiling
+  recovery (same test).
+- **`tests/data/dropped_table_schema.db`** — SYNTHETIC, Tier 2. A dropped
+  `secrets` table; pins `recover_dropped_schemas` + the
+  `SQLITE-DROPPED-SCHEMA-RECOVERED` audit finding (`dropped_schema.rs`).
+
+The env-gated **`sqlite-unhide`** corpus (nine author-keyed DBs; FREEWARE/home-use,
+never committed) is documented in [`tests-oracle-corpus/README.md`](https://github.com/SecurityRonin/sqlite-forensic/blob/main/tests-oracle-corpus/README.md).
+
 ## §H MD5 manifest
 
 Committed fixtures (under `tests/data/`, `tests/data/`):
@@ -633,6 +661,10 @@ Committed fixtures (under `tests/data/`, `tests/data/`):
 | `tests/data/paper_fp/b.db` | `042ab37d307951db79df011a9eb0deec` | 8192 |
 | `tests/data/paper_fp/wcase.db` | `22ebdd36e102f2af2f5766b7297dcad3` | 4096 |
 | `tests/data/paper_fp/wcase.db-wal` | `baaf207913b60136c1762dbe435bb03e` | 16512 |
+| `tests/data/freeblock_2byte_rowid.db` | `e32a55e60a40e3072917d4d5cd3494f5` | 20480 |
+| `tests/data/freeblock_coalesced.db` | `e064fd01f8040c49dc5cf8913532b36f` | 20480 |
+| `tests/data/dropped_table_schema.db` | `69087f66e1fc37a47ebf1803d951301d` | 12288 |
+| `tests/data/nist_dlc_snapshot.db` | `a37a765981eea87d2c2cd5f7be0c6c0a` | 20480 |
 
 The `drop_recreate` and `paper_fp` `-journal`/`-wal` sidecars embed a per-run nonce,
 so their md5 varies; the consuming tests read content, not hash. The 141 committed

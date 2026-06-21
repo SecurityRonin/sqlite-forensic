@@ -293,25 +293,25 @@ local Undark row, run on the **same** bytes as our carve. As with recall,
 throughput is not the headline: the survey's contribution and ours is **false
 positives** and **substrate coverage**, not raw speed.
 
-## Survey ideas → our backlog
+## Survey-informed capabilities
 
-- **Throughput benchmark.** *Shipped:* a large-DB (≈100 MB) timing harness —
-  `carve --format jsonl` measures ~15.3 s on a 100 MB database, reported alongside
-  the survey's tools (see the Throughput section above).
-- **rowid → table inference for drop-recreate (the 0B nuance).** *Shipped (Detector
-  A):* residue attributed to an `AUTOINCREMENT` table carries a `table_instance_risk`
-  flag when its `rowid` exceeds the table's `sqlite_sequence` high-water mark —
-  surfaced as a non-overclaiming **hint** (consistent with prior-incarnation
-  residue, but also explainable by an `UPDATE`/`sqlite_sequence` edit/current-instance
-  deletion), AUTOINCREMENT-only, never a predecessor assertion, never a reroute or
-  tier change. The plain-`INTEGER PRIMARY KEY` case stays unflagged (genuinely
-  undecidable from a bare snapshot). *Shipped (Detector B):* Detector B now flags an
-  unambiguous sidecar `-wal`/`-journal` schema change — the prior `sqlite_master`
-  shows a table absent or with a different CREATE SQL than current
-  (`sidecar_schema_changed(table)`) — a table-level boundary hint, still not the
-  same-schema case (a same-schema drop+recreate is indistinguishable from a benign
-  page move) and never row-level provenance.
-- **WAL-checkpoint acquisition warning.** *Shipped:* the `SQLITE-WAL-UNCHECKPOINTED`
-  audit note now carries the acquisition warning — a `-wal` a checkpoint would
-  reclaim is forensically load-bearing, so the note tells the examiner to acquire
-  the live `-wal` before any tool checkpoints it away.
+The survey's analysis surfaced these needs — now shipped `sqlite4n6` features:
+
+- **Throughput measurement.** A large-DB (≈100 MB) timing harness — `carve
+  --format jsonl` runs in ~15.3 s on a 100 MB database, reported alongside the
+  survey's tools (see the Throughput section above).
+- **`table_instance_risk` drop-recreate hint.** Residue attributed to an
+  `AUTOINCREMENT` table carries a `table_instance_risk` flag when its `rowid`
+  exceeds the table's `sqlite_sequence` high-water mark (Detector A), plus a
+  table-level flag when a `-wal`/`-journal` sidecar's prior `sqlite_master` shows a
+  table absent or with a different CREATE SQL (Detector B,
+  `sidecar_schema_changed(table)`). It is a non-overclaiming **hint** — consistent
+  with prior-incarnation residue, but also explainable by an `UPDATE` /
+  `sqlite_sequence` edit / current-instance deletion — AUTOINCREMENT-only for
+  Detector A, never a predecessor assertion, never a reroute or tier change. The
+  plain-`INTEGER PRIMARY KEY` and same-schema drop+recreate cases stay unflagged
+  (genuinely undecidable from a bare snapshot / indistinguishable from a benign
+  page move).
+- **WAL-checkpoint acquisition warning.** The `SQLITE-WAL-UNCHECKPOINTED` audit
+  note tells the examiner to acquire the live `-wal` before any tool checkpoints it
+  away — a `-wal` a checkpoint would reclaim is forensically load-bearing.

@@ -18,7 +18,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use sqlite_core::Database;
-use sqlite_forensic::recover_dropped_schemas;
+use sqlite_forensic::{audit, recover_dropped_schemas, AnomalyKind};
 
 fn open_fixture() -> Database {
     let bytes = std::fs::read("../tests/data/dropped_table_schema.db")
@@ -52,5 +52,21 @@ fn does_not_report_a_live_table_as_dropped() {
     assert!(
         schemas.iter().all(|s| s.name != "keep"),
         "live table `keep` must NOT be reported as a recovered (dropped) schema: {schemas:?}"
+    );
+}
+
+#[test]
+fn audit_surfaces_the_dropped_schema_as_a_finding() {
+    let db = open_fixture();
+    let found = audit(&db).into_iter().any(|a| {
+        matches!(
+            a.kind,
+            AnomalyKind::DroppedSchemaRecovered { ref name, ref object_type }
+                if name == "secrets" && object_type == "table"
+        )
+    });
+    assert!(
+        found,
+        "audit must surface the dropped `secrets` table as a SQLITE-DROPPED-SCHEMA-RECOVERED finding"
     );
 }

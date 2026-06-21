@@ -60,16 +60,21 @@ serial-type carve of unallocated space, and WAL + rollback-journal recovery — 
 a 0-false-positive discipline on the in-page tier (live rowids are excluded by
 construction).
 
-![Radar of the three SQLite recovery technique families (metadata, carving, WAL)
-on the survey's Throughput / Coverage / Anti-Forensic axes, with sqlite4n6
-overlaid spanning all three.](img/landscape-radar.png)
+On the survey's three axes (Fig. 8 — the paper notes these per-technique values are
+**heuristically assigned, not measured**, so they are qualitative):
 
-*Qualitative positioning, on the survey's Fig. 8 axes (the paper notes those
-per-technique values are heuristically assigned, not measured). The single
-measured-anchored point is `sqlite4n6`'s Throughput — medium, ~15.3 s to carve a
-100 MB database (see the Throughput section below); its Coverage and Anti-Forensic
-are high because it reads metadata, carves, applies the WAL overlay, and recovers
-the rollback journal. Regenerate with `python3 docs/plot_landscape_radar.py`.*
+| Technique | Throughput | Coverage | Anti-forensic resilience |
+|---|---|---|---|
+| Metadata-based | High | High | Low |
+| Carving-based | Medium | High | Medium |
+| WAL-based | Low | Low | High |
+| **`sqlite4n6`** | Medium | High | High |
+
+`sqlite4n6` spans every column — and its **Throughput** entry is the one
+*measured* anchor here: ~15.3 s to carve a 100 MB database (see the Throughput
+section below), so "Medium" rather than the metadata-only "High". Coverage and
+Anti-forensic are high because it reads metadata, carves, applies the WAL overlay,
+and recovers the rollback journal.
 
 ## Measured false-positive / recall table (identical bytes)
 

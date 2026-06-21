@@ -473,6 +473,39 @@ them — `Matteo` (chain page 5 the freelist trunk), whose intact local prefix y
 `id` and `name` after the chain is rejected from Tier-1. `0C` is fully
 reconstructable, so it yields no fragments.
 
+### Filtering recovered items by confidence
+
+Every carved record and fragment carries a confidence set by its recovery path
+(the `_confidence` column / `confidence` JSON field). The distinct values:
+
+| confidence | recovery path |
+|---|---|
+| 0.9 | full row with distinctive UTF-8 TEXT — a freed cell, dropped-table page, or live / prior-version row |
+| 0.72 | full row rebuilt in-page from a free block, distinctive text (`0.9 × 0.8`) |
+| 0.675 | full row whose body spilled to an overflow chain (`0.9 × 0.75`) |
+| 0.6 | full row, no distinctive text |
+| 0.48 | in-page free-block row, no distinctive text (`0.6 × 0.8`) |
+| 0.4 | row reconstructed from an exact-tiled free block |
+| 0.30 | exact-tiled free-block row that spilled to overflow (`0.4 × 0.75`) |
+| 0.2 | Tier-2 fragment |
+
+`--min-confidence` keeps only items at or above a level — `info` 0.0 · `low` 0.2 ·
+`medium` 0.4 · `high` 0.6 · `critical` 0.8 — partitioning the output:
+
+| level | keeps |
+|---|---|
+| `info` (default), `low` | all of the above |
+| `medium` | drops Tier-2 fragments (0.2) and overflow free-block rows (0.30) |
+| `high` | also drops free-block reconstructions (0.4) and text-poor in-page rows (0.48) |
+| `critical` | only distinctive-text full rows (0.9) — drops in-page (0.72) and overflow-spill (0.675) too |
+
+The dial applies to every emitted item, full records and fragments alike;
+`--fragments` forces the fragment surface in past the threshold and `--no-fragments`
+removes it. `info` and `low` are equivalent under the current confidence set (no
+item scores in `[0.0, 0.2)`); both are kept so the ladder mirrors the standard
+severity scale and stays correct if a future recovery path lands a value between
+them.
+
 Because a lone surviving cell *can* be a coincidental byte run that satisfies the
 serial + UTF-8 checks, the fragment surface carries an **expected non-zero
 false-positive rate** and is therefore opt-in — the full-row tier's 0-false-positive

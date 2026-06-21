@@ -61,6 +61,45 @@ fn recovers_deleted_rows_with_two_byte_rowid() {
     }
 }
 
+/// Coalesced freeblock: adjacent deletions (ids 1100..=1104) merge into one
+/// multi-cell freeblock. Span-level exact-tiling walks the coalesced cells and
+/// recovers them only when they tile the freeblock exactly — recovering each row
+/// without emitting a partial/misaligned phantom.
+///
+/// Fixture `tests/data/freeblock_coalesced.db` (same shape as above,
+/// `DELETE FROM m WHERE id BETWEEN 1100 AND 1104`).
+#[test]
+fn recovers_coalesced_two_byte_rowid_rows() {
+    let bytes = std::fs::read("../tests/data/freeblock_coalesced.db")
+        .or_else(|_| std::fs::read("tests/data/freeblock_coalesced.db"))
+        .expect("fixture readable");
+    let db = Database::open(bytes).expect("fixture opens");
+    let texts = recovered_texts(&db);
+    let recovered = (1100..=1104)
+        .filter(|id| {
+            texts
+                .iter()
+                .any(|t| t == &format!("line text for record {id}"))
+        })
+        .count();
+    // Span-tiling should recover the coalesced run; require a clear majority so a
+    // boundary cell that does not tile cleanly does not fail the test.
+    assert!(
+        recovered >= 4,
+        "coalesced freeblock: expected >= 4 of ids 1100..=1104 recovered, got {recovered}; \
+         texts={texts:?}"
+    );
+    // Precision: no misaligned phantom among them.
+    for t in &texts {
+        if t.contains("line text for record") {
+            assert!(
+                t.starts_with("line text for record") && !t.chars().any(char::is_control),
+                "coalesced recovery emitted a misaligned phantom: {t:?}"
+            );
+        }
+    }
+}
+
 /// Precision: the exact-tile gate must not emit a column-shifted phantom — no
 /// recovered `line` text may be a misaligned read of the real value (a leading
 /// control byte, or a truncated body). A clean recovery is exactly

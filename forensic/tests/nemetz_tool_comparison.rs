@@ -351,6 +351,32 @@ fn sqldrp_recover(cmd: &Path, db: &Path) -> BTreeSet<RowId> {
     set
 }
 
+/// Parse the normalized `run-sqlite-dissect.sh` output --- one recovered record
+/// per line as `rowid,col1,col2,...`, with an optional `rowid,...` header --- into
+/// the cross-tool `(col1,col2)` identity set, the same projection every other
+/// CSV-emitting oracle is scored on.
+fn parse_sqlite_dissect(text: &str) -> BTreeSet<RowId> {
+    let _ = text;
+    BTreeSet::new() // RED stub: real body lands in the GREEN commit
+}
+
+#[test]
+fn sqlite_dissect_output_parses_col1_col2() {
+    // A header row (skipped), two records, and a blank line (ignored).
+    let sample = "rowid,name,city,zip\n\
+                  1,Alice,New York,10001\n\
+                  \n\
+                  2,Bob,Los Angeles,90001\n";
+    let got = parse_sqlite_dissect(sample);
+    let want: BTreeSet<RowId> = [
+        ("Alice".to_string(), "New York".to_string()),
+        ("Bob".to_string(), "Los Angeles".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(got, want);
+}
+
 /// The in-scope databases for the head-to-head: 0C/0D/0E minus the float-key
 /// exclusions, in id order.
 fn in_scope() -> Vec<(String, String)> {

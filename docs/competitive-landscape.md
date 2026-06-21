@@ -68,13 +68,13 @@ not measured values:
 | Metadata-based | High | High | Low |
 | Carving-based | Medium | High | Medium |
 | WAL-based | Low | Low | High |
-| **`sqlite4n6`** | Medium | High | High |
 
-`sqlite4n6` spans every column — and its **Throughput** entry is the one
-*measured* anchor here: ~15.3 s to carve a 100 MB database (see the Throughput
-section below), so "Medium" rather than the metadata-only "High". Coverage and
-Anti-forensic are high because it reads metadata, carves, applies the WAL overlay,
-and recovers the rollback journal.
+This is the survey's qualitative read of the three *approaches* — not a scorecard
+for any tool, and we don't add a self-graded `sqlite4n6` row to it (the axes have
+no defined cutoffs and we'd be grading ourselves). `sqlite4n6` implements all three
+plus the rollback journal (stated above); where it actually lands is shown by the
+**measured** evidence below — the false-positive comparison on identical bytes and
+the throughput figures (~15.3 s on a 100 MB database).
 
 ## Measured false-positive / recall table (identical bytes)
 

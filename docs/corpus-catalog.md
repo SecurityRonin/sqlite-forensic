@@ -20,9 +20,14 @@ All fixtures were built with the system `sqlite3` CLI / Python `sqlite3` module:
 
 ## Classification
 
-`SYNTHETIC` — all built locally with the real `sqlite3` engine (REAL engine,
-synthetic data). Confidence `✓` (confirmed: each generator below was run and the
-resulting file inspected, not just named).
+The corpus spans three provenance classes, labelled per section below:
+`REAL-engine`/`SYNTHETIC` (built locally with the real `sqlite3` engine — real
+engine, our data: §A–§E, §J, §L, §M, §N, §O); `REAL-ext` (externally-authored real
+artifacts — the Nemetz corpus §I, NIST CFReDS §K, SharifCTF §K, the DC3 corpus §G);
+and `REAL-device` (genuine device data — the Josh Hickman iOS-17 images §P).
+Confidence `✓` throughout (each generator was run and the file inspected, or the
+external artifact downloaded and its schema/ground-truth parse confirmed — not just
+named).
 
 ## §A `tests/data/places.db`  (pre-existing, WS-C spike)
 
@@ -453,13 +458,15 @@ manifest: `tests/data/cfreds/README.md` (the single detailed index for this set)
   `UPDATE … SET Quantity=200` modifications per variation.
   - *WAL* variation (uncheckpointed): main-only view = 2240 rows, WAL-applied =
     2140; our WAL handling surfaces both. Validated now.
-  - *PERSIST* variation (rollback journal): the 100 deletes survive in the
-    `-journal` page images (header zeroed post-commit, bodies intact, all 100
-    confirmed present). **Recovering them is a pending capability** — the carver
-    reads only the main db today (0/100). Rollback-journal carving is designed in
-    [`design/journal-recovery.md`](design/journal-recovery.md). This is the
-    Doer-Checker payoff: real NIST ground truth surfaced a real recovery-substrate
-    gap our synthetic fixtures never exercised.
+  - *PERSIST* variation (rollback journal): the 100 deletes and 100 modifications
+    survive in the `-journal` page images (header zeroed post-commit, bodies
+    intact). `carve_rollback_journal` diffs the journal's pre-transaction snapshot
+    against the live db and recovers **100/100 deletes + 100/100 modified prior
+    values** (`forensic/tests/cfreds_journal_recovery.rs`); `audit_journal` raises
+    the RECOVERABLE observation on it (`cfreds_journal_anomaly.rs`). Rollback-journal
+    carving is designed in [`design/journal-recovery.md`](design/journal-recovery.md).
+    This was the Doer-Checker payoff: real NIST ground truth surfaced a real
+    recovery-substrate gap our synthetic fixtures never exercised, now closed.
 - **SFT-05** (BLOB): **not committed** — each db is ~206 MB (gitignored/env-gated
   class). Re-download from the SFT-05 dataset link in `tests/data/cfreds/README.md`.
 
@@ -487,6 +494,90 @@ third-party content); full provenance + recipes + md5s in
 - `ddl_persist.db` + `ddl_persist.db-journal` — a committed-DDL PERSIST journal
   (`ALTER TABLE … ADD COLUMN`). Live schema cookie (2) advanced past the journal's
   prior page-1 image cookie (1), so SCHEMA-CHANGE fires with both values shown.
+
+## §N `tests/data/drop_recreate/`  (real-engine artifact, **committed**)
+
+Five small real-engine databases (plus two `-journal` sidecars) that exercise the
+`table_instance_risk` diagnostic **HINT** — Detector A (AUTOINCREMENT high-water
+reconciliation) and Detector B (sidecar `-wal`/`-journal` schema change). The flag
+is a hint that names its evidence; it is **not** an assertion that a predecessor
+table existed. Construction reference: `docs/design/drop-recreate-attribution.md`;
+full fixture table + ground truth in `tests/data/drop_recreate/README.md`.
+
+- Classification: `REAL-engine` (minted with the public-domain SQLite engine via
+  the committed `gen.py`; no third-party content), confidence `✓` (generated and
+  the ground truth confirmed with the `sqlite3` CLI). **Committed** (CC0).
+- Detector A — `rowid > sqlite_sequence` on an AUTOINCREMENT table: `b_autoinc.db`
+  fires on residue rowids 6..10; `upd_autoinc.db` fires on rowid 1000 — a row a
+  *current-instance* `UPDATE` moved past the high-water mark (proving A is a hint,
+  not proof); `b_plainpk.db` (no AUTOINCREMENT) **never** fires — the honest limit
+  that a same-schema, plain-PK drop+recreate is undecidable.
+- Detector B — sidecar prior schema differs: `b_journal_altered.db` + `-journal`
+  fires for `students` (the prior CREATE SQL lacks the later `ALTER`'s column);
+  `b_journal_dml.db` + `-journal` (DML-only last txn) **never** fires. Detector B is
+  table-level and deliberately does NOT fire on a same-schema drop+recreate or a
+  `VACUUM` page move.
+- Consumed by `forensic/tests/drop_recreate_risk.rs` (Detector A),
+  `forensic/tests/detector_b.rs` (Detector B), the CLI provenance-column test, and
+  the `core` prior-schema unit tests.
+- md5 (the `.db` files are byte-reproducible; the `-journal` sidecars embed a random
+  checksum nonce so their md5 varies per run — the tests read content, not hash):
+
+  | file | md5 | bytes |
+  |---|---|---|
+  | `b_autoinc.db` | `b5f380a6376a8701e73514eb09a4ef27` | — |
+  | `b_plainpk.db` | `042ab37d307951db79df011a9eb0deec` | — |
+  | `upd_autoinc.db` | `6225cdb9cd88973bcad4a4325830c0a1` | — |
+  | `b_journal_altered.db` | `3a77f03ea3ac1ef40f8e9b284af98a59` | — |
+  | `b_journal_dml.db` | `2c1a405f4cc27856b367059554b319bf` | — |
+
+## §O `tests/data/paper_fp/` false-positive scenarios  (real-engine **replication**, **committed**)
+
+Real-engine **replications** of the three false-positive scenarios from the 2025
+survey (Lee, Park, Lee & Choi, *FSI:DI* **55**, art. 302031,
+[DOI](https://doi.org/10.1016/j.fsidi.2025.302031)). These reproduce the survey's
+Table-5 *construction* with the real SQLite engine — they are **not** the authors'
+byte-identical corpus (the official corpus is released "upon request" / not public
+yet). Generator + full ground truth: `tests/data/paper_fp/README.md`.
+
+- Classification: `REAL-engine` (minted by the committed `gen.py` via Python stdlib
+  `sqlite3`; no third-party data embedded), confidence `✓`. **Committed** (CC0).
+- `f.db` — **0F**, B-tree rebalancing (Type \*\*): live ids 51..80, deleted 1..50.
+  Our carver excludes live rowids structurally → **0 live-row false positives**
+  where `bring2lite` re-surfaces 13.
+- `b.db` — **0B**, table reinsertion with the SAME schema (Type \*): live ids 1..5
+  (`NEW-NAME`), dropped residue = 10 `OLD-NAME` rows. The genuinely-undecidable
+  same-schema case.
+- `wcase.db` + `wcase.db-wal` — **10**, WAL + `secure_delete=ON`: the residue lives
+  **only** in the `-wal`; the main image holds zero message bodies. **FQLite's
+  scenario-10 number is cited from the paper, not measured here** — its WAL recovery
+  is GUI-coupled (see §F.2).
+- Consumed by `forensic/tests/paper_fp_scenarios.rs` and the oracle comparison in
+  [`competitive-landscape.md`](competitive-landscape.md).
+- md5 (`.db` files byte-reproducible; `wcase.db-wal` is content-stable but
+  salt-variant per run):
+
+  | file | md5 | bytes |
+  |---|---|---|
+  | `f.db` | `a61a446a1cf0e5304956384b69644071` | 45056 |
+  | `b.db` | `042ab37d307951db79df011a9eb0deec` | 8192 |
+  | `wcase.db` | `22ebdd36e102f2af2f5766b7297dcad3` | 4096 |
+  | `wcase.db-wal` | `baaf207913b60136c1762dbe435bb03e` | 16512 (content-stable, salt-variant) |
+
+## §P Josh Hickman iOS-17 image corpus  (REAL-device, env-gated, **not committed**)
+
+Genuine iOS-17 application SQLite databases from Josh Hickman's public reference
+image — real-device data used as a **robustness sweep** (no-panic), NOT a
+known-answer recall oracle. The full open → audit → carve pipeline must survive
+every real db without panicking.
+
+- Classification: `REAL-device` (third-party real-device artifacts), confidence `✓`
+  (the sweep runs the pipeline over every db). **Not committed** — large, owned by
+  the `issen` corpus; downloaded manually and read in place, env-gated like §G/§M.
+- Test gate: `SQLITE_FORENSIC_IOS_CORPUS` (absolute path to the extracted corpus
+  root). `forensic/tests/ios_realdata_robustness.rs` opens every `.db`/`.sqlite`/
+  `.sqlite3` under it and asserts the pipeline never panics; it **skips cleanly**
+  when the var is unset, so a plain `cargo test` stays green.
 
 ## §M `tests/data/paper_fp/large_messages.db`  (throughput benchmark, generated, **not committed**)
 
@@ -533,15 +624,28 @@ Committed fixtures (under `tests/data/`, `tests/data/`):
 | `tests/data/journal/hot.db-journal` | `d428e2fcf8e6f3d9c71a58b18c6f4dcc` | 22016 |
 | `tests/data/journal/ddl_persist.db` | `0271673fb35215d80f313e5f549dbbaf` | 16384 |
 | `tests/data/journal/ddl_persist.db-journal` | `fe785dd18b5eb58b6dd4176ae5864130` | 8720 |
+| `tests/data/drop_recreate/b_autoinc.db` | `b5f380a6376a8701e73514eb09a4ef27` | — |
+| `tests/data/drop_recreate/b_plainpk.db` | `042ab37d307951db79df011a9eb0deec` | — |
+| `tests/data/drop_recreate/upd_autoinc.db` | `6225cdb9cd88973bcad4a4325830c0a1` | — |
+| `tests/data/drop_recreate/b_journal_altered.db` | `3a77f03ea3ac1ef40f8e9b284af98a59` | — |
+| `tests/data/drop_recreate/b_journal_dml.db` | `2c1a405f4cc27856b367059554b319bf` | — |
+| `tests/data/paper_fp/f.db` | `a61a446a1cf0e5304956384b69644071` | 45056 |
+| `tests/data/paper_fp/b.db` | `042ab37d307951db79df011a9eb0deec` | 8192 |
+| `tests/data/paper_fp/wcase.db` | `22ebdd36e102f2af2f5766b7297dcad3` | 4096 |
+| `tests/data/paper_fp/wcase.db-wal` | `baaf207913b60136c1762dbe435bb03e` | 16512 |
 
-The 141 committed Nemetz databases under `tests/data/nemetz/` (CC0, §I) have their
-own md5 manifest in `tests/data/nemetz/README.md` to avoid duplicating it here.
+The `drop_recreate` and `paper_fp` `-journal`/`-wal` sidecars embed a per-run nonce,
+so their md5 varies; the consuming tests read content, not hash. The 141 committed
+Nemetz databases under `tests/data/nemetz/` (CC0, §I) have their own md5 manifest in
+`tests/data/nemetz/README.md` to avoid duplicating it here.
 
 Not committed (provenance only — see §F, §G and the per-directory READMEs):
 `tools/undark`, the fqlite tap under `tools/fqlite/` (source, jars, built classes
 — recipe in `tools/fqlite/README.md`), the `bring2lite` checkout + PyQt5 shim
 under `tools/bring2lite/` (§F.3), the Py3-ported `sqlparse` under `tools/sqldrp/`
-(§F.4), and the DC3 corpus under `tests-oracle-corpus/dc3-sqlite-dissect/` (full
-sha256/md5 list in `tests-oracle-corpus/README.md`). The committed
-`scripts/run-bring2lite.sh` / `scripts/run-sqldrp.sh` wrappers are the stable
-harness interface to the gitignored tool sources.
+(§F.4), the DC3 corpus under `tests-oracle-corpus/dc3-sqlite-dissect/` (full
+sha256/md5 list in `tests-oracle-corpus/README.md`), the env-gated Josh Hickman
+iOS-17 image corpus (`SQLITE_FORENSIC_IOS_CORPUS`, §P), and the ~100 MB throughput
+db (`SQLITE_FORENSIC_PERF_DB`, §M). The committed `scripts/run-bring2lite.sh` /
+`scripts/run-sqldrp.sh` wrappers are the stable harness interface to the gitignored
+tool sources.

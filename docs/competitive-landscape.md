@@ -74,7 +74,7 @@ for any tool, and we don't add a self-graded `sqlite4n6` row to it (the axes hav
 no defined cutoffs and we'd be grading ourselves). `sqlite4n6` implements all three
 plus the rollback journal (stated above); where it actually lands is shown by the
 **measured** evidence below — the false-positive comparison on identical bytes and
-the throughput figures (~15.3 s on a 100 MB database).
+the throughput figures (~15.6 s on a 100 MB database).
 
 ## Measured false-positive / recall table (identical bytes)
 
@@ -251,10 +251,12 @@ in the provenance note).
 - **Replicated corpus, not the survey's bytes.** The survey's official corpus is
   not yet public; these are real-engine replications of its construction. When the
   corpus is released, swap it in and re-measure (tracked in the fixtures README).
-- **Throughput is now measured (see "Throughput" below).** On a locally-generated
-  ~100 MB image our `carve --format jsonl` runs in a median **15.3 s** (release,
-  Apple M4 Pro); the survey's numbers are on *its own* 100 MB DB on a *different*
-  machine and are not directly comparable, but anchor the order of magnitude.
+- **Throughput is now measured apples-to-apples (see "Throughput" below).** Every
+  tool was timed on the **same** machine (Apple M4 Pro) and the **same**
+  locally-generated ~100 MB image; our `carve --format jsonl` runs in a median
+  **15.6 s** (release). The survey's numbers are on *its own* 100 MB DB on a
+  *different* machine and are not directly comparable — they are kept only as a
+  historical anchor, not read against the measured table.
 - **Recall is not the headline.** The identical-bytes recall numbers differ by
   scenario and tool, but the survey's contribution — and ours here — is about
   **false positives** and **substrate coverage** (WAL vs main-image), not a recall
@@ -262,25 +264,51 @@ in the provenance note).
 
 ## Throughput
 
-The survey reports execution time on a 100 MB database. We measured our carver on
-a **locally-generated ~100 MB** messages-like image (210k → 178k rows, an 80k-row
-contiguous middle subset DELETEd, `secure_delete=OFF`, `auto_vacuum=NONE`;
-generator `tests/data/paper_fp/gen_large.py`, gitignored DB). Methodology:
-**wall-clock over 5 runs, median reported**, release build, on the local machine
-noted below. The carve recovers 79,904 of the 80,000 deleted rows (0.9988) with
-**0** live false positives — correctness holds at scale, pinned by the env-gated
-perf-smoke `forensic/tests/perf_large_carve.rs` (`SQLITE_FORENSIC_PERF_DB`).
+**Throughput is not the headline — false positives and substrate coverage are.**
+Lower wall-clock time only means "faster at the same job" when the tools are doing
+the same job; they are not (see the *recovery discipline* column). A flat b-tree
+dump that emits ~178k undifferentiated rows in 1.5 s is not "10× faster" than a
+deleted-only carve that emits 79,904 attributed rows in 15 s — it is doing
+different, lesser work. The table below records times **as facts in their
+work-done context**, not as a leaderboard.
 
-**Measured here (this repo, local machine — Apple M4 Pro, macOS):**
+Every tool was run on the **same machine** and the **same** locally-generated
+~100 MB messages-like image (210k → 178k rows, an 80k-row contiguous middle subset
+DELETEd, `secure_delete=OFF`, `auto_vacuum=NONE`; generator
+`tests/data/paper_fp/gen_large.py`, gitignored DB). **Methodology:** wall-clock,
+warm cache, **median of 5 runs** per tool, release build; harness
+`scripts/throughput-bench.sh`. Our carve recovers 79,904 of the 80,000 deleted
+rows (recall 0.9988) with **0** live false positives — correctness holds at scale,
+pinned by the env-gated perf-smoke `forensic/tests/perf_large_carve.rs`
+(`SQLITE_FORENSIC_PERF_DB`).
 
-| Tool / mode | Median wall-clock | Records emitted | Notes |
+**Measured here — same machine (Apple M4 Pro, macOS 15.7.8), same ~100 MB db:**
+
+| Tool / mode | Median wall-clock | Records emitted | Recovery discipline |
 |---|---:|---:|---|
-| `sqlite4n6 carve --format jsonl` | **15.3 s** | 79,904 deleted | streams JSONL; deleted-only, 0 live FP |
-| `sqlite4n6 carve --db` | **39.7 s** | 79,904 deleted | also rebuilds a 45 MB carved `.db` + 8.5 MB `.xlsx` |
-| Undark (`-i`) | **1.45 s** | 177,906 (flat dump) | dumps the **whole b-tree** (live + freespace), no live/deleted split |
+| `sqlite4n6 carve --format jsonl` | 15.6 s | 79,904 deleted | **deleted-only**, live-rowid excluded, 0 live FP; every row content-confirmed in the deleted range |
+| `sqlite4n6 carve --db` | 44.8 s | 79,904 deleted | as above, **plus** it rebuilds a 45 MB queryable `.carved.db` + an 8.7 MB `.xlsx` |
+| `undark -i` | 1.5 s | 177,906 | **flat-dump**: whole b-tree (live + freespace), no live/deleted split — ~178k rows are almost all *live* |
+| `fqlite` (headless tap) | 2.4 s | 2,935 | **deleted-only** bucket (status flag `D`), but mostly freelist-page fragments — only 31 rows carry an `MSG-` tag, 6 of them in the true deleted range |
+| `sqldrp` (sqlparse v1.3) | 0.2 s | 5 | **metadata/string carve**: printable-ASCII blobs from a handful of freeblock/unallocated regions; no per-column record, no live/deleted split |
+| `bring2lite` | — (did not complete) | 0 | crashes mid-run (`struct.error: unpack requires a buffer of 1 bytes` in `_extract_trunk_page_content` while parsing a freelist trunk page) before producing any recovered record |
 
-**Reported by the paper (its own 100 MB DB, a different machine — NOT directly
-comparable; an order-of-magnitude anchor only):**
+Notes on the measurements:
+
+- **`bring2lite` did not complete a recovery on this db** — it parses the live
+  b-tree, then aborts in the freelist trunk-page parser with a truncated-buffer
+  `struct.error`. The ~10 s it spends before crashing is **not** a recovery time,
+  so no figure is entered for it. (It runs to completion on the small
+  identical-bytes fixtures elsewhere in this doc; the failure is specific to the
+  larger image's freelist structure.)
+- **`undark` emits all 177,906 rows then SIGSEGVs at exit** when its stdout is a
+  regular file or `/dev/null` (it exits cleanly to a pipe); the timing pipes its
+  output, and the row count is complete regardless of the exit-time crash.
+- **`sqldrp`** is a printable-string carver: on this db it surfaces 5 freeblock /
+  unallocated string blobs, not 80k records — it does not chase freed pages.
+
+**Reported by the paper (its own 100 MB db, a *different* machine — NOT comparable
+with the table above; kept only as a historical order-of-magnitude anchor):**
 
 | Tool | Reported time |
 |---|---:|
@@ -289,11 +317,9 @@ comparable; an order-of-magnitude anchor only):**
 | FQLite | 13.62 s |
 | Bring2Lite | 21.89 s |
 
-The two tables measure different things. Our `jsonl` figure is the cost of
-recovering **only deleted** records with live-rowid exclusion and per-record
-attribution; Undark's 1.45 s is a single linear b-tree dump with no live/deleted
-separation (it emits ~178k rows, almost all live). The cross-machine paper numbers
-are not an apples-to-apples leaderboard — the apples-to-apples cell is the
-local Undark row, run on the **same** bytes as our carve. As with recall,
-throughput is not the headline: the survey's contribution and ours is **false
-positives** and **substrate coverage**, not raw speed.
+These survey numbers were measured on a different machine and a different corpus;
+they are **explicitly not** an apples-to-apples comparison with the measured table
+and must not be read against it. The apples-to-apples evidence is the first table:
+same machine, same bytes, with the *records-emitted* and *recovery-discipline*
+columns making clear that a smaller time often buys a smaller — or
+undifferentiated — result.

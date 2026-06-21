@@ -60,3 +60,26 @@ deleted rows beyond the live set, or the DB is a header/version fixture).
 | `corpus_08-01.db` | `corpus/08-01.db` | `6089df2e698de7e55bb88064dea83ed7c5cd313a466434b7e243a93ada7de5ad` | `239e100214c821e46bb56cc456f97321` | 8192 |
 | `corpus_09-01.db` | `corpus/09-01.db` | `651f8c0e9aa5fed80bc11f4a1db95d233d5a1b49237c280f1ece0f9b0df06914` | `214df574ec06ad77bad9062d7e5c59ce` | 118784 |
 | `version_history_test.sqlite` | `version_history_test.sqlite` | `a82aa11d0377e16ee14b7f7dab91c1570c239b5b5b6a6942fbb7e27326ca261a` | `67c33214a88fefec1d35e10ad6e86825` | 16384 |
+
+## sqlite-unhide/  (REAL-ext, env-gated)
+
+- **Source:** `little-brother/sqlite-unhide` — a third-party SQLite deleted-record
+  recovery tool whose `tests/extra/` ships nine hand-built databases, each with a
+  `.sql` builder and a **`.txt` answer key authored by the tool's author** (not us,
+  not our oracles). Independent input AND independent ground truth.
+- **Repo / path:** <https://github.com/little-brother/sqlite-unhide> →
+  `tests/extra/01.{db,sql,txt}` … `09.{db,sql,txt}`.
+- **License:** the project README states **"FREEWARE. HOME USE ONLY."** with no
+  redistribution licence, so these files are **never committed** — download a copy
+  for your own (home-use) assessment only.
+- **Wired into:** `forensic/tests/sqlite_unhide_corpus.rs`, **env-gated** on
+  `SQLITE_FORENSIC_UNHIDE_CORPUS` pointing at the downloaded `tests/extra`
+  directory (skips cleanly when unset; CI never runs it).
+- **Cases covered (per the `.txt` keys):** `sqlite_master` spanning a non-single
+  leaf page (01), generalized-type inference (02), INTEGER-PK-as-rowid (03),
+  FLOAT-first-column with a freeblock-clobbered "missing" row (04), TEXT-first
+  (05), non-PK leading INTEGER (06), 2-byte text-length serial (07), trunk-freelist
+  recovery (08), UTF-8 with 2-byte rowids (09). Cases 08–09 pin the dropped-table
+  and exact-tile 2-byte-rowid recovery paths.
+- **Verify:** compare your download against the upstream repo (files are tiny,
+  8–37 KB; `01.db` md5 `228e70341e5bb26f33818c2386c0c214`).

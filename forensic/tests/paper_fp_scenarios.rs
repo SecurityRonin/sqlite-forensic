@@ -94,16 +94,31 @@ fn scenario_0f_rebalancing_zero_live_false_positives() {
         );
     }
 
-    // The id-tagged payload lets us confirm the rowid reconstruction is sound:
-    // a recovered row's `v` begins with `ROW-<its rowid>-`.
+    // The id-tagged payload confirms the reconstruction is sound. A row carved
+    // with its rowid intact must tag exactly that rowid (`ROW-<rowid>-`). A
+    // freeblock-reconstructed row has its rowid destroyed (surfaced as 0), so we
+    // instead require its content to be a genuinely-DELETED row (id 1..=50) and
+    // never a live one (51..=80) — a stronger precision check than rowid alone.
     for r in &recs {
-        let expected = format!("ROW-{}-", r.rowid);
-        assert!(
-            text(&r.values[1]).starts_with(&expected),
-            "row {} content must tag its own id; got {:?}",
-            r.rowid,
-            &text(&r.values[1])[..expected.len().min(text(&r.values[1]).len())]
-        );
+        let content = text(&r.values[1]);
+        if r.rowid != 0 {
+            let expected = format!("ROW-{}-", r.rowid);
+            assert!(
+                content.starts_with(&expected),
+                "row {} content must tag its own id; got {content:?}",
+                r.rowid
+            );
+        } else {
+            let tagged_id: Option<i64> = content
+                .strip_prefix("ROW-")
+                .and_then(|s| s.split('-').next())
+                .and_then(|s| s.parse().ok());
+            assert!(
+                matches!(tagged_id, Some(id) if (1..=50).contains(&id)),
+                "rowid-destroyed recovery must be a deleted-range row (1..=50), never live; \
+                 got {content:?}"
+            );
+        }
     }
 }
 

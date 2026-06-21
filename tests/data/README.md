@@ -277,3 +277,43 @@ its own provenance README (source, NIST/author hashes, licence, ground truth):
 - **Notable contents:** 258 live rows; deleted ids 1050/1130/1210, each
   recovered as `line text for record <id>` with no misaligned phantom;
   `PRAGMA freelist_count` = 0 (in-page freeblocks only).
+
+#### freeblock_coalesced.db
+
+- **Source:** SYNTHETIC — `sqlite3` CLI (Tier-2; ground truth derivable from the
+  construction). Same shape as `freeblock_2byte_rowid.db`.
+- **Identity:** **adjacent** high-rowid rows (`DELETE id BETWEEN 1100 AND 1104`)
+  whose freed cells SQLite coalesces into one multi-cell freeblock. Pins the
+  **span-level exact-tiling** recovery (`forensic/tests/freeblock_highrowid.rs`):
+  the coalesced cells are recovered only when they tile the freeblock exactly, so
+  a misaligned run yields nothing rather than a phantom.
+- **md5:** `e064fd01f8040c49dc5cf8913532b36f` — 20480 bytes.
+- **Notable contents:** 256 live rows; deleted ids 1100..=1104 recovered (≥4 of
+  5), no misaligned phantom; `PRAGMA freelist_count` = 0.
+
+#### dropped_table_schema.db
+
+- **Source:** SYNTHETIC — `sqlite3` CLI (Tier-2; ground truth derivable from the
+  construction).
+- **Identity:** a `secrets` table is created, populated, then `DROP`ped (under
+  `secure_delete=OFF`), leaving only `keep` live. Its `sqlite_master` row survives
+  in page-1 free space. Pins dropped-table **schema recovery**
+  (`forensic/tests/dropped_schema.rs`): `recover_dropped_schemas` surfaces the
+  dropped object's name + `CREATE` statement, and `audit` reports it as
+  `SQLITE-DROPPED-SCHEMA-RECOVERED`.
+- **Generator:**
+
+  ```sh
+  sqlite3 dropped_table_schema.db <<'SQL'
+  PRAGMA page_size=4096; PRAGMA secure_delete=0;
+  CREATE TABLE keep(id INTEGER PRIMARY KEY, x TEXT);
+  INSERT INTO keep VALUES (1,'a'),(2,'b');
+  CREATE TABLE secrets(id INTEGER PRIMARY KEY, account TEXT, password TEXT);
+  INSERT INTO secrets VALUES (1,'admin','hunter2'),(2,'root','toor');
+  DROP TABLE secrets;
+  SQL
+  ```
+
+- **md5:** `69087f66e1fc37a47ebf1803d951301d` — 12288 bytes.
+- **Notable contents:** live table `keep`; dropped table `secrets` recovered with
+  its `CREATE TABLE secrets(...)` statement from page-1 residue.

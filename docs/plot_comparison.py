@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Render docs/img/recovery-comparison.png from docs/img/comparison_metrics.csv.
 
-The CSV is emitted by ``forensic/tests/nemetz_tool_comparison.rs`` (the
-``emit_three_tool_comparison`` test, run with the undark/fqlite oracles set), so
-every number plotted here is the harness's computed value — never hand-typed.
+The CSV is emitted by ``forensic/tests/nemetz_tool_comparison.rs`` (run with the
+oracle gates set — UNDARK_BIN/FQLITE_TAP/BRING2LITE_CMD/SQLDRP_CMD), so every
+number plotted here is the harness's computed value — never hand-typed.
 Re-run that test to refresh the CSV, then re-run this script to refresh the PNG.
 
 Three panels:
   1. Precision-Recall plane with constant-F1 iso-contours and an ideal star.
-  2. F1 grouped bars (category x 3 tools).
+  2. F1 grouped bars (category x tool).
   3. F0.5 grouped bars (precision-weighted forensic beta).
 """
 
@@ -25,9 +25,15 @@ HERE = pathlib.Path(__file__).resolve().parent
 CSV_PATH = HERE / "img" / "comparison_metrics.csv"
 PNG_PATH = HERE / "img" / "recovery-comparison.png"
 
-# Tool -> colour (ours teal, fqlite orange, undark red); category -> marker.
-TOOL_COLOR = {"ours": "#1b9e8a", "fqlite": "#e6840f", "undark": "#d62728"}
-TOOL_ORDER = ["ours", "fqlite", "undark"]
+# Tool -> colour; category -> marker.
+TOOL_COLOR = {
+    "ours": "#1b9e8a",        # teal
+    "fqlite": "#e6840f",      # orange
+    "undark": "#d62728",      # red
+    "bring2lite": "#7570b3",  # purple
+    "sqldrp": "#666666",      # grey
+}
+TOOL_ORDER = ["ours", "fqlite", "undark", "bring2lite", "sqldrp"]
 CAT_MARKER = {"0C": "o", "0D": "s", "0E": "^"}
 CAT_ORDER = ["0C", "0D", "0E"]
 
@@ -83,7 +89,7 @@ def panel_pr(ax, rows):
     )
 
     for (cat, tool), m in rows.items():
-        if tool not in TOOL_COLOR:  # headline P/R chart plots the 3 full-recall tools
+        if tool not in TOOL_COLOR:  # defensive: skip any tool without a defined colour
             continue
         ax.scatter(
             m["recall"],
@@ -139,11 +145,12 @@ def grouped_bars(ax, rows, metric, title):
     # collide with the top spine.
     ax.set_ylim(0, 1.12)
     x = np.arange(len(CAT_ORDER))
-    width = 0.26
+    n = len(TOOL_ORDER)
+    width = 0.8 / n
     for i, tool in enumerate(TOOL_ORDER):
         vals = [rows[(cat, tool)][metric] for cat in CAT_ORDER]
         bars = ax.bar(
-            x + (i - 1) * width,
+            x + (i - (n - 1) / 2) * width,
             vals,
             width,
             color=TOOL_COLOR[tool],
@@ -183,7 +190,7 @@ def main():
     grouped_bars(axes[2], rows, "f0_5", "F0.5 (precision-weighted)")
     fig.suptitle(
         "Deleted-record recovery on the Nemetz corpus — ours vs undark vs fqlite "
-        "(0C/0D/0E, harness-computed)",
+        "vs bring2lite vs SQL-DRP (0C/0D/0E, harness-computed)",
         fontsize=12,
     )
     fig.tight_layout(rect=(0, 0.07, 1, 0.96))

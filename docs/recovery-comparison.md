@@ -101,7 +101,7 @@ row-level deleted set and are **out of scope** for this cross-tool recall table.
 
 > **Full-corpus scope (v2.0).** The vendored corpus is now the **full 141-DB
 > Nemetz v2.0** (23 categories). This head-to-head table stays scoped to `0C`/`0D`/
-> `0E` where all three tools have oracle output and a format-stable key exists; the
+> `0E` where the tools have oracle output and a format-stable key exists; the
 > numbers above are unchanged. The newly-vendored deleted-ground-truth categories
 > `07` (fragmented contents) and the anti-forensic `17` (manipulated freeblocks) /
 > `18` (manipulated freelist trunks) are scored by our single-tool matrix
@@ -199,8 +199,8 @@ the same answer key and the same `(col1,col2)` matcher (`BRING2LITE_CMD` =
   pay off (false-positive avoidance, WAL-vs-main-image substrate) see
   [`competitive-landscape.md`](competitive-landscape.md).
 
-![Precision-recall plane plus F1 and F0.5 grouped bars for ours, undark, and
-fqlite across categories 0C/0D/0E](img/recovery-comparison.png)
+![Precision-recall plane plus F1 and F0.5 grouped bars for ours, undark,
+fqlite, bring2lite, and SQL-DRP across categories 0C/0D/0E](img/recovery-comparison.png)
 
 The figure plots the **same harness-computed numbers** as the table above:
 `forensic/tests/nemetz_tool_comparison.rs` writes the per-(tool, category)
@@ -250,8 +250,8 @@ committed CSV/PNG were produced by that oracle run; `FQLITE_TAP` =
   2 within the 4-row substrate (substrate recall 0.500, precision 0.500).
 
 The consistent picture (per the committed oracle run): **our carver leads fqlite
-on in-page recall (`0C`, 0.833 vs 0.798) while keeping the highest precision of all
-three tools on every category and never re-reading a live row; it matches fqlite on
+on in-page recall (`0C`, 0.833 vs 0.798) while holding precision 1.000 on every
+category (no phantom, no live re-read); it matches fqlite on
 overwritten records (`0D`) — both recover every row whose full identity survives, at
 precision 1.000. On the `0E` overflow substrate (4 rows) ours recovers 4/4 to
 fqlite's 2/4, but end-to-end `0E` recall (0.333) keeps overflow a limited
@@ -498,9 +498,9 @@ reported here.
 
 ## What the numbers do and do NOT claim
 
-- They claim an **honest, reproducible measurement** of all three tools against
+- They claim an **honest, reproducible measurement** of all five tools against
   *this* independent corpus (per the committed oracle run): our carver leads fqlite
-  on in-page recall (`0C`) at the highest precision of the three and never re-reads
+  on in-page recall (`0C`) at precision 1.000 and never re-reads
   a live row; it matches fqlite on overwritten records (`0D`), where both recover
   every row whose full identity survives; on the `0E` overflow substrate ours
   recovers 4/4 to fqlite's 2/4, though end-to-end `0E` recall (0.333) keeps overflow
@@ -511,7 +511,7 @@ reported here.
   denominator of 19 substrate-recoverable rows); on `0C` we lead fqlite by raw
   recall; on `0E` end-to-end recovery is limited for both (ours 0.333, fqlite 0.167)
   — not a meaningful lead. We hold a structural 0-false-positive guarantee on the
-  in-page tier and the lowest phantom rate of the three throughout; overflow Tier-1
+  in-page tier and zero phantoms throughout; overflow Tier-1
   is a separate graded path (a freelist leaf can be stale), not part of that
   structural guarantee.
 - A low per-category end-to-end recall is a true statement about a capability

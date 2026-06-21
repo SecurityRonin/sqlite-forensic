@@ -947,9 +947,10 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
 /// to bound against (`None` — a fully dropped-table db), only the all-NULL arm
 /// applies; the dropped-table tier governs column counts there.
 fn is_structural_noise(values: &[Value], max_live_columns: Option<usize>) -> bool {
-    // RED stub — real predicate lands in the GREEN commit.
-    let _ = (values, max_live_columns);
-    false
+    if max_live_columns.is_some_and(|max| values.len() > max) {
+        return true;
+    }
+    values.iter().all(|v| matches!(v, Value::Null))
 }
 
 /// Two-tier deleted-record recovery: Tier-1 full rows **plus** Tier-2 partial
@@ -2052,9 +2053,8 @@ mod structural_noise_tests {
         // The inferred over-read: a rowid echoed as the INTEGER-PK first column
         // followed by a long serial-type-0 (NULL) tail — 102 columns where the
         // widest live table has 6. It belongs to no table → noise.
-        let overwide: Vec<Value> = std::iter::once(Value::Integer(14))
-            .chain(std::iter::repeat(Value::Null).take(101))
-            .collect();
+        let mut overwide = vec![Value::Null; 102];
+        overwide[0] = Value::Integer(14);
         assert!(is_structural_noise(&overwide, Some(6)));
     }
 
@@ -2084,7 +2084,7 @@ mod structural_noise_tests {
         // must still be kept, only all-NULL noise rejected.
         let row: Vec<Value> = (0..6).map(Value::Integer).collect();
         assert!(!is_structural_noise(&row, None));
-        let all_null: Vec<Value> = std::iter::repeat(Value::Null).take(6).collect();
+        let all_null = vec![Value::Null; 6];
         assert!(is_structural_noise(&all_null, None));
     }
 }

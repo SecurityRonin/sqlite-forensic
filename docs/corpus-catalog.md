@@ -467,8 +467,16 @@ manifest: `tests/data/cfreds/README.md` (the single detailed index for this set)
     carving is designed in [`design/journal-recovery.md`](design/journal-recovery.md).
     This was the Doer-Checker payoff: real NIST ground truth surfaced a real
     recovery-substrate gap our synthetic fixtures never exercised, now closed.
-- **SFT-05** (BLOB): **not committed** — each db is ~206 MB (gitignored/env-gated
-  class). Re-download from the SFT-05 dataset link in `tests/data/cfreds/README.md`.
+- **SFT-05** (BLOB / data types): **not committed** — `SFT-05_android.sqlite` /
+  `SFT-05_ios.sqlite` are ~206 MB each (gitignored/env-gated). Download both from
+  the NIST CFReDS "SQLite Database containing BLOB data" Drive folder (link in
+  `tests/data/cfreds/README.md`) into one directory and point
+  **`SQLITE_FORENSIC_SFT05`** at it; `core/tests/cfreds_sft05_types.rs` then
+  validates native-type + BLOB reading against the `new_students` table
+  (`id INT PK, name TEXT, photo BLOB, gpa FLOAT, has_covid_vaccine BOOLEAN,
+  year_graduated INT`; 100 rows, the `photo` BLOBs a variety of real graphic
+  formats — PNG/JPEG/GIF/TIFF/BMP/ISO-BMFF/PDF, all read intact). Skips cleanly
+  when the var is unset.
 
 `tests/data/sharifctf/db0.db` — a real damaged-header SQLite db from SharifCTF 8
 ("crashed db"); the 100-byte header is overwritten so `Database::open` returns

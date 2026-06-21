@@ -3,25 +3,28 @@
 //! The binary is the irreducible Humble-Object shell: it parses arguments,
 //! reads the evidence file into owned bytes, opens a read-only [`Database`],
 //! drives the `sqlite4n6` library's pure decision helpers, and — per the single
-//! `-f/--format` choice — writes one output: the **combined recovered workbook**
-//! (`-f xlsx`, the default → `<stem>.recovered.xlsx`), the **rebuilt carved
-//! database** (`-f db` → `<stem>.carved.db`), or a stdout rendering of the records
-//! (`-f table`/`csv`/`jsonl`/`rowids`). **The evidence file and its sidecars are
-//! never written** — the evidence bytes are owned by the [`Database`] and never
-//! flushed back, and the file output is *separate* (guarded so it can never
-//! resolve to the evidence db or a `-wal`/`-shm`/`-journal` sidecar). Every
-//! decision (path derivation, projection, filtering, rendering) lives in the
-//! unit-tested library; this file owns only I/O.
+//! `-f/--format` choice — emits one output. Every format writes a **derived-name
+//! file by default** (`<db-stem>.<suffix>` in the CWD): the **combined recovered
+//! workbook** (`-f xlsx`, the default → `<stem>.recovered.xlsx`), the **rebuilt
+//! carved database** (`-f db` → `<stem>.carved.db`), or a rendered record stream
+//! (`-f table`/`csv`/`jsonl` → `<stem>.carved.{txt,csv,jsonl}`).
+//! `-o <FILE>` overrides the path verbatim; the literal `-o -` streams the format
+//! to stdout instead. **The evidence file and its sidecars are never written** —
+//! the evidence bytes are owned by the [`Database`] and never flushed back, and
+//! every file output is *separate* (guarded so it can never resolve to the
+//! evidence db or a `-wal`/`-shm`/`-journal` sidecar). Every decision (destination
+//! resolution, projection, filtering, rendering) lives in the unit-tested library;
+//! this file owns only I/O.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlite4n6::{
-    carve_wal_snapshots, carved_db_path, combined_xlsx_bytes, filter_by_confidence,
-    group_attributed_tables, journal_carved_records, recovered_xlsx_path, render_audit,
+    carve_output_dest, carve_wal_snapshots, combined_xlsx_bytes, count_blob_cells,
+    filter_by_confidence, group_attributed_tables, journal_carved_records, render_audit,
     render_carve, render_carve_tiered, render_carve_with_snapshot, render_fragments, MinConfidence,
-    OutputFormat, EXCEL_MAX_ROWS,
+    OutputDest, OutputFormat, EXCEL_MAX_ROWS,
 };
 use sqlite_core::rebuild::build_recovered_db_tables;
 use sqlite_core::Database;
@@ -39,23 +42,24 @@ struct Cli {
     command: Commands,
 }
 
-/// The `carve` output format — one choice selects exactly one destination: a file
-/// (`xlsx`, `db`) or a stdout rendering (`table`, `csv`, `jsonl`, `rowids`).
+/// The `carve` output format — one choice selects exactly one destination. Every
+/// format writes a derived-name FILE by default (`<db-stem>.<suffix>` in the CWD);
+/// `-o <FILE>` overrides the path and `-o -` streams to STDOUT. The `xlsx` review
+/// workbook is named `.recovered.xlsx`; every raw carved-records encoding (`db`,
+/// `table`, `csv`, `jsonl`) shares the `.carved.*` family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Default)]
 enum FormatArg {
-    /// The full recovered review workbook (`<stem>.recovered.xlsx`) — a FILE.
+    /// The full recovered review workbook (`<stem>.recovered.xlsx`).
     #[default]
     Xlsx,
-    /// The carved-records database (`<stem>.carved.db`) — a FILE.
+    /// The carved-records database (`<stem>.carved.db`).
     Db,
-    /// Carved records as an aligned text table — STDOUT.
+    /// Carved records as an aligned text table (`<stem>.carved.txt`).
     Table,
-    /// Carved records as CSV — STDOUT.
+    /// Carved records as CSV (`<stem>.carved.csv`).
     Csv,
-    /// Carved records as JSONL — STDOUT.
+    /// Carved records as JSONL (`<stem>.carved.jsonl`).
     Jsonl,
-    /// Just the recovered rowids, one per line — STDOUT.
-    Rowids,
 }
 
 /// The `audit` output format (stdout rendering only).
@@ -78,16 +82,29 @@ impl From<AuditFormatArg> for OutputFormat {
 }
 
 impl FormatArg {
-    /// The stdout [`OutputFormat`] for a text rendering. `Rowids` renders over the
-    /// `table` layout (the rowid-only projection is selected separately, by
-    /// [`CarveArgs::rowid_only`]). Only meaningful for the stdout formats.
+    /// The stdout [`OutputFormat`] for a text rendering. Only meaningful for the
+    /// stream formats (`table`/`csv`/`jsonl`).
     fn stdout_format(self) -> OutputFormat {
         match self {
             FormatArg::Csv => OutputFormat::Csv,
             FormatArg::Jsonl => OutputFormat::Jsonl,
-            // Table, Rowids (and the file formats, never reached on the stdout
-            // path) all use the aligned table layout.
+            // Table (and the file formats, never reached on the stream path) use
+            // the aligned table layout.
             _ => OutputFormat::Table,
+        }
+    }
+
+    /// The two-part default extension for this format's derived output name
+    /// (`<db-stem>.<suffix>` in the CWD when no `-o` is given). The `xlsx` workbook
+    /// is the reconstructed review view (`recovered.xlsx`); every raw carved-records
+    /// encoding shares the `carved.*` family.
+    fn default_suffix(self) -> &'static str {
+        match self {
+            FormatArg::Xlsx => "recovered.xlsx",
+            FormatArg::Db => "carved.db",
+            FormatArg::Table => "carved.txt",
+            FormatArg::Csv => "carved.csv",
+            FormatArg::Jsonl => "carved.jsonl",
         }
     }
 }
@@ -132,19 +149,23 @@ struct CarveArgs {
     #[arg(value_name = "DB")]
     db: PathBuf,
 
-    /// Output format — one choice, one destination:
-    /// `xlsx` (the full recovered review workbook, a FILE; default),
-    /// `db` (the carved-records database, a FILE),
-    /// `table`/`csv`/`jsonl` (carved records to STDOUT),
-    /// `rowids` (just the recovered rowids, one per line, to STDOUT).
+    /// Output format — one choice, one destination. Each writes a derived-name FILE
+    /// by default: `xlsx` → `<stem>.recovered.xlsx` (the review workbook),
+    /// `db` → `<stem>.carved.db` (the carved-records database),
+    /// `table` → `<stem>.carved.txt`, `csv` → `<stem>.carved.csv`,
+    /// `jsonl` → `<stem>.carved.jsonl`. BLOB fidelity differs: `db` (native bytes)
+    /// and `jsonl` (`{"blob_base64": …}`) preserve blob CONTENT losslessly, while
+    /// `csv` and `table` render a blob as a `<blob:N bytes>` placeholder (only the
+    /// byte count survives) — use `db` or `jsonl` when blob content (e.g. recovered
+    /// images) must be preserved.
     #[arg(short = 'f', long, value_enum, default_value = "xlsx")]
     format: FormatArg,
 
-    /// Full output path for a file format (`xlsx`/`db`), honored EXACTLY as given
-    /// (no extension rewriting). Defaults to `<db-stem>.recovered.xlsx` for `xlsx`
-    /// or `<db-stem>.carved.db` for `db`, in the current directory. A path
-    /// resolving to the evidence db or a `-wal`/`-shm`/`-journal` sidecar is
-    /// refused. Ignored for the stdout formats.
+    /// Output path, honored EXACTLY as given (no extension rewriting). Defaults to
+    /// the format's `<db-stem>.<suffix>` in the current directory. A path resolving
+    /// to the evidence db or a `-wal`/`-shm`/`-journal` sidecar is refused. Use the
+    /// literal `-o -` to stream this format to STDOUT instead (e.g. `-f jsonl -o -
+    /// | jq`); a stdout stream prints the rendered rows only, with no summary line.
     #[arg(short = 'o', long, value_name = "FILE")]
     out: Option<PathBuf>,
 
@@ -165,8 +186,8 @@ struct CarveArgs {
     /// full rows. Fragments — lower-confidence partial rows salvaged where a full
     /// row could not be reconstructed but a distinctive cell survived — are shown
     /// **by default**, kept structurally separate from the full-row tier so they
-    /// can never be mistaken for a recovered row. `-f rowids` also omits them
-    /// (a fragment has no rowid). Fragments are sourced from the on-disk image only.
+    /// can never be mistaken for a recovered row. Fragments are sourced from the
+    /// on-disk image only.
     #[arg(long)]
     no_fragments: bool,
 
@@ -181,20 +202,13 @@ struct CarveArgs {
 
 impl CarveArgs {
     /// Whether to render the Tier-2 fragment section. On by default; suppressed
-    /// by `--no-fragments`, and by `-f rowids` (fragments carry no rowid, so a
-    /// rowid listing coherently excludes them rather than erroring).
+    /// only by `--no-fragments`.
     fn wants_fragments(&self) -> bool {
-        !self.no_fragments && self.format != FormatArg::Rowids
+        !self.no_fragments
     }
 
-    /// Whether the stdout renderer should project to bare rowids — true exactly for
-    /// the `rowids` format.
-    fn rowid_only(&self) -> bool {
-        self.format == FormatArg::Rowids
-    }
-
-    /// The stdout [`OutputFormat`] for a text rendering (`table`/`csv`/`jsonl`, and
-    /// `rowids` over the table layout). Only meaningful for the stdout formats.
+    /// The stdout [`OutputFormat`] for a text rendering (`table`/`csv`/`jsonl`).
+    /// Only meaningful for the stream formats.
     fn stdout_format(&self) -> OutputFormat {
         self.format.stdout_format()
     }
@@ -349,32 +363,35 @@ fn sidecar_prior_schema(args: &CarveArgs) -> std::collections::BTreeMap<String, 
 }
 
 fn run_carve(args: &CarveArgs) -> Result<(), String> {
+    // Resolve + guard the destination BEFORE carving, uniformly for every format,
+    // so an evidence-clobbering `-o` fails fast and nothing is read or written
+    // under it. `-o -` resolves to stdout; otherwise the verbatim `-o <FILE>` or the
+    // derived `<stem>.<suffix>` in the CWD.
+    let dest = carve_output_dest(&args.db, args.out.as_deref(), args.format.default_suffix())?;
     match args.format {
-        FormatArg::Xlsx => run_carve_xlsx(args),
-        FormatArg::Db => run_carve_db(args),
-        // table / csv / jsonl / rowids all render to stdout.
-        _ => run_carve_stdout(args),
+        FormatArg::Xlsx => run_carve_xlsx(args, &dest),
+        FormatArg::Db => run_carve_db(args, &dest),
+        // table / csv / jsonl render the same record stream.
+        _ => run_carve_stream(args, &dest),
     }
 }
 
-/// `-f xlsx` (the default): carve the full recovered records and write the
-/// combined `<stem>.recovered.xlsx` workbook — one sheet per live table with the
-/// recovered (deleted) rows folded back in by rowid (marked `is_deleted` /
-/// `is_guessed`, tinted), unattributed rows + fragments in separate tabs. The
-/// rollback-journal prior rows are folded in too when a `<db>-journal` is in play.
-/// The output path is the explicit `-o` (verbatim) or the derived
-/// `<stem>.recovered.xlsx`, guarded against the evidence set by the pure
-/// [`recovered_xlsx_path`]; this shell only performs the I/O.
-fn run_carve_xlsx(args: &CarveArgs) -> Result<(), String> {
-    // Resolve + guard the destination BEFORE carving, so an evidence-clobbering
-    // path fails fast and nothing is read or written under it.
-    let xlsx_path = recovered_xlsx_path(&args.db, args.out.as_deref())?;
-
+/// `-f xlsx` (the default): carve the full recovered records and emit the combined
+/// recovered workbook — one sheet per live table with the recovered (deleted) rows
+/// folded back in by rowid (marked `is_deleted` / `is_guessed`, tinted),
+/// unattributed rows + fragments in separate tabs. The rollback-journal prior rows
+/// are folded in too when a `<db>-journal` is in play. The workbook bytes go to the
+/// resolved `dest` (a file → `<stem>.recovered.xlsx` or the verbatim `-o`, with the
+/// summary line; or stdout for `-o -`); this shell only performs the I/O.
+fn run_carve_xlsx(args: &CarveArgs, dest: &OutputDest) -> Result<(), String> {
     let (db, records, fragments) = collect_for_rebuild(args)?;
     let journal = recover_journal(args, &db)?;
     let prior_schema = sidecar_prior_schema(args);
 
-    // Built to an in-memory buffer by the library; this shell only writes bytes
+    // The library wants a path hint for the truncation warning; stdout has none.
+    let path_hint = dest_path_hint(dest);
+
+    // Built to an in-memory buffer by the library; this shell only emits bytes
     // (and the library warns on stderr for any >1M-row sheet truncation).
     let xlsx_bytes = combined_xlsx_bytes(
         &db,
@@ -382,41 +399,95 @@ fn run_carve_xlsx(args: &CarveArgs) -> Result<(), String> {
         fragments.as_deref(),
         journal.as_ref(),
         &prior_schema,
-        &xlsx_path,
+        &path_hint,
         EXCEL_MAX_ROWS,
     )?;
-    std::fs::write(&xlsx_path, &xlsx_bytes)
-        .map_err(|e| format!("cannot write recovered xlsx {}: {e}", xlsx_path.display()))?;
+    emit_bytes(dest, &xlsx_bytes, "recovered xlsx")?;
 
-    print_carve_summary(records.len(), fragments.as_deref(), &xlsx_path);
-    print_journal_summary(journal.as_ref());
+    if let OutputDest::File(path) = dest {
+        print_carve_summary(records.len(), fragments.as_deref(), path);
+        print_journal_summary(journal.as_ref());
+    }
     Ok(())
 }
 
-/// `-f db`: carve the full recovered records and write the rebuilt
-/// `<stem>.carved.db` — every carved record grouped into its attribution tier:
-/// `recovered_<table>` (CERTAIN, real column names), `recovered_inferred`
-/// (consistent-with + an ambiguity flag), `recovered_unattributed` (unknown), plus
-/// `recovered_fragments`. The output path is the explicit `-o` (verbatim) or the
-/// derived `<stem>.carved.db`, guarded against the evidence set by the pure
-/// [`carved_db_path`]; this shell only performs the I/O.
-fn run_carve_db(args: &CarveArgs) -> Result<(), String> {
-    let db_path = carved_db_path(&args.db, args.out.as_deref())?;
-
+/// `-f db`: carve the full recovered records and emit the rebuilt carved database —
+/// every carved record grouped into its attribution tier: `recovered_<table>`
+/// (CERTAIN, real column names), `recovered_inferred` (consistent-with + an
+/// ambiguity flag), `recovered_unattributed` (unknown), plus `recovered_fragments`.
+/// The database bytes go to the resolved `dest` (a file → `<stem>.carved.db` or the
+/// verbatim `-o`, with the summary line; or stdout for `-o -`); this shell only
+/// performs the I/O.
+fn run_carve_db(args: &CarveArgs, dest: &OutputDest) -> Result<(), String> {
     let (db, records, fragments) = collect_for_rebuild(args)?;
     let prior_schema = sidecar_prior_schema(args);
 
     let tables = group_attributed_tables(&db, &records, fragments.as_deref(), &prior_schema);
     let bytes = build_recovered_db_tables(&tables);
-    std::fs::write(&db_path, &bytes)
-        .map_err(|e| format!("cannot write carved db {}: {e}", db_path.display()))?;
+    emit_bytes(dest, &bytes, "carved db")?;
 
-    print_carve_summary(records.len(), fragments.as_deref(), &db_path);
+    if let OutputDest::File(path) = dest {
+        print_carve_summary(records.len(), fragments.as_deref(), path);
+    }
     Ok(())
 }
 
+/// A path to hand the xlsx builder for its truncation-warning message. For a file
+/// destination it is the real output path; for stdout there is no file, so a
+/// neutral `<stdout>` placeholder is used (the warning is cosmetic).
+fn dest_path_hint(dest: &OutputDest) -> PathBuf {
+    match dest {
+        OutputDest::File(path) => path.clone(),
+        OutputDest::Stdout => PathBuf::from("<stdout>"),
+    }
+}
+
+/// Emit `bytes` to the resolved destination: a file write or stdout (`-o -`). Both
+/// paths funnel through one [`write_dest`] call, so a single shared error mapping
+/// surfaces an I/O failure loudly (named by `label` + the destination) instead of
+/// panicking on, e.g., a broken pipe.
+fn emit_bytes(dest: &OutputDest, bytes: &[u8], label: &str) -> Result<(), String> {
+    write_dest(dest, bytes, label)
+}
+
+/// Emit rendered `lines` to the resolved destination as one newline-terminated
+/// body (a trailing newline after the last line so a file ends cleanly and a stdout
+/// stream matches the historical `println!` output), via the same [`write_dest`].
+fn emit_lines(dest: &OutputDest, lines: &[String], label: &str) -> Result<(), String> {
+    let mut body = lines.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    write_dest(dest, body.as_bytes(), label)
+}
+
+/// Write `bytes` to a file path or stdout, mapping any I/O error to a single
+/// `label`ed diagnostic. Stdout uses a locked handle and is flushed; the file path
+/// truncates/creates. This is the one place carve output reaches the OS, so the
+/// fail-loud error mapping lives here once for every format and destination. The
+/// error arm is reached by the write-failure tests (an `-o` path that cannot be
+/// created, e.g. occupied by a directory or under a missing parent).
+fn write_dest(dest: &OutputDest, bytes: &[u8], label: &str) -> Result<(), String> {
+    use std::io::Write;
+    let (mut sink, where_): (Box<dyn Write>, String) = match dest {
+        OutputDest::File(path) => match std::fs::File::create(path) {
+            Ok(f) => (Box::new(f), path.display().to_string()),
+            Err(e) => return Err(format!("cannot write {label} {}: {e}", path.display())),
+        },
+        OutputDest::Stdout => (Box::new(std::io::stdout().lock()), "stdout".to_string()),
+    };
+    // `match` (not `.map_err(closure)`) so the fail-loud error arm is a region of
+    // this covered function, not a separate closure that the write-success tests
+    // would leave uncovered.
+    match sink.write_all(bytes).and_then(|()| sink.flush()) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(format!("cannot write {label} to {where_}: {e}")),
+    }
+}
+
 /// The one-line carve summary naming the written file and the record (and, when
-/// fragments were carved, fragment) counts.
+/// fragments were carved, fragment) counts. Printed only for a file destination —
+/// a `-o -` stdout stream emits the rendered rows alone, with no summary.
 fn print_carve_summary(records: usize, fragments: Option<&[CarvedFragment]>, path: &Path) {
     match fragments {
         Some(frags) => println!(
@@ -495,9 +566,62 @@ fn collect_for_rebuild(args: &CarveArgs) -> Result<RebuildInputs, String> {
     Ok((db, records, fragments))
 }
 
-/// Stdout mode (`-f table`/`csv`/`jsonl`/`rowids`): the historical rendering
-/// behavior, byte-for-byte unchanged.
-fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
+/// The rendered stream plus the counts its summary line (and the lossy-format
+/// warning) need: all output lines (the carved rows and, when enabled, the fragment
+/// section), the rendered record count, the fragment count (`None` when fragments
+/// were suppressed), and the number of `BLOB` cells in the rendered set (record
+/// values + fragment surviving cells) — what `csv`/`table` collapse to a
+/// `<blob:N bytes>` placeholder.
+struct RenderedStream {
+    lines: Vec<String>,
+    records: usize,
+    fragments: Option<usize>,
+    blob_cells: usize,
+}
+
+/// Stream mode (`-f table`/`csv`/`jsonl`): render the carved records (and, by
+/// default, the Tier-2 fragment section) the historical way, then emit to the
+/// resolved `dest` — a derived-name file (`<stem>.carved.{txt,csv,jsonl}`) or the
+/// verbatim `-o <FILE>` with the summary line, or stdout for `-o -` (rows only, no
+/// summary). The rendering itself is byte-for-byte unchanged.
+fn run_carve_stream(args: &CarveArgs, dest: &OutputDest) -> Result<(), String> {
+    let rendered = render_carve_stream(args)?;
+    emit_lines(dest, &rendered.lines, "carve output")?;
+    // Fail loud on silent evidence loss: `csv`/`table` collapse a BLOB to a
+    // `<blob:N bytes>` placeholder (content dropped). Warn on stderr (keeping stdout
+    // clean for `-o -` piping) whenever at least one blob was actually truncated;
+    // `jsonl` preserves blobs (base64) so it never warns.
+    warn_lossy_blob_truncation(args.format, rendered.blob_cells);
+    if let OutputDest::File(path) = dest {
+        print_stream_summary(rendered.records, rendered.fragments, path);
+    }
+    Ok(())
+}
+
+/// Emit the lossy-blob warning to stderr when the chosen text format (`csv`/`table`)
+/// actually dropped at least one blob's content to a `<blob:N bytes>` placeholder.
+/// Silent on blob-free data (no noise) and on the blob-preserving formats.
+fn warn_lossy_blob_truncation(format: FormatArg, blob_cells: usize) {
+    if blob_cells == 0 {
+        return;
+    }
+    let label = match format {
+        FormatArg::Csv => "csv",
+        FormatArg::Table => "table",
+        // jsonl preserves blobs; xlsx/db never reach the stream path.
+        _ => return,
+    };
+    eprintln!(
+        "warning: {blob_cells} BLOB value(s) were truncated to a `<blob:N bytes>` \
+         placeholder in {label} output (content NOT exported); use `-f db` or \
+         `-f jsonl` to preserve blob content"
+    );
+}
+
+/// Render the stream output lines and the summary counts, without emitting them.
+/// Splits the WAL-applied view (LSN-labelled, with an on-disk fragment section)
+/// from the on-disk-only view (which may fold in `<db>-journal` prior rows).
+fn render_carve_stream(args: &CarveArgs) -> Result<RenderedStream, String> {
     let fmt = args.stdout_format();
     // Open the main file's owned bytes (never written back, no sidecar created).
     let db_bytes = std::fs::read(&args.db)
@@ -525,17 +649,25 @@ fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
         let records = filter_by_confidence(records, args.min_confidence.into());
         let attrs = attribute_records(&db, &records);
         let risks = table_instance_risks_with_sidecar(&db, &records, &attrs, &prior_schema);
-        for line in render_carve_with_snapshot(&records, &risks, fmt, args.rowid_only()) {
-            println!("{line}");
-        }
+        // `rowid_only` is always false: the bare-rowid format was dropped (multiple
+        // versions per rowid + rowid reuse + destroyed rowids made a flat list
+        // misleading); the full record stream is always rendered.
+        let mut lines = render_carve_with_snapshot(&records, &risks, fmt, false);
         // v1 fragments are sourced from the on-disk image only (no WAL fragment
-        // pass yet); print the default section under the WAL-applied view's `db`.
-        if args.wants_fragments() {
-            let fragments = carve_with_fragments(&db).fragments;
-            for line in render_fragments(&fragments, fmt) {
-                println!("{line}");
-            }
+        // pass yet); render the default section under the WAL-applied view's `db`.
+        let frags = args
+            .wants_fragments()
+            .then(|| carve_with_fragments(&db).fragments);
+        if let Some(frags) = &frags {
+            lines.extend(render_fragments(frags, fmt));
         }
+        let blob_cells = count_blob_cells(&records, frags.as_deref());
+        Ok(RenderedStream {
+            lines,
+            records: records.len(),
+            fragments: frags.as_ref().map(Vec::len),
+            blob_cells,
+        })
     } else {
         // On-disk-only view: single view, no snapshot column. With no WAL in play, a
         // `<db>-journal` may apply — its recovered prior rows (deleted + modified)
@@ -553,22 +685,42 @@ fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
             full.extend(journal_records);
             let attrs = attribute_records(&db, &full);
             let risks = table_instance_risks_with_sidecar(&db, &full, &attrs, &prior_schema);
-            for line in render_carve_tiered(&full, &risks, &tiers.fragments, fmt, args.rowid_only())
-            {
-                println!("{line}");
-            }
+            let lines = render_carve_tiered(&full, &risks, &tiers.fragments, fmt, false);
+            let blob_cells = count_blob_cells(&full, Some(&tiers.fragments));
+            Ok(RenderedStream {
+                lines,
+                records: full.len(),
+                fragments: Some(tiers.fragments.len()),
+                blob_cells,
+            })
         } else {
             let mut records =
                 filter_by_confidence(carve_all_deleted_records(&db), args.min_confidence.into());
             records.extend(journal_records);
             let attrs = attribute_records(&db, &records);
             let risks = table_instance_risks_with_sidecar(&db, &records, &attrs, &prior_schema);
-            for line in render_carve(&records, &risks, fmt, args.rowid_only()) {
-                println!("{line}");
-            }
+            let lines = render_carve(&records, &risks, fmt, false);
+            let blob_cells = count_blob_cells(&records, None);
+            Ok(RenderedStream {
+                lines,
+                records: records.len(),
+                fragments: None,
+                blob_cells,
+            })
         }
     }
-    Ok(())
+}
+
+/// The stream-format file summary, mirroring [`print_carve_summary`] but taking the
+/// fragment **count** directly (the stream path tracks counts, not slices).
+fn print_stream_summary(records: usize, fragments: Option<usize>, path: &Path) {
+    match fragments {
+        Some(n) => println!(
+            "wrote {records} record(s) and {n} fragment(s) to {}",
+            path.display()
+        ),
+        None => println!("wrote {records} record(s) to {}", path.display()),
+    }
 }
 
 /// The `<db>-journal` rollback-journal sidecar to fold into an `audit`, applying
@@ -814,30 +966,15 @@ mod tests {
         );
     }
 
-    /// `-f rowids` is a full-row rowid listing; fragments have no rowid, so it
-    /// coherently implies no fragment section — a usage combination, not an error.
-    #[test]
-    fn rowids_format_suppresses_fragments() {
-        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "-f", "rowids"]);
-        assert!(
-            !args.wants_fragments(),
-            "-f rowids implies the fragment section is omitted"
-        );
-        assert!(
-            args.rowid_only(),
-            "-f rowids selects the rowid-only projection"
-        );
-    }
-
     /// The bare default carve selects the `xlsx` file output (the default format),
-    /// not a stdout rendering and not the carved db.
+    /// not a stream rendering and not the carved db.
     #[test]
     fn default_carve_format_is_xlsx() {
         let args = carve_args(&["sqlite4n6", "carve", "db.sqlite"]);
         assert_eq!(args.format, FormatArg::Xlsx, "the default format is xlsx");
         assert!(
-            !args.rowid_only(),
-            "the default is not the rowid projection"
+            args.wants_fragments(),
+            "fragments are on by default (no --no-fragments)"
         );
     }
 
@@ -849,7 +986,7 @@ mod tests {
         assert_eq!(args.format, FormatArg::Db, "-f db selects the carved db");
     }
 
-    /// The stdout formats (`table`/`csv`/`jsonl`/`rowids`) map onto the right
+    /// The stream formats (`table`/`csv`/`jsonl`) map onto the right
     /// [`OutputFormat`] for rendering.
     #[test]
     fn stdout_formats_map_to_output_format() {
@@ -857,11 +994,42 @@ mod tests {
             ("table", OutputFormat::Table),
             ("csv", OutputFormat::Csv),
             ("jsonl", OutputFormat::Jsonl),
-            ("rowids", OutputFormat::Table),
         ] {
             let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "-f", flag]);
             assert_eq!(args.stdout_format(), want, "-f {flag} renders as {want:?}");
         }
+    }
+
+    /// Each format's default-name suffix is the derived `<stem>.<suffix>` extension
+    /// — `recovered.xlsx` for the review workbook, the `carved.*` family for every
+    /// raw carved-records encoding. Covers every `FormatArg` arm.
+    #[test]
+    fn every_format_has_its_default_suffix() {
+        for (flag, want) in [
+            ("xlsx", "recovered.xlsx"),
+            ("db", "carved.db"),
+            ("table", "carved.txt"),
+            ("csv", "carved.csv"),
+            ("jsonl", "carved.jsonl"),
+        ] {
+            let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "-f", flag]);
+            assert_eq!(
+                args.format.default_suffix(),
+                want,
+                "-f {flag} default suffix"
+            );
+        }
+    }
+
+    /// The dropped `rowids` format value no longer parses — it was removed because a
+    /// flat rowid list is misleading under WAL/journal multi-version recovery and
+    /// rowid reuse, and freeblock-reconstructed records carry a destroyed rowid.
+    #[test]
+    fn rowids_format_is_rejected() {
+        assert!(
+            Cli::try_parse_from(["sqlite4n6", "carve", "db.sqlite", "-f", "rowids"]).is_err(),
+            "-f rowids must be rejected as an unknown value"
+        );
     }
 
     /// The dropped `--db` / `--rowid-only` flags no longer parse — clap rejects

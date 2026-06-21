@@ -3,9 +3,11 @@
 //! core). Every decision that can be made without I/O — output-format and
 //! confidence-threshold parsing, projecting a carved record or an anomaly into a
 //! row of string cells, confidence filtering, rowid-only projection, and the
-//! table/CSV/JSONL rendering of both surfaces — lives here so it is directly
-//! unit-testable. `main()` is the thin shell that only reads the evidence file
-//! and writes the rendered lines to stdout.
+//! table/CSV/JSONL rendering of both surfaces, and the output-destination
+//! resolution (derived-name file, verbatim `-o`, or the `-o -` stdout escape) —
+//! lives here so it is directly unit-testable. `main()` is the thin shell that
+//! only reads the evidence file and emits the rendered output to the resolved
+//! destination.
 
 use std::path::{Path, PathBuf};
 
@@ -106,6 +108,28 @@ fn value_to_json(value: &Value) -> String {
         Value::Blob(b) => format!("{{\"blob_base64\":\"{}\"}}", base64_encode(b)),
         other => format!("\"{}\"", json_escape(&value_to_cell(other))),
     }
+}
+
+/// Count the carved `BLOB` cells across the records' values AND the fragments'
+/// surviving cells — exactly the cells that the `table`/`csv` renderers collapse
+/// to a `<blob:N bytes>` placeholder (lossy: only the byte count survives, not the
+/// content). The CLI uses this to fail loud — warn on stderr — when a lossy text
+/// format actually drops blob content, so silent evidence loss is made visible.
+/// `db` and `jsonl` preserve blobs, so the caller does not warn for those.
+#[must_use]
+pub fn count_blob_cells(records: &[CarvedRecord], fragments: Option<&[CarvedFragment]>) -> usize {
+    let in_records = records
+        .iter()
+        .flat_map(|r| &r.values)
+        .filter(|v| matches!(v, Value::Blob(_)))
+        .count();
+    let in_fragments = fragments
+        .into_iter()
+        .flatten()
+        .flat_map(|f| &f.surviving)
+        .filter(|(_, v)| matches!(v, Value::Blob(_)))
+        .count();
+    in_records + in_fragments
 }
 
 /// Base64-encode bytes (RFC 4648 standard alphabet, with `=` padding).
@@ -733,48 +757,42 @@ fn render_audit_jsonl(anomalies: &[Anomaly]) -> Vec<String> {
         .collect()
 }
 
-// ---- carve output paths (.carved.db / .recovered.xlsx) ---------------------
+// ---- carve output destination (file or stdout) ----------------------------
 
-/// Resolve the output path for the rebuilt **carved** database, enforcing the
-/// forensic-soundness guard.
-///
-/// With no `-o`, the path is the evidence file's own stem with the `.carved.db`
-/// suffix, in the **current working directory** (`History.db` →
-/// `History.carved.db`), never beside the evidence. An explicit `out` is honored
-/// **verbatim** — the exact path given, with no stem or extension stripping
-/// (`-o /p/foo.db` → `/p/foo.db`). Either way the resolved path is **refused** (an
-/// `Err`) when it equals the evidence database or any of its `-wal` / `-shm` /
-/// `-journal` sidecars, so a carved db can never overwrite the evidence set.
-pub fn carved_db_path(db: &Path, out: Option<&Path>) -> Result<PathBuf, String> {
-    resolve_output_path(db, out, "carved.db", "carved db")
+/// Where a `carve` output goes: a concrete file on disk, or stdout (the `-o -`
+/// piping escape). Every output format — `xlsx`, `db`, and the stream formats
+/// (`table`/`csv`/`jsonl`) — resolves to one of these via [`carve_output_dest`], so
+/// the destination logic is uniform across formats.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputDest {
+    /// Write to standard output (`-o -`); nothing is written to disk and the
+    /// evidence guard does not apply.
+    Stdout,
+    /// Write to this file path (the verbatim `-o <FILE>`, or the derived
+    /// `<stem>.<suffix>` in the CWD), guarded against the evidence set.
+    File(PathBuf),
 }
 
-/// Resolve the output path for the **recovered** combined workbook — the
-/// reconstructed live + recovered view.
+/// Resolve a `carve` output destination, enforcing the forensic-soundness guard.
 ///
-/// Resolution mirrors [`carved_db_path`]: the evidence stem with the
-/// `.recovered.xlsx` suffix in the CWD by default (`History.db` →
-/// `History.recovered.xlsx`), or the explicit `-o` path **verbatim**
-/// (`-o /p/foo.xlsx` → `/p/foo.xlsx`, no stripping). The same evidence-set guard
-/// applies.
-pub fn recovered_xlsx_path(db: &Path, out: Option<&Path>) -> Result<PathBuf, String> {
-    resolve_output_path(db, out, "recovered.xlsx", "recovered xlsx")
-}
-
-/// Shared output-path resolution + evidence guard for a carve output. With an
-/// explicit `out`, that path is used **verbatim** (the caller asked for an exact
-/// file). With no `out`, the path is the evidence file's stem with the two-part
-/// `suffix` (e.g. `carved.db`, `recovered.xlsx`) appended, as a bare filename so
-/// it lands in the CWD; a source with no filename component degrades to the fixed
-/// `recovered` stem rather than panicking. Either way the result is refused if it
-/// lands on the evidence db or a sidecar (`label` names the output in the
-/// diagnostic).
-fn resolve_output_path(
+/// - `-o -` (a literal single dash) → [`OutputDest::Stdout`]: the piping escape;
+///   nothing is written to disk, and the evidence guard does not apply.
+/// - `-o <FILE>` (anything else) → [`OutputDest::File`] with that path **verbatim**
+///   (no stem/extension rewriting), refused if it lands on the evidence db or a
+///   `-wal`/`-shm`/`-journal` sidecar.
+/// - no `-o` → [`OutputDest::File`] with the evidence file's stem plus the
+///   format's two-part `default_suffix` (e.g. `carved.jsonl`, `carved.db`), as
+///   a bare filename so it lands in the **current working directory**; a source
+///   with no filename component degrades to the fixed `recovered` stem rather than
+///   panicking. The same evidence guard applies.
+pub fn carve_output_dest(
     db: &Path,
     out: Option<&Path>,
-    suffix: &str,
-    label: &str,
-) -> Result<PathBuf, String> {
+    default_suffix: &str,
+) -> Result<OutputDest, String> {
+    if out == Some(Path::new("-")) {
+        return Ok(OutputDest::Stdout);
+    }
     let resolved = if let Some(path) = out {
         // An explicit `-o` is honored verbatim — the exact file the caller named.
         path.to_path_buf()
@@ -785,18 +803,18 @@ fn resolve_output_path(
             |s| s.to_string_lossy().into_owned(),
         );
         let mut p = PathBuf::from(stem);
-        p.set_extension(suffix);
+        p.set_extension(default_suffix);
         p
     };
     if let Some(clash) = evidence_path_clash(db, &resolved) {
         return Err(format!(
-            "refusing to write {label} to {} — it is the evidence {}; \
+            "refusing to write output to {} — it is the evidence {}; \
              choose a different --out",
             resolved.display(),
             clash
         ));
     }
-    Ok(resolved)
+    Ok(OutputDest::File(resolved))
 }
 
 /// If `out` names the evidence db or one of its sidecars, return a label for the
@@ -2750,6 +2768,39 @@ mod tests {
     }
 
     #[test]
+    fn count_blob_cells_counts_records_and_fragments() {
+        // Two blob cells in the record values + one surviving blob in a fragment =
+        // 3; non-blob cells are not counted.
+        let records = vec![
+            rec(
+                1,
+                0.9,
+                RecoverySource::FreelistPage,
+                vec![Value::Blob(vec![1, 2]), Value::Text("x".into())],
+            ),
+            rec(
+                2,
+                0.9,
+                RecoverySource::FreelistPage,
+                vec![Value::Blob(vec![3]), Value::Integer(7)],
+            ),
+        ];
+        let mut f = frag();
+        f.surviving = vec![(0, Value::Integer(9)), (1, Value::Blob(vec![4, 5, 6]))];
+        assert_eq!(count_blob_cells(&records, Some(&[f])), 3);
+        // No fragments slice → only the record blobs are counted.
+        assert_eq!(count_blob_cells(&records, None), 2);
+        // Blob-free input → zero (no warning fires for the caller).
+        let clean = vec![rec(
+            3,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Text("y".into())],
+        )];
+        assert_eq!(count_blob_cells(&clean, None), 0);
+    }
+
+    #[test]
     fn carve_table_has_header_and_renders_values() {
         let records = vec![rec(
             1,
@@ -3352,92 +3403,110 @@ mod tests {
         assert_eq!(lines, vec!["7".to_string()]);
     }
 
-    // ---- rebuilt-db output: path derivation + safety guard -----------------
+    // ---- carve output destination: path derivation + safety guard ----------
+
+    /// A small wrapper that asserts a [`OutputDest::File`] and returns the path,
+    /// so the per-format default-name tests read as cleanly as the old ones.
+    fn dest_file(db: &str, out: Option<&str>, suffix: &str) -> PathBuf {
+        match carve_output_dest(Path::new(db), out.map(Path::new), suffix).unwrap() {
+            OutputDest::File(p) => p,
+            OutputDest::Stdout => panic!("expected a file destination"),
+        }
+    }
 
     #[test]
-    fn default_carved_db_path_is_stem_carved_db_in_cwd() {
-        // History.db -> History.carved.db (final extension stripped).
-        assert_eq!(
-            carved_db_path(Path::new("/evidence/History.db"), None).unwrap(),
-            PathBuf::from("History.carved.db")
-        );
-        // ChatStorage.sqlite -> ChatStorage.carved.db.
-        assert_eq!(
-            carved_db_path(Path::new("ChatStorage.sqlite"), None).unwrap(),
-            PathBuf::from("ChatStorage.carved.db")
-        );
-        // A name with no extension keeps the whole stem.
-        assert_eq!(
-            carved_db_path(Path::new("/data/wal_only"), None).unwrap(),
-            PathBuf::from("wal_only.carved.db")
-        );
+    fn default_name_is_stem_plus_suffix_in_cwd_per_format() {
+        // Every format's default lands at `<evidence-stem>.<suffix>` in the CWD.
+        for (db, suffix, want) in [
+            (
+                "/evidence/History.db",
+                "recovered.xlsx",
+                "History.recovered.xlsx",
+            ),
+            ("/evidence/History.db", "carved.db", "History.carved.db"),
+            (
+                "/evidence/History.db",
+                "carved.jsonl",
+                "History.carved.jsonl",
+            ),
+            ("/evidence/History.db", "carved.csv", "History.carved.csv"),
+            ("/evidence/History.db", "carved.txt", "History.carved.txt"),
+            ("ChatStorage.sqlite", "carved.db", "ChatStorage.carved.db"),
+            // A name with no extension keeps the whole stem.
+            (
+                "/data/wal_only",
+                "recovered.xlsx",
+                "wal_only.recovered.xlsx",
+            ),
+        ] {
+            assert_eq!(dest_file(db, None, suffix), PathBuf::from(want));
+        }
         // A path with no filename component degrades to a fixed safe name rather
         // than panicking (exercises the no-stem fallback arm).
         assert_eq!(
-            carved_db_path(Path::new("/"), None).unwrap(),
+            dest_file("/", None, "carved.db"),
             PathBuf::from("recovered.carved.db")
         );
     }
 
     #[test]
-    fn default_recovered_xlsx_path_is_stem_recovered_xlsx_in_cwd() {
-        // History.db -> History.recovered.xlsx (final extension stripped).
+    fn out_is_honored_verbatim_regardless_of_format() {
+        // `-o <FILE>` is the EXACT path — no stem/extension stripping — for any
+        // format suffix.
         assert_eq!(
-            recovered_xlsx_path(Path::new("/evidence/History.db"), None).unwrap(),
-            PathBuf::from("History.recovered.xlsx")
-        );
-        // ChatStorage.sqlite -> ChatStorage.recovered.xlsx.
-        assert_eq!(
-            recovered_xlsx_path(Path::new("ChatStorage.sqlite"), None).unwrap(),
-            PathBuf::from("ChatStorage.recovered.xlsx")
-        );
-        // No-stem fallback.
-        assert_eq!(
-            recovered_xlsx_path(Path::new("/"), None).unwrap(),
-            PathBuf::from("recovered.recovered.xlsx")
-        );
-    }
-
-    #[test]
-    fn out_is_honored_verbatim_for_both_outputs() {
-        // `-o /p/foo.xlsx` is the EXACT path — no stem/extension stripping. The db
-        // and xlsx helpers each take the path as given (the caller picks which
-        // suffix to ask for; the helper does not append one).
-        assert_eq!(
-            recovered_xlsx_path(Path::new("History.db"), Some(Path::new("/p/foo.xlsx"))).unwrap(),
+            dest_file("History.db", Some("/p/foo.xlsx"), "recovered.xlsx"),
             PathBuf::from("/p/foo.xlsx")
         );
         assert_eq!(
-            carved_db_path(Path::new("History.db"), Some(Path::new("/p/foo.db"))).unwrap(),
+            dest_file("History.db", Some("/p/foo.db"), "carved.db"),
             PathBuf::from("/p/foo.db")
         );
         // An unusual name (no extension, or a different extension) is kept exactly.
         assert_eq!(
-            recovered_xlsx_path(Path::new("History.db"), Some(Path::new("/p/bare"))).unwrap(),
+            dest_file("History.db", Some("/p/bare"), "carved.jsonl"),
             PathBuf::from("/p/bare")
         );
         assert_eq!(
-            carved_db_path(Path::new("History.db"), Some(Path::new("out/x.sqlite"))).unwrap(),
+            dest_file("History.db", Some("out/x.sqlite"), "carved.db"),
             PathBuf::from("out/x.sqlite")
         );
     }
 
     #[test]
-    fn carved_db_guard_refuses_an_out_onto_the_evidence() {
-        // An explicit `-o` landing exactly on the evidence db is refused.
-        let db = Path::new("/evidence/History.db");
-        assert!(carved_db_path(db, Some(Path::new("/evidence/History.db"))).is_err());
-        // A genuinely different path is allowed.
-        assert!(carved_db_path(db, Some(Path::new("/out/History.carved.db"))).is_ok());
+    fn out_dash_resolves_to_stdout_for_any_format() {
+        // `-o -` is the stdout escape: it bypasses the suffix/derivation AND the
+        // evidence guard (nothing is written to disk), for every format.
+        for suffix in ["recovered.xlsx", "carved.db", "carved.jsonl"] {
+            assert_eq!(
+                carve_output_dest(
+                    Path::new("/evidence/History.db"),
+                    Some(Path::new("-")),
+                    suffix
+                )
+                .unwrap(),
+                OutputDest::Stdout
+            );
+        }
     }
 
     #[test]
-    fn recovered_xlsx_guard_refuses_an_out_onto_a_sidecar() {
-        // An explicit `-o` landing on a `-wal` sidecar is refused.
-        let db = Path::new("/evidence/History.db");
-        assert!(recovered_xlsx_path(db, Some(Path::new("/evidence/History.db-wal"))).is_err());
+    fn out_guard_refuses_evidence_set_for_any_format() {
+        // An explicit `-o <file>` onto the evidence db or a sidecar is refused, for
+        // a stream format suffix just as for the binary ones.
+        let db = Path::new("/ev/History.db");
+        assert!(
+            carve_output_dest(db, Some(Path::new("/ev/History.db")), "carved.jsonl").is_err(),
+            "a stream -o onto the evidence db must be refused"
+        );
+        assert!(
+            carve_output_dest(db, Some(Path::new("/ev/History.db-wal")), "carved.txt").is_err(),
+            "a stream -o onto a sidecar must be refused too"
+        );
         // A genuinely different path is allowed.
-        assert!(recovered_xlsx_path(db, Some(Path::new("/out/History.recovered.xlsx"))).is_ok());
+        assert!(
+            carve_output_dest(db, Some(Path::new("/out/x.jsonl")), "carved.jsonl").is_ok(),
+            "a distinct -o path is allowed"
+        );
     }
 
     #[test]

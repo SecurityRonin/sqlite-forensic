@@ -108,6 +108,10 @@ fn sqldrp_cmd() -> Option<PathBuf> {
     std::env::var_os("SQLDRP_CMD").map(PathBuf::from)
 }
 
+fn sqlite_dissect_cmd() -> Option<PathBuf> {
+    std::env::var_os("SQLITE_DISSECT_CMD").map(PathBuf::from)
+}
+
 /// One tool's confusion matrix on one database, scored against the Nemetz answer
 /// key via the `(col1,col2)` identity projection.
 #[derive(Default, Clone)]
@@ -356,8 +360,33 @@ fn sqldrp_recover(cmd: &Path, db: &Path) -> BTreeSet<RowId> {
 /// the cross-tool `(col1,col2)` identity set, the same projection every other
 /// CSV-emitting oracle is scored on.
 fn parse_sqlite_dissect(text: &str) -> BTreeSet<RowId> {
-    let _ = text;
-    BTreeSet::new() // RED stub: real body lands in the GREEN commit
+    let mut set = BTreeSet::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f = split_csv(line);
+        // Skip the optional `rowid,...` header row the wrapper may emit.
+        if f.first().is_some_and(|s| s.eq_ignore_ascii_case("rowid")) {
+            continue;
+        }
+        if f.len() >= 3 {
+            set.insert((unquote(&f[1]), unquote(&f[2])));
+        }
+    }
+    set
+}
+
+/// sqlite_dissect's recovered `(col1,col2)` set via `scripts/run-sqlite-dissect.sh`.
+/// DC3's SQLite Dissect parses the database together with its rollback journal and
+/// WAL; the wrapper normalizes its export to one `rowid,col1,col2,...` record per
+/// line, scored on the same `(col1,col2)` identity as the other oracles.
+fn sqlite_dissect_recover(cmd: &Path, db: &Path) -> BTreeSet<RowId> {
+    let out = Command::new(cmd)
+        .arg(db)
+        .output()
+        .expect("sqlite_dissect wrapper must execute");
+    parse_sqlite_dissect(&String::from_utf8_lossy(&out.stdout))
 }
 
 #[test]
@@ -470,6 +499,7 @@ struct Oracles<'a> {
     fqlite: Option<&'a Path>,
     bring2lite: Option<&'a Path>,
     sqldrp: Option<&'a Path>,
+    sqlite_dissect: Option<&'a Path>,
 }
 
 /// Per-category totals for ours + each gated oracle. A `None` field means the
@@ -480,6 +510,7 @@ struct CategoryRun {
     fqlite: Option<CatTotals>,
     bring2lite: Option<CatTotals>,
     sqldrp: Option<CatTotals>,
+    sqlite_dissect: Option<CatTotals>,
 }
 
 fn empty_totals() -> CatTotals {
@@ -497,6 +528,7 @@ fn category_totals(cat: &str, oracles: Oracles) -> CategoryRun {
     let mut f = oracles.fqlite.map(|_| empty_totals());
     let mut b = oracles.bring2lite.map(|_| empty_totals());
     let mut s = oracles.sqldrp.map(|_| empty_totals());
+    let mut sd = oracles.sqlite_dissect.map(|_| empty_totals());
 
     for (nid, c) in in_scope().into_iter().filter(|(_, c)| c == cat) {
         let path = db_path(&nid, &c);
@@ -526,6 +558,9 @@ fn category_totals(cat: &str, oracles: Oracles) -> CategoryRun {
         if let Some(cmd) = oracles.sqldrp {
             accumulate(s.as_mut(), sqldrp_recover(cmd, &path));
         }
+        if let Some(cmd) = oracles.sqlite_dissect {
+            accumulate(sd.as_mut(), sqlite_dissect_recover(cmd, &path));
+        }
     }
     CategoryRun {
         ours: o,
@@ -533,6 +568,7 @@ fn category_totals(cat: &str, oracles: Oracles) -> CategoryRun {
         fqlite: f,
         bring2lite: b,
         sqldrp: s,
+        sqlite_dissect: sd,
     }
 }
 
@@ -546,6 +582,7 @@ fn emit_tool_comparison() {
     let fqlite = fqlite_tap();
     let bring2lite = bring2lite_cmd();
     let sqldrp = sqldrp_cmd();
+    let sqlite_dissect = sqlite_dissect_cmd();
     if undark.is_none() {
         eprintln!("NOTE undark column omitted: set UNDARK_BIN to include it");
     }
@@ -558,11 +595,15 @@ fn emit_tool_comparison() {
     if sqldrp.is_none() {
         eprintln!("NOTE SQL-DRP column omitted: set SQLDRP_CMD to include it");
     }
+    if sqlite_dissect.is_none() {
+        eprintln!("NOTE sqlite_dissect column omitted: set SQLITE_DISSECT_CMD to include it");
+    }
     let oracles = Oracles {
         undark: undark.as_deref(),
         fqlite: fqlite.as_deref(),
         bring2lite: bring2lite.as_deref(),
         sqldrp: sqldrp.as_deref(),
+        sqlite_dissect: sqlite_dissect.as_deref(),
     };
 
     println!(
@@ -612,6 +653,7 @@ fn emit_tool_comparison() {
             ("fqlite", &run.fqlite),
             ("bring2lite", &run.bring2lite),
             ("sqldrp", &run.sqldrp),
+            ("sqlite_dissect", &run.sqlite_dissect),
         ] {
             if let Some(t) = totals {
                 print_row(cat, tool, t);

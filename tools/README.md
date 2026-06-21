@@ -17,6 +17,7 @@ at the pinned version, under its own license, and apply our patch.
 | **fqlite** 4.22 | `FQLITE_TAP` + `FQLITE_JAVA` | [pawlaszczyk/fqlite](https://github.com/pawlaszczyk/fqlite) | see upstream | `fqlite/{SETUP.md, run-tap.sh, fqlite.patch, tap/, stubs/}` |
 | **bring2lite** | `BRING2LITE_CMD` | [bring2lite/bring2lite](https://github.com/bring2lite/bring2lite) | see upstream | `bring2lite/{SETUP.md, bring2lite.patch, shim/}` |
 | **SQL-DRP** `sqlparse` v1.3 | `SQLDRP_CMD` | [mdegrazia/SQLite-Deleted-Records-Parser](https://github.com/mdegrazia/SQLite-Deleted-Records-Parser) | GPLv3 | `sqldrp/{SETUP.md, sqlparse_v1.3.py.patch}` |
+| **sqlite_dissect** (DC3) | `SQLITE_DISSECT_CMD` | [dod-cyber-crime-center/sqlite-dissect](https://github.com/dod-cyber-crime-center/sqlite-dissect) | see upstream | `scripts/run-sqlite-dissect.sh` (install via `pip install sqlite-dissect`) |
 
 The bulky upstream checkouts/builds (`*/checkout/`, `fqlite/{sdk,lib,build}`,
 `*/pkg/`, downloaded scripts, built binaries) are gitignored — see `.gitignore`.

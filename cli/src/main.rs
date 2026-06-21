@@ -2,15 +2,16 @@
 //!
 //! The binary is the irreducible Humble-Object shell: it parses arguments,
 //! reads the evidence file into owned bytes, opens a read-only [`Database`],
-//! drives the `sqlite4n6` library's pure decision helpers, and either writes the
-//! **combined recovered workbook** (`<stem>.recovered.xlsx`, the default) plus —
-//! when `--db` is given — the **rebuilt carved database** (`<stem>.carved.db`),
-//! or renders the records to stdout (`--format` / `--rowid-only`). **The evidence
-//! file and its sidecars are never written** — the evidence bytes are owned by
-//! the [`Database`] and never flushed back, and both outputs are *separate* files
-//! (guarded so neither can resolve to the evidence db or a `-wal`/`-shm`/`-journal`
-//! sidecar). Every decision (path derivation, projection, filtering, rendering)
-//! lives in the unit-tested library; this file owns only I/O.
+//! drives the `sqlite4n6` library's pure decision helpers, and — per the single
+//! `-f/--format` choice — writes one output: the **combined recovered workbook**
+//! (`-f xlsx`, the default → `<stem>.recovered.xlsx`), the **rebuilt carved
+//! database** (`-f db` → `<stem>.carved.db`), or a stdout rendering of the records
+//! (`-f table`/`csv`/`jsonl`/`rowids`). **The evidence file and its sidecars are
+//! never written** — the evidence bytes are owned by the [`Database`] and never
+//! flushed back, and the file output is *separate* (guarded so it can never
+//! resolve to the evidence db or a `-wal`/`-shm`/`-journal` sidecar). Every
+//! decision (path derivation, projection, filtering, rendering) lives in the
+//! unit-tested library; this file owns only I/O.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -38,20 +39,55 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+/// The `carve` output format — one choice selects exactly one destination: a file
+/// (`xlsx`, `db`) or a stdout rendering (`table`, `csv`, `jsonl`, `rowids`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Default)]
 enum FormatArg {
+    /// The full recovered review workbook (`<stem>.recovered.xlsx`) — a FILE.
+    #[default]
+    Xlsx,
+    /// The carved-records database (`<stem>.carved.db`) — a FILE.
+    Db,
+    /// Carved records as an aligned text table — STDOUT.
+    Table,
+    /// Carved records as CSV — STDOUT.
+    Csv,
+    /// Carved records as JSONL — STDOUT.
+    Jsonl,
+    /// Just the recovered rowids, one per line — STDOUT.
+    Rowids,
+}
+
+/// The `audit` output format (stdout rendering only).
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+enum AuditFormatArg {
     #[default]
     Table,
     Csv,
     Jsonl,
 }
 
-impl From<FormatArg> for OutputFormat {
-    fn from(f: FormatArg) -> Self {
+impl From<AuditFormatArg> for OutputFormat {
+    fn from(f: AuditFormatArg) -> Self {
         match f {
-            FormatArg::Table => OutputFormat::Table,
+            AuditFormatArg::Table => OutputFormat::Table,
+            AuditFormatArg::Csv => OutputFormat::Csv,
+            AuditFormatArg::Jsonl => OutputFormat::Jsonl,
+        }
+    }
+}
+
+impl FormatArg {
+    /// The stdout [`OutputFormat`] for a text rendering. `Rowids` renders over the
+    /// `table` layout (the rowid-only projection is selected separately, by
+    /// [`CarveArgs::rowid_only`]). Only meaningful for the stdout formats.
+    fn stdout_format(self) -> OutputFormat {
+        match self {
             FormatArg::Csv => OutputFormat::Csv,
             FormatArg::Jsonl => OutputFormat::Jsonl,
+            // Table, Rowids (and the file formats, never reached on the stdout
+            // path) all use the aligned table layout.
+            _ => OutputFormat::Table,
         }
     }
 }
@@ -86,9 +122,9 @@ enum Commands {
     Audit(AuditArgs),
 }
 
-// Each bool is an independent CLI toggle (`--rowid-only`, `--no-wal`,
-// `--no-fragments`, `--db`); a bitflags struct would only obscure the clap
-// surface, so the >3-bools lint does not apply to an args struct.
+// Each bool is an independent CLI toggle (`--no-wal`, `--no-fragments`,
+// `--no-journal`); a bitflags struct would only obscure the clap surface, so the
+// >3-bools lint does not apply to an args struct.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 struct CarveArgs {
@@ -96,24 +132,21 @@ struct CarveArgs {
     #[arg(value_name = "DB")]
     db: PathBuf,
 
-    /// Render the recovered records to stdout in this format instead of writing
-    /// output files. Omit to write the combined `<stem>.recovered.xlsx` workbook
-    /// (the default).
-    #[arg(long, value_enum)]
-    format: Option<FormatArg>,
+    /// Output format — one choice, one destination:
+    /// `xlsx` (the full recovered review workbook, a FILE; default),
+    /// `db` (the carved-records database, a FILE),
+    /// `table`/`csv`/`jsonl` (carved records to STDOUT),
+    /// `rowids` (just the recovered rowids, one per line, to STDOUT).
+    #[arg(short = 'f', long, value_enum, default_value = "xlsx")]
+    format: FormatArg,
 
-    /// Output stem for the written files (default-write mode only). Defaults to
-    /// the evidence file's stem in the current directory; any extension is
-    /// dropped, so `--out /p/foo` and `--out /p/foo.db` both yield
-    /// `/p/foo.recovered.xlsx` (and, with `--db`, `/p/foo.carved.db`). A derived
-    /// path resolving to the evidence db or a `-wal`/`-shm`/`-journal` sidecar is
-    /// refused.
-    #[arg(long, value_name = "PATH")]
+    /// Full output path for a file format (`xlsx`/`db`), honored EXACTLY as given
+    /// (no extension rewriting). Defaults to `<db-stem>.recovered.xlsx` for `xlsx`
+    /// or `<db-stem>.carved.db` for `db`, in the current directory. A path
+    /// resolving to the evidence db or a `-wal`/`-shm`/`-journal` sidecar is
+    /// refused. Ignored for the stdout formats.
+    #[arg(short = 'o', long, value_name = "FILE")]
     out: Option<PathBuf>,
-
-    /// Print only recovered rowids, one per line.
-    #[arg(long)]
-    rowid_only: bool,
 
     /// Drop records below this confidence level.
     #[arg(long, value_enum, default_value = "info")]
@@ -132,7 +165,7 @@ struct CarveArgs {
     /// full rows. Fragments — lower-confidence partial rows salvaged where a full
     /// row could not be reconstructed but a distinctive cell survived — are shown
     /// **by default**, kept structurally separate from the full-row tier so they
-    /// can never be mistaken for a recovered row. `--rowid-only` also omits them
+    /// can never be mistaken for a recovered row. `-f rowids` also omits them
     /// (a fragment has no rowid). Fragments are sourced from the on-disk image only.
     #[arg(long)]
     no_fragments: bool,
@@ -144,36 +177,26 @@ struct CarveArgs {
     /// A WAL always takes precedence (the two journal modes are mutually exclusive).
     #[arg(long)]
     no_journal: bool,
-
-    /// ALSO write the rebuilt carved SQLite database `<stem>.carved.db` beside the
-    /// default `<stem>.recovered.xlsx` (honoring `--out`'s stem). The db holds the
-    /// raw carved records split into attribution-tiered `recovered_*` tables, each
-    /// cell in its native type (a recovered BLOB stored byte-for-byte), so it is
-    /// directly queryable with `sqlite3`. A file-output-only option: conflicts with
-    /// the stdout text modes (`--format`, `--rowid-only`).
-    #[arg(long = "db", conflicts_with = "format", conflicts_with = "rowid_only")]
-    db_flag: bool,
 }
 
 impl CarveArgs {
     /// Whether to render the Tier-2 fragment section. On by default; suppressed
-    /// by `--no-fragments`, and by `--rowid-only` (fragments carry no rowid, so a
+    /// by `--no-fragments`, and by `-f rowids` (fragments carry no rowid, so a
     /// rowid listing coherently excludes them rather than erroring).
     fn wants_fragments(&self) -> bool {
-        !self.no_fragments && !self.rowid_only
+        !self.no_fragments && self.format != FormatArg::Rowids
     }
 
-    /// Whether to write the combined recovered workbook (the default file output).
-    /// True only when neither a stdout `--format` nor `--rowid-only` was given —
-    /// both of those keep the historical stdout behavior exactly.
-    fn writes_xlsx(&self) -> bool {
-        self.format.is_none() && !self.rowid_only
+    /// Whether the stdout renderer should project to bare rowids — true exactly for
+    /// the `rowids` format.
+    fn rowid_only(&self) -> bool {
+        self.format == FormatArg::Rowids
     }
 
-    /// The stdout format to use when NOT writing a rebuilt db: the explicit
-    /// `--format`, or `table` for the bare `--rowid-only` case.
+    /// The stdout [`OutputFormat`] for a text rendering (`table`/`csv`/`jsonl`, and
+    /// `rowids` over the table layout). Only meaningful for the stdout formats.
     fn stdout_format(&self) -> OutputFormat {
-        self.format.unwrap_or(FormatArg::Table).into()
+        self.format.stdout_format()
     }
 }
 
@@ -185,7 +208,7 @@ struct AuditArgs {
 
     /// Output format.
     #[arg(long, value_enum, default_value = "table")]
-    format: FormatArg,
+    format: AuditFormatArg,
 
     /// Ignore any `<db>-journal` rollback-journal sidecar — do not fold its
     /// design-§6 observations (hot journal, recoverable pre-images, checksum
@@ -326,57 +349,33 @@ fn sidecar_prior_schema(args: &CarveArgs) -> std::collections::BTreeMap<String, 
 }
 
 fn run_carve(args: &CarveArgs) -> Result<(), String> {
-    if args.writes_xlsx() {
-        return run_carve_files(args);
+    match args.format {
+        FormatArg::Xlsx => run_carve_xlsx(args),
+        FormatArg::Db => run_carve_db(args),
+        // table / csv / jsonl / rowids all render to stdout.
+        _ => run_carve_stdout(args),
     }
-    run_carve_stdout(args)
 }
 
-/// Default mode: carve the full recovered records and write the combined
-/// `<stem>.recovered.xlsx` workbook (always), plus — when `--db` is given — the
-/// rebuilt `<stem>.carved.db`. Neither is the evidence file. Output paths are
-/// derived (and guarded against the evidence set) by the pure [`carved_db_path`] /
+/// `-f xlsx` (the default): carve the full recovered records and write the
+/// combined `<stem>.recovered.xlsx` workbook — one sheet per live table with the
+/// recovered (deleted) rows folded back in by rowid (marked `is_deleted` /
+/// `is_guessed`, tinted), unattributed rows + fragments in separate tabs. The
+/// rollback-journal prior rows are folded in too when a `<db>-journal` is in play.
+/// The output path is the explicit `-o` (verbatim) or the derived
+/// `<stem>.recovered.xlsx`, guarded against the evidence set by the pure
 /// [`recovered_xlsx_path`]; this shell only performs the I/O.
-fn run_carve_files(args: &CarveArgs) -> Result<(), String> {
-    // Resolve + guard EVERY destination BEFORE carving, so an evidence-clobbering
-    // path fails fast and nothing is read or written under it. The carved db path
-    // is resolved only when `--db` is requested.
+fn run_carve_xlsx(args: &CarveArgs) -> Result<(), String> {
+    // Resolve + guard the destination BEFORE carving, so an evidence-clobbering
+    // path fails fast and nothing is read or written under it.
     let xlsx_path = recovered_xlsx_path(&args.db, args.out.as_deref())?;
-    let db_path = args
-        .db_flag
-        .then(|| carved_db_path(&args.db, args.out.as_deref()))
-        .transpose()?;
 
-    // Tier-1 full rows and (when enabled) Tier-2 fragments come from one carve over
-    // the same evidence bytes. With `--no-fragments` the fragment set is `None`.
     let (db, records, fragments) = collect_for_rebuild(args)?;
-
-    // The rollback-journal recovery (deleted + modified prior rows), when a
-    // `<db>-journal` is in play and no WAL takes precedence. Folded into the
-    // combined workbook below; `None` when no journal applies.
     let journal = recover_journal(args, &db)?;
-
-    // The sidecar's PRIOR schema (`name -> CREATE SQL`) drives Detector B's
-    // `sidecar_schema_changed(table)` hint; empty when no `-wal`/`-journal` applies.
     let prior_schema = sidecar_prior_schema(args);
 
-    // `--db`: ALSO write the rebuilt carved database. Group every carved record
-    // into its attribution tier — recovered_<table> (CERTAIN, real column names),
-    // recovered_inferred (consistent-with + an ambiguity flag),
-    // recovered_unattributed (unknown), plus recovered_fragments. Written first so
-    // an unwritable db path fails before the (larger) xlsx work.
-    if let Some(path) = &db_path {
-        let tables = group_attributed_tables(&db, &records, fragments.as_deref(), &prior_schema);
-        let bytes = build_recovered_db_tables(&tables);
-        std::fs::write(path, &bytes)
-            .map_err(|e| format!("cannot write carved db {}: {e}", path.display()))?;
-    }
-
-    // The default COMBINED workbook: the source DB dumped one sheet per live table
-    // with the recovered (deleted) rows folded back in by rowid (marked
-    // is_deleted / is_guessed, tinted), unattributed rows + fragments in separate
-    // tabs. Built to an in-memory buffer by the library; this shell only writes
-    // bytes (and the library warns on stderr for any >1M-row sheet truncation).
+    // Built to an in-memory buffer by the library; this shell only writes bytes
+    // (and the library warns on stderr for any >1M-row sheet truncation).
     let xlsx_bytes = combined_xlsx_bytes(
         &db,
         &records,
@@ -389,28 +388,52 @@ fn run_carve_files(args: &CarveArgs) -> Result<(), String> {
     std::fs::write(&xlsx_path, &xlsx_bytes)
         .map_err(|e| format!("cannot write recovered xlsx {}: {e}", xlsx_path.display()))?;
 
-    let db_suffix = db_path
-        .as_ref()
-        .map(|p| format!(" (+ {})", p.display()))
-        .unwrap_or_default();
-    match &fragments {
+    print_carve_summary(records.len(), fragments.as_deref(), &xlsx_path);
+    print_journal_summary(journal.as_ref());
+    Ok(())
+}
+
+/// `-f db`: carve the full recovered records and write the rebuilt
+/// `<stem>.carved.db` — every carved record grouped into its attribution tier:
+/// `recovered_<table>` (CERTAIN, real column names), `recovered_inferred`
+/// (consistent-with + an ambiguity flag), `recovered_unattributed` (unknown), plus
+/// `recovered_fragments`. The output path is the explicit `-o` (verbatim) or the
+/// derived `<stem>.carved.db`, guarded against the evidence set by the pure
+/// [`carved_db_path`]; this shell only performs the I/O.
+fn run_carve_db(args: &CarveArgs) -> Result<(), String> {
+    let db_path = carved_db_path(&args.db, args.out.as_deref())?;
+
+    let (db, records, fragments) = collect_for_rebuild(args)?;
+    let prior_schema = sidecar_prior_schema(args);
+
+    let tables = group_attributed_tables(&db, &records, fragments.as_deref(), &prior_schema);
+    let bytes = build_recovered_db_tables(&tables);
+    std::fs::write(&db_path, &bytes)
+        .map_err(|e| format!("cannot write carved db {}: {e}", db_path.display()))?;
+
+    print_carve_summary(records.len(), fragments.as_deref(), &db_path);
+    Ok(())
+}
+
+/// The one-line carve summary naming the written file and the record (and, when
+/// fragments were carved, fragment) counts.
+fn print_carve_summary(records: usize, fragments: Option<&[CarvedFragment]>, path: &Path) {
+    match fragments {
         Some(frags) => println!(
-            "wrote {} record(s) and {} fragment(s) to {}{db_suffix}",
-            records.len(),
+            "wrote {records} record(s) and {} fragment(s) to {}",
             frags.len(),
-            xlsx_path.display()
+            path.display()
         ),
-        None => println!(
-            "wrote {} record(s) to {}{db_suffix}",
-            records.len(),
-            xlsx_path.display()
-        ),
+        None => println!("wrote {records} record(s) to {}", path.display()),
     }
-    // When a rollback `-journal` was folded in, report its recovery counts too, so
-    // the summary reflects the prior rows in the workbook rather than only the
-    // free-space carve (the journal's deleted/modified rows are tinted red/blue in
-    // each table sheet, not counted among `records`).
-    if let Some(j) = &journal {
+}
+
+/// When a rollback `-journal` was folded in, report its recovery counts so the
+/// summary reflects the prior rows in the workbook rather than only the free-space
+/// carve (the journal's deleted/modified rows are tinted red/blue in each table
+/// sheet, not counted among the records).
+fn print_journal_summary(journal: Option<&JournalRecovery>) {
+    if let Some(j) = journal {
         if j.counts.deleted > 0 || j.counts.modified > 0 {
             println!(
                 "recovered {} deleted + {} modified row(s) from the rollback journal",
@@ -418,7 +441,6 @@ fn run_carve_files(args: &CarveArgs) -> Result<(), String> {
             );
         }
     }
-    Ok(())
 }
 
 /// The evidence handle plus the carved record/fragment sets a rebuild needs:
@@ -473,8 +495,8 @@ fn collect_for_rebuild(args: &CarveArgs) -> Result<RebuildInputs, String> {
     Ok((db, records, fragments))
 }
 
-/// Stdout mode (`--format` / `--rowid-only`): the historical rendering behavior,
-/// byte-for-byte unchanged.
+/// Stdout mode (`-f table`/`csv`/`jsonl`/`rowids`): the historical rendering
+/// behavior, byte-for-byte unchanged.
 fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
     let fmt = args.stdout_format();
     // Open the main file's owned bytes (never written back, no sidecar created).
@@ -503,7 +525,7 @@ fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
         let records = filter_by_confidence(records, args.min_confidence.into());
         let attrs = attribute_records(&db, &records);
         let risks = table_instance_risks_with_sidecar(&db, &records, &attrs, &prior_schema);
-        for line in render_carve_with_snapshot(&records, &risks, fmt, args.rowid_only) {
+        for line in render_carve_with_snapshot(&records, &risks, fmt, args.rowid_only()) {
             println!("{line}");
         }
         // v1 fragments are sourced from the on-disk image only (no WAL fragment
@@ -531,7 +553,8 @@ fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
             full.extend(journal_records);
             let attrs = attribute_records(&db, &full);
             let risks = table_instance_risks_with_sidecar(&db, &full, &attrs, &prior_schema);
-            for line in render_carve_tiered(&full, &risks, &tiers.fragments, fmt, args.rowid_only) {
+            for line in render_carve_tiered(&full, &risks, &tiers.fragments, fmt, args.rowid_only())
+            {
                 println!("{line}");
             }
         } else {
@@ -540,7 +563,7 @@ fn run_carve_stdout(args: &CarveArgs) -> Result<(), String> {
             records.extend(journal_records);
             let attrs = attribute_records(&db, &records);
             let risks = table_instance_risks_with_sidecar(&db, &records, &attrs, &prior_schema);
-            for line in render_carve(&records, &risks, fmt, args.rowid_only) {
+            for line in render_carve(&records, &risks, fmt, args.rowid_only()) {
                 println!("{line}");
             }
         }
@@ -600,7 +623,7 @@ fn run_audit(args: &AuditArgs) -> Result<(), String> {
 mod tests {
     use super::{
         audit_journal_for, open_db, recover_journal, resolve_journal_path, AuditArgs, CarveArgs,
-        Cli, Commands,
+        Cli, Commands, FormatArg, OutputFormat,
     };
     use clap::Parser;
     use std::path::{Path, PathBuf};
@@ -791,49 +814,67 @@ mod tests {
         );
     }
 
-    /// `--rowid-only` is a full-row rowid listing; fragments have no rowid, so it
+    /// `-f rowids` is a full-row rowid listing; fragments have no rowid, so it
     /// coherently implies no fragment section — a usage combination, not an error.
     #[test]
-    fn rowid_only_suppresses_fragments() {
-        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "--rowid-only"]);
+    fn rowids_format_suppresses_fragments() {
+        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "-f", "rowids"]);
         assert!(
             !args.wants_fragments(),
-            "--rowid-only implies the fragment section is omitted"
+            "-f rowids implies the fragment section is omitted"
         );
-    }
-
-    /// The bare default carve writes the combined xlsx and NOT the db: the file
-    /// surface is xlsx-only unless `--db` is given.
-    #[test]
-    fn default_carve_writes_xlsx_not_db() {
-        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite"]);
         assert!(
-            args.writes_xlsx(),
-            "the default carve writes the combined xlsx"
+            args.rowid_only(),
+            "-f rowids selects the rowid-only projection"
         );
-        assert!(!args.db_flag, "the rebuilt db is opt-in (no --db given)");
     }
 
-    /// `--db` ADDITIONALLY writes the rebuilt SQLite database alongside the xlsx:
-    /// it parses, sets the flag, and keeps the xlsx-writing default active.
+    /// The bare default carve selects the `xlsx` file output (the default format),
+    /// not a stdout rendering and not the carved db.
     #[test]
-    fn db_flag_adds_the_rebuilt_database() {
-        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "--db"]);
-        assert!(args.db_flag, "--db must set the flag");
-        assert!(args.writes_xlsx(), "--db keeps the default xlsx output");
+    fn default_carve_format_is_xlsx() {
+        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite"]);
+        assert_eq!(args.format, FormatArg::Xlsx, "the default format is xlsx");
+        assert!(
+            !args.rowid_only(),
+            "the default is not the rowid projection"
+        );
     }
 
-    /// `--db` is a file-output (default) concern; it conflicts with the stdout text
-    /// modes so clap rejects the combination rather than silently ignoring it.
+    /// `-f db` selects the carved-database file output — a single exclusive choice,
+    /// distinct from the xlsx default.
     #[test]
-    fn db_flag_conflicts_with_stdout_modes() {
+    fn db_format_selects_the_carved_database() {
+        let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "-f", "db"]);
+        assert_eq!(args.format, FormatArg::Db, "-f db selects the carved db");
+    }
+
+    /// The stdout formats (`table`/`csv`/`jsonl`/`rowids`) map onto the right
+    /// [`OutputFormat`] for rendering.
+    #[test]
+    fn stdout_formats_map_to_output_format() {
+        for (flag, want) in [
+            ("table", OutputFormat::Table),
+            ("csv", OutputFormat::Csv),
+            ("jsonl", OutputFormat::Jsonl),
+            ("rowids", OutputFormat::Table),
+        ] {
+            let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "-f", flag]);
+            assert_eq!(args.stdout_format(), want, "-f {flag} renders as {want:?}");
+        }
+    }
+
+    /// The dropped `--db` / `--rowid-only` flags no longer parse — clap rejects
+    /// them as unknown arguments (no deprecated alias).
+    #[test]
+    fn dropped_flags_no_longer_parse() {
         for argv in [
-            &["sqlite4n6", "carve", "db.sqlite", "--db", "--format", "csv"][..],
-            &["sqlite4n6", "carve", "db.sqlite", "--db", "--rowid-only"][..],
+            &["sqlite4n6", "carve", "db.sqlite", "--db"][..],
+            &["sqlite4n6", "carve", "db.sqlite", "--rowid-only"][..],
         ] {
             assert!(
                 Cli::try_parse_from(argv).is_err(),
-                "--db must conflict with {argv:?}"
+                "{argv:?} must be rejected as an unknown flag"
             );
         }
     }

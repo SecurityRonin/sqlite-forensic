@@ -1,0 +1,141 @@
+% =============================================================================
+% Bibliography — Deleted-Record Recovery from SQLite Databases
+% All entries verified against primary or authoritative sources (2026-06).
+% =============================================================================
+
+% --- Primary: official SQLite documentation ----------------------------------
+@misc{sqlite_fileformat,
+  author       = {{SQLite Consortium}},
+  title        = {The {SQLite} Database File Format},
+  howpublished = {\url{https://www.sqlite.org/fileformat2.html}},
+  year         = {2026},
+  note         = {Accessed 2026-06}
+}
+
+@misc{sqlite_wal,
+  author       = {{SQLite Consortium}},
+  title        = {Write-Ahead Logging},
+  howpublished = {\url{https://www.sqlite.org/wal.html}},
+  year         = {2026},
+  note         = {Accessed 2026-06; WAL available since 3.7.0 (2010-07-21)}
+}
+
+@misc{sqlite_vacuum,
+  author       = {{SQLite Consortium}},
+  title        = {{VACUUM}},
+  howpublished = {\url{https://www.sqlite.org/lang_vacuum.html}},
+  year         = {2026},
+  note         = {Accessed 2026-06}
+}
+
+@misc{sqlite_pragma,
+  author       = {{SQLite Consortium}},
+  title        = {Pragma statements supported by {SQLite}},
+  howpublished = {\url{https://www.sqlite.org/pragma.html}},
+  year         = {2026},
+  note         = {Accessed 2026-06; see \texttt{secure\_delete}, \texttt{auto\_vacuum}, \texttt{journal\_mode}}
+}
+
+@misc{sqlite_mostdeployed,
+  author       = {{SQLite Consortium}},
+  title        = {Most Widely Deployed and Used Database Engine},
+  howpublished = {\url{https://www.sqlite.org/mostdeployed.html}},
+  year         = {2026},
+  note         = {Accessed 2026-06}
+}
+
+% --- Academic: SQLite forensics & recovery -----------------------------------
+@article{choi2025survey,
+  author  = {Lee, Seonghyeon and Park, Sooyoung and Lee, Insoo and Choi, Jongmoo},
+  title   = {A comprehensive analysis and evaluation of {SQLite} deleted record recovery techniques: A survey},
+  journal = {Forensic Science International: Digital Investigation},
+  volume  = {55},
+  pages   = {302031},
+  year    = {2025},
+  doi     = {10.1016/j.fsidi.2025.302031}
+}
+
+@article{nemetz2018corpus,
+  author  = {Nemetz, Sebastian and Schmitt, Sven and Freiling, Felix C.},
+  title   = {A standardized corpus for {SQLite} database forensics},
+  journal = {Digital Investigation},
+  volume  = {24},
+  pages   = {S121--S130},
+  year    = {2018},
+  note    = {Proceedings of DFRWS EU 2018},
+  doi     = {10.1016/j.diin.2018.01.015}
+}
+
+@article{pawlaszczyk2021fqlite,
+  author  = {Pawlaszczyk, Dirk and Hummert, Christian},
+  title   = {Making the Invisible Visible---Techniques for Recovering Deleted {SQLite} Data Records},
+  journal = {International Journal of Cyber Forensics and Advanced Threat Investigations},
+  volume  = {1},
+  number  = {1--3},
+  pages   = {27--41},
+  year    = {2021},
+  doi     = {10.46386/ijcfati.v1i1-3.17}
+}
+
+@article{meng2019bring2lite,
+  author  = {Meng, Christian and Baier, Harald},
+  title   = {bring2lite: A Structural Concept and Tool for Forensic Data Analysis and Recovery of Deleted {SQLite} Records},
+  journal = {Digital Investigation},
+  volume  = {29},
+  pages   = {S31--S41},
+  year    = {2019},
+  note    = {Proceedings of DFRWS USA 2019},
+  doi     = {10.1016/j.diin.2019.04.017}
+}
+
+@article{hur2020wechat,
+  author  = {Hur, Uk and Park, Myungseo and Kim, Jongsung},
+  title   = {Study on Improved Decryption Method of {WeChat} Messenger and Deleted Message Recovery Using {SQLite} Full Text Search Data},
+  journal = {Journal of the Korea Institute of Information Security and Cryptology},
+  volume  = {30},
+  number  = {3},
+  pages   = {405--415},
+  year    = {2020},
+  doi     = {10.13089/JKIISC.2020.30.3.405}
+}
+
+% --- Tools and reference datasets --------------------------------------------
+@misc{undark,
+  author       = {Daniels, Paul L.},
+  title        = {undark: an {SQLite} deleted and corrupted data-recovery tool},
+  howpublished = {\url{https://pldaniels.com/undark/}},
+  year         = {2026},
+  note         = {Code mirror \url{https://github.com/inflex/undark}; accessed 2026-06}
+}
+
+@misc{degrazia_sqlparse,
+  author       = {DeGrazia, Mari},
+  title        = {{SQLite} Deleted Records Parser},
+  howpublished = {\url{https://github.com/mdegrazia/SQLite-Deleted-Records-Parser}},
+  year         = {2026},
+  note         = {Accessed 2026-06}
+}
+
+@misc{sqlite_dissect_dc3,
+  author       = {{DoD Cyber Crime Center (DC3)}},
+  title        = {{SQLite} Dissect},
+  howpublished = {\url{https://github.com/dod-cyber-crime-center/sqlite-dissect}},
+  year         = {2026},
+  note         = {Accessed 2026-06}
+}
+
+@misc{nist_cfreds_sqlite,
+  author       = {{National Institute of Standards and Technology}},
+  title        = {Computer Forensic Reference Data Sets (CFReDS): {SQLite} Data Recovery},
+  howpublished = {\url{https://cfreds.nist.gov/}},
+  year         = {2021},
+  note         = {CFTT SQLite recovery read-me \url{https://www.nist.gov/document/cftt-document-sqlite-recovery-read-me}; accessed 2026-06}
+}
+
+@misc{digitalcorpora_sqlite,
+  author       = {{Digital Corpora}},
+  title        = {{SQLite} Forensic Corpus},
+  howpublished = {\url{https://digitalcorpora.org/corpora/sql/sqlite-forensic-corpus/}},
+  year         = {2026},
+  note         = {Companion to \cite{nemetz2018corpus}; accessed 2026-06}
+}

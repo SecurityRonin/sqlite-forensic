@@ -1,0 +1,10 @@
+# LaTeX build intermediates (the PDF is committed for convenience)
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.toc

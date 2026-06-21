@@ -881,6 +881,14 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
     //
     // A rowid-only filter cannot tell these apart and drops both (a false
     // negative on prior versions). Comparing decoded values does.
+    // Structural-noise rejection (precision, not the live-row guarantee): drop
+    // any carved record that cannot belong to a table in this schema — more
+    // columns than the widest live table, or no non-NULL cell. Applied to every
+    // tier uniformly (no per-source special-case); the dropped-table db has no
+    // live bound, so only the all-NULL arm fires there.
+    let max_live_columns = db.live_tables().iter().map(|t| t.affinities.len()).max();
+    out.retain(|rec| !is_structural_noise(&rec.values, max_live_columns));
+
     let live = db.live_rows();
     // Value-level identity of every live row, for collision-checking records whose
     // rowid is unknown (freeblock reconstructions have a destroyed rowid, so the
@@ -926,6 +934,22 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
     });
 
     dedup_keep_best(out)
+}
+
+/// A carved full record is **structural noise** — not an information-bearing
+/// deleted row — when it cannot belong to any table in the schema. Two
+/// fixture-independent conditions, derived from the data's structure rather
+/// than any specific input: it has more columns than the widest live table
+/// (`max_live_columns`), so it matches no table; or every column is NULL, so it
+/// carries no recoverable content. The inferred carver, lacking a column hint,
+/// can read a run of free-space zero/garbage bytes as a long serial-type-0
+/// (NULL) array — this rejects that noise at any confidence. With no live table
+/// to bound against (`None` — a fully dropped-table db), only the all-NULL arm
+/// applies; the dropped-table tier governs column counts there.
+fn is_structural_noise(values: &[Value], max_live_columns: Option<usize>) -> bool {
+    // RED stub — real predicate lands in the GREEN commit.
+    let _ = (values, max_live_columns);
+    false
 }
 
 /// Two-tier deleted-record recovery: Tier-1 full rows **plus** Tier-2 partial
@@ -2016,6 +2040,53 @@ pub fn row_histories_with_residue(db: &Database) -> Vec<sqlite_core::row_history
 /// `Hash`/`Eq` directly).
 fn residue_key(table: &str, rowid: Option<i64>, values: &[Value]) -> String {
     format!("{table}:{rowid:?}:{values:?}")
+}
+
+#[cfg(test)]
+mod structural_noise_tests {
+    use super::is_structural_noise;
+    use sqlite_core::Value;
+
+    #[test]
+    fn rejects_record_wider_than_any_live_table() {
+        // The inferred over-read: a rowid echoed as the INTEGER-PK first column
+        // followed by a long serial-type-0 (NULL) tail — 102 columns where the
+        // widest live table has 6. It belongs to no table → noise.
+        let overwide: Vec<Value> = std::iter::once(Value::Integer(14))
+            .chain(std::iter::repeat(Value::Null).take(101))
+            .collect();
+        assert!(is_structural_noise(&overwide, Some(6)));
+    }
+
+    #[test]
+    fn rejects_all_null_record() {
+        assert!(is_structural_noise(
+            &[Value::Null, Value::Null, Value::Null],
+            Some(6)
+        ));
+    }
+
+    #[test]
+    fn keeps_ordinary_recovered_row() {
+        let good = vec![
+            Value::Integer(3),
+            Value::Text("Bowl".into()),
+            Value::Real(11.23),
+            Value::Null,
+        ];
+        assert!(!is_structural_noise(&good, Some(6)));
+    }
+
+    #[test]
+    fn dropped_table_db_has_no_column_bound() {
+        // No live table → max_live_columns is None → the column-cap arm is
+        // disabled; a wide real dropped-table row (08.db's 6-column books rows)
+        // must still be kept, only all-NULL noise rejected.
+        let row: Vec<Value> = (0..6).map(Value::Integer).collect();
+        assert!(!is_structural_noise(&row, None));
+        let all_null: Vec<Value> = std::iter::repeat(Value::Null).take(6).collect();
+        assert!(is_structural_noise(&all_null, None));
+    }
 }
 
 #[cfg(test)]

@@ -478,7 +478,7 @@ Cat & Tool & TP & FP & FN & $R_{\mathrm{sub}}$ & $R_{\mathrm{e2e}}$ & Prec. \\
  & fqlite          & 67 & 17 & 17 & 0.798 & 0.798 & 0.798 \\
  & bring2lite      & 40 & 0  & 44 & 0.476 & 0.476 & 1.000 \\
  & undark          & 14 & 10 & 70 & 0.167 & 0.167 & 0.583 \\
- & sql-drp         & 0  & 1  & 84 & 0.000 & 0.000 & 0.000 \\
+ & sql-drp$^\ddagger$ & 0  & 1  & 84 & 0.000 & 0.000 & 0.000 \\
 \midrule
 \multirow{5}{*}{\code{0D}}
  & \textbf{ours}   & 19 & 0 & 0 & \textbf{1.000} & 0.422 & \textbf{1.000} \\
@@ -497,7 +497,11 @@ Cat & Tool & TP & FP & FN & $R_{\mathrm{sub}}$ & $R_{\mathrm{e2e}}$ & Prec. \\
 \end{tabular}
 \\[2pt]
 {\footnotesize $^\dagger$\,\code{fqlite}'s two-column projection matches 20 distinct
-identities on the 19-row \code{0D} substrate; substrate recall is capped at $1.000$.}
+identities on the 19-row \code{0D} substrate; substrate recall is capped at $1.000$.
+$^\ddagger$\,SQL-DRP emits space-joined string blobs, not per-column records, so it
+matches no answer-key identity under this metric---a measured capability boundary,
+not a recovery failure; it carves printable strings (assessed on false positives,
+not per-column recall).}
 \end{table}
 
 In this harness, on in-page deletion (\code{0C}) our carver recovers 70 of 84
@@ -560,18 +564,16 @@ each category.}
 \centering
 \begin{tikzpicture}
 \begin{axis}[
-  ybar, bar width=3pt, width=\textwidth, height=0.44\textwidth,
+  ybar, bar width=3pt, width=\textwidth, height=0.42\textwidth,
   symbolic x coords={0C,0D,0E}, xtick=data,
-  ymin=0, ymax=1.14, ylabel={$F_1$}, xlabel={category},
+  ymin=0, ymax=1.12, ylabel={$F_1$},
   enlarge x limits=0.32, ytick={0,0.25,0.5,0.75,1.0},
-  legend style={at={(0.5,-0.20)}, anchor=north, legend columns=5, font=\scriptsize, draw=gray!40},
 ]
 \addplot[fill=ours,draw=white] coordinates {(0C,0.909) (0D,1.000) (0E,1.000)};
 \addplot[fill=fqlitec,draw=white] coordinates {(0C,0.798) (0D,1.000) (0E,0.333)};
 \addplot[fill=bring,draw=white] coordinates {(0C,0.645) (0D,0.538) (0E,0.500)};
 \addplot[fill=undarkc,draw=white] coordinates {(0C,0.259) (0D,0.067) (0E,0.462)};
-\addplot[fill=gray!55,draw=white] coordinates {(0C,0.001) (0D,0.001) (0E,0.001)};
-\legend{ours,fqlite,bring2lite,undark,sql-drp}
+% SQL-DRP omitted: it emits string blobs, not per-column records (see caption + table)
 \end{axis}
 \end{tikzpicture}
 \caption{$F_1$ (balanced)}
@@ -581,24 +583,34 @@ each category.}
 \centering
 \begin{tikzpicture}
 \begin{axis}[
-  ybar, bar width=3pt, width=\textwidth, height=0.44\textwidth,
+  ybar, bar width=3pt, width=\textwidth, height=0.42\textwidth,
   symbolic x coords={0C,0D,0E}, xtick=data,
-  ymin=0, ymax=1.14, ylabel={$F_{0.5}$}, xlabel={category},
+  ymin=0, ymax=1.12, ylabel={$F_{0.5}$},
   enlarge x limits=0.32, ytick={0,0.25,0.5,0.75,1.0},
 ]
 \addplot[fill=ours,draw=white] coordinates {(0C,0.962) (0D,1.000) (0E,1.000)};
 \addplot[fill=fqlitec,draw=white] coordinates {(0C,0.798) (0D,1.000) (0E,0.278)};
 \addplot[fill=bring,draw=white] coordinates {(0C,0.820) (0D,0.745) (0E,0.417)};
 \addplot[fill=undarkc,draw=white] coordinates {(0C,0.389) (0D,0.079) (0E,0.375)};
-\addplot[fill=gray!55,draw=white] coordinates {(0C,0.001) (0D,0.001) (0E,0.001)};
+% SQL-DRP omitted: it emits string blobs, not per-column records (see caption + table)
 \end{axis}
 \end{tikzpicture}
 \caption{$F_{0.5}$ (precision-weighted)}
 \end{subfigure}
-\caption{$F_1$ and $F_{0.5}$ by category and tool, on substrate recall. $F_{0.5}$
-weights precision over recall---the forensic preference, since a phantom row costs
-an examiner more than a missed low-confidence one. Bars are computed from the same
-harness figures as Table~\ref{tab:headtohead}.}
+\\[5pt]
+\centerline{%
+  \tikz\fill[ours](0,0)rectangle(1.8mm,1.8mm);~\scriptsize ours\quad
+  \tikz\fill[fqlitec](0,0)rectangle(1.8mm,1.8mm);~\scriptsize fqlite\quad
+  \tikz\fill[bring](0,0)rectangle(1.8mm,1.8mm);~\scriptsize bring2lite\quad
+  \tikz\fill[undarkc](0,0)rectangle(1.8mm,1.8mm);~\scriptsize undark%
+}
+\caption{$F_1$ and $F_{0.5}$ by category and tool, on substrate recall. SQL-DRP is
+omitted: it emits space-joined string blobs rather than per-column records, so it
+exposes no identity this per-column metric can score (it is a string-carver assessed
+on a false-positive basis, \S\ref{sec:eval}; see also Table~\ref{tab:headtohead}).
+$F_{0.5}$ weights precision over recall---the forensic preference, since a phantom
+row costs an examiner more than a missed low-confidence one. Bars are computed from
+the same harness figures as Table~\ref{tab:headtohead}.}
 \label{fig:fscores}
 \end{figure*}
 

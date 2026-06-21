@@ -249,3 +249,31 @@ its own provenance README (source, NIST/author hashes, licence, ground truth):
   `PRIORVERSION secret …`, amount 707 — genuine deleted content whose rowid is still
   live with different values. The full original body survives nowhere (overwritten);
   only the intermediate `PRIORVERSION` version is cleanly carvable.
+
+#### freeblock_2byte_rowid.db
+
+- **Source:** SYNTHETIC — `sqlite3` CLI (Tier-2; ground truth derivable from the
+  construction).
+- **Identity:** a 4-column table whose rows all have **2-byte rowid varints**
+  (ids 1000..=1259), with three well-separated rows deleted so each freed cell is
+  its own non-coalesced freeblock. Pins the freeblock-clobbered **2-byte-rowid**
+  recovery path (`forensic/tests/freeblock_highrowid.rs`): the 4-byte freeblock
+  clobber destroys no serial type, so the whole serial array survives and the
+  exact-tile reconstruction recovers the row. The independent sqlite-unhide 09.db
+  (env-gated) is the real-corpus twin.
+- **Generator:**
+
+  ```sh
+  sqlite3 freeblock_2byte_rowid.db <<'SQL'
+  PRAGMA page_size=4096; PRAGMA secure_delete=0;
+  CREATE TABLE m(id INTEGER PRIMARY KEY, sid TEXT, line TEXT, n INT);
+  WITH RECURSIVE c(i) AS (SELECT 1000 UNION ALL SELECT i+1 FROM c WHERE i<1260)
+  INSERT INTO m SELECT i, 's'||i, 'line text for record '||i, i FROM c;
+  DELETE FROM m WHERE id IN (1050, 1130, 1210);
+  SQL
+  ```
+
+- **md5:** `e32a55e60a40e3072917d4d5cd3494f5` — 20480 bytes.
+- **Notable contents:** 258 live rows; deleted ids 1050/1130/1210, each
+  recovered as `line text for record <id>` with no misaligned phantom;
+  `PRAGMA freelist_count` = 0 (in-page freeblocks only).

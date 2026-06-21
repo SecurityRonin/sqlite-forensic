@@ -3218,7 +3218,18 @@ fn reconstruct_freeblock_inner(
             break; // cov:unreachable: usize add of two u16-range values
         };
         if size >= 4 && fb_end <= page_bytes.len() {
-            template.reconstruct_span_tiered(page_bytes, fb, fb_end, false, &mut cells, &mut frags);
+            if template.known_lead_serials.is_empty() {
+                // Empty-lead (2-byte-rowid) page: each freeblock is a single freed
+                // cell whose serial array fully survives. Reconstruct it ONLY if
+                // the record tiles the freeblock exactly — the precision gate that
+                // rejects the misaligned runs a loose walk would manufacture.
+                if let Some(cell) = template.reconstruct_exact_single(page_bytes, fb, fb_end) {
+                    cells.push(cell);
+                }
+            } else {
+                template
+                    .reconstruct_span_tiered(page_bytes, fb, fb_end, false, &mut cells, &mut frags);
+            }
         }
         fb = next;
     }
@@ -3226,7 +3237,10 @@ fn reconstruct_freeblock_inner(
     let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
     let cptr_end = hdr_off + 8 + cell_count * 2;
     let cca = be_u16(page_bytes, hdr_off + 5) as usize;
-    if cca > cptr_end && cca <= page_bytes.len() {
+    // The unallocated-gap pass anchors off a surviving forward cell and a known
+    // leading serial; it is meaningful only for the (non-empty-lead) span-walk
+    // templates. Empty-lead pages recover solely through the exact-tile chain pass.
+    if !template.known_lead_serials.is_empty() && cca > cptr_end && cca <= page_bytes.len() {
         for anchor_off in cptr_end..cca {
             let Some(anchor) =
                 try_carve_cell_at(page_bytes, anchor_off, Some(template.column_count), enc)
@@ -3355,13 +3369,16 @@ impl FreeblockTemplate {
             }
             known_lead.push(serial);
         }
-        // Require at least one surviving serial AND at least one clobbered serial
-        // (otherwise the forward carver already reaches the record, or nothing
-        // survives to anchor reconstruction).
+        // At least one serial must survive to anchor the reconstruction. The
+        // leading (clobbered) serial list MAY be empty: a 2-byte-or-wider rowid
+        // varint (rowid >= 128) widens the cell prefix so the 4-byte freeblock
+        // clobber stops at `header_len`, destroying NO serial type — the whole
+        // serial array survives. Such pages reconstruct via the exact-tile
+        // single-cell path (`reconstruct_freeblock_inner` routes on
+        // `known_lead_serials.is_empty()`), which requires each freed cell to fill
+        // its freeblock exactly; that precision check keeps the empty-lead case
+        // phantom-free where a loose span walk would mis-align columns.
         let surviving_serials_off = surviving_serials_off?;
-        if known_lead.is_empty() || known_lead.len() >= serials.len() {
-            return None;
-        }
         Some(FreeblockTemplate {
             column_count: serials.len(),
             known_lead_serials: known_lead,
@@ -3600,6 +3617,63 @@ impl FreeblockTemplate {
             },
             record_end,
         ))
+    }
+
+    /// Reconstruct a freeblock-clobbered cell that occupies the **entire**
+    /// freeblock `[cell_start, fb_end)` — the empty-leading-serial case (a 2-byte
+    /// or wider rowid varint, so the 4-byte clobber destroyed no serial type and
+    /// the whole serial array survives at `cell_start + surviving_serials_off`).
+    ///
+    /// A freed cell's slot becomes a freeblock of **exactly** its own size, so the
+    /// record is emitted ONLY when it tiles the freeblock precisely
+    /// (`record_end == fb_end`). That exact-tile constraint is the strong precision
+    /// signal that the surviving bytes are a real record: a wrong serial offset (a
+    /// deleted cell whose destroyed rowid width differs from the template's) yields
+    /// a body that does not reach `fb_end`, and is rejected rather than emitted as
+    /// a column-shifted phantom. Returns the carved cell (rowid destroyed → 0), or
+    /// `None` on any out-of-bounds parse or inexact fit.
+    fn reconstruct_exact_single(
+        &self,
+        page: &[u8],
+        cell_start: usize,
+        fb_end: usize,
+    ) -> Option<CarvedCell> {
+        let tail_start = cell_start.checked_add(self.surviving_serials_off)?;
+        // The whole serial array survives (no clobbered leading serial); read all
+        // `column_count` serials from the freeblock.
+        let mut serials = Vec::with_capacity(self.column_count);
+        let mut pos = tail_start;
+        for _ in 0..self.column_count {
+            let (s, used) = read_varint(page, pos).ok()?;
+            serial_body_len(s)?;
+            serials.push(s);
+            pos = pos.checked_add(used)?;
+            if pos > fb_end {
+                return None;
+            }
+        }
+        let mut body_len = 0usize;
+        for &s in &serials {
+            body_len = body_len.checked_add(serial_body_len(s)?)?;
+        }
+        let body_start = pos;
+        let record_end = body_start.checked_add(body_len)?;
+        // Exact tile: the reconstructed record must fill the freeblock precisely.
+        if record_end != fb_end {
+            return None;
+        }
+        let body = page.get(body_start..record_end)?;
+        let values = decode_synthetic_record(&serials, body, self.text_encoding)?;
+        if values.len() != self.column_count {
+            return None; // cov:unreachable: one value per serial by construction
+        }
+        Some(CarvedCell {
+            offset: cell_start,
+            byte_len: record_end - cell_start,
+            rowid: 0, // destroyed by freeblock conversion — surfaced as unknown
+            values,
+            confidence: FREEBLOCK_RECONSTRUCT_CONFIDENCE,
+        })
     }
 
     /// Reconstruct a freeblock-clobbered **spilled** cell at `cell_start` (task

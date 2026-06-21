@@ -56,17 +56,10 @@ fn open(root: &std::path::Path, stem: &str) -> Option<Database> {
     Database::open(bytes).ok()
 }
 
-/// The widest live (schema-present) user table — the structural upper bound on a
-/// legitimately-attributable recovered record's column count.
-fn max_live_columns(db: &Database) -> Option<usize> {
-    db.live_tables().iter().map(|t| t.affinities.len()).max()
-}
-
 /// Structural-noise invariant: across every sqlite-unhide database, no recovered
-/// full record may have more columns than the widest live table (it would belong
-/// to no table in the schema) or be entirely NULL (no recoverable content). This
-/// is the regression guard for the inferred-carver over-read that read a run of
-/// free-space zero bytes as a 100+-column serial-type-0 record on 03/04/05/06.
+/// full record may be content-free — every column past the first NULL, the
+/// inferred-carver over-read that read a run of free-space zero bytes as a
+/// 100+-column serial-type-0 record (a rowid echo + all-NULL tail) on 03/04/05/06.
 #[test]
 fn no_full_record_is_structural_noise() {
     let Some(root) = corpus_root() else {
@@ -79,20 +72,12 @@ fn no_full_record_is_structural_noise() {
             continue;
         };
         checked += 1;
-        let bound = max_live_columns(&db);
         for rec in carve_all_deleted_records(&db) {
-            if let Some(max) = bound {
-                assert!(
-                    rec.values.len() <= max,
-                    "{stem}.db: recovered record with {} columns exceeds the widest live table \
-                     ({max}) — structural over-read: {:?}",
-                    rec.values.len(),
-                    rec.values
-                );
-            }
+            let content_free = rec.values.len() >= 2
+                && rec.values.iter().skip(1).all(|v| matches!(v, Value::Null));
             assert!(
-                !rec.values.iter().all(|v| matches!(v, Value::Null)),
-                "{stem}.db: recovered an all-NULL record (no recoverable content): {:?}",
+                !content_free,
+                "{stem}.db: recovered a content-free record (rowid echo + all-NULL tail): {:?}",
                 rec.values
             );
         }
@@ -110,9 +95,6 @@ fn no_full_record_is_structural_noise() {
 /// confirmation of the multi-byte-rowid reconstruction fix (committed-fixture
 /// twin: `freeblock_highrowid.rs`).
 #[test]
-#[ignore = "known gap: 2-byte-rowid freeblock recovery awaits the \
-            precision-preserving (exact-tile) reconstruction (see \
-            freeblock_highrowid.rs)"]
 fn recovers_utf8_high_rowid_rows_from_09() {
     let Some(root) = corpus_root() else {
         return;

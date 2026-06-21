@@ -103,3 +103,36 @@ fn no_full_record_is_structural_noise() {
     );
     eprintln!("sqlite_unhide_corpus: structural-noise invariant held across {checked} database(s)");
 }
+
+/// 09.db (key: `"lyrics" 2 rows (5002, 5014)`, UTF-8) — the two deleted rows have
+/// 2-byte rowids (5002/5014) and Cyrillic `line` text, so they are
+/// freeblock-clobbered cells with an all-surviving serial array. Real-corpus
+/// confirmation of the multi-byte-rowid reconstruction fix (committed-fixture
+/// twin: `freeblock_highrowid.rs`).
+#[test]
+fn recovers_utf8_high_rowid_rows_from_09() {
+    let Some(root) = corpus_root() else {
+        return;
+    };
+    let Some(db) = open(&root, "09") else {
+        eprintln!("SKIP: 09.db absent from corpus");
+        return;
+    };
+    let texts: Vec<String> = carve_all_deleted_records(&db)
+        .into_iter()
+        .flat_map(|r| r.values)
+        .filter_map(|v| match v {
+            Value::Text(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    // The two deleted Cyrillic lines (ids 5014, 5002).
+    assert!(
+        texts.iter().any(|t| t.contains("Столица")),
+        "09.db: deleted UTF-8 row (id 5014) not recovered; got {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("Весь мир")),
+        "09.db: deleted UTF-8 row (id 5002) not recovered; got {texts:?}"
+    );
+}

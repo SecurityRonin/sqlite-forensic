@@ -191,6 +191,13 @@ struct CarveArgs {
     #[arg(long)]
     no_fragments: bool,
 
+    /// Force the Tier-2 fragment section to be included even when `--min-confidence`
+    /// would otherwise drop it. Fragments carry the flat confidence 0.2, so they are
+    /// filtered out at `--min-confidence medium` and above; `--fragments` keeps them
+    /// regardless. Conflicts with `--no-fragments`.
+    #[arg(long)]
+    fragments: bool,
+
     /// Ignore any `<db>-journal` rollback-journal sidecar — do not recover the
     /// last transaction's deletions/modifications from it. By default, when no WAL
     /// is in play and a `<db>-journal` sits beside the database, its prior-state
@@ -205,6 +212,15 @@ impl CarveArgs {
     /// only by `--no-fragments`.
     fn wants_fragments(&self) -> bool {
         !self.no_fragments
+    }
+
+    /// Apply the fragment output policy to a carved fragment set: `--no-fragments`
+    /// → none; `--fragments` → all (forced, bypassing the confidence bar);
+    /// otherwise only fragments meeting `--min-confidence` (the global filter —
+    /// fragments are confidence 0.2, so they appear at `info`/`low`, not `medium`+).
+    fn select_fragments(&self, frags: Vec<CarvedFragment>) -> Vec<CarvedFragment> {
+        // RED stub — real policy lands in the GREEN commit.
+        frags
     }
 
     /// The stdout [`OutputFormat`] for a text rendering (`table`/`csv`/`jsonl`).
@@ -775,10 +791,25 @@ fn run_audit(args: &AuditArgs) -> Result<(), String> {
 mod tests {
     use super::{
         audit_journal_for, open_db, recover_journal, resolve_journal_path, AuditArgs, CarveArgs,
-        Cli, Commands, FormatArg, OutputFormat,
+        CarvedFragment, Cli, Commands, FormatArg, OutputFormat,
     };
     use clap::Parser;
+    use sqlite_core::Value;
+    use sqlite_forensic::RecoverySource;
     use std::path::{Path, PathBuf};
+
+    /// A Tier-2 fragment with a given confidence and one surviving distinctive cell.
+    fn frag(confidence: f32) -> CarvedFragment {
+        CarvedFragment {
+            page: 1,
+            offset: 0,
+            surviving: vec![(1, Value::Text("lead".into()))],
+            missing: 2,
+            confidence,
+            source: RecoverySource::InPageFreeBlock,
+            wal: None,
+        }
+    }
 
     fn carve_args(argv: &[&str]) -> CarveArgs {
         match Cli::try_parse_from(argv).expect("argv must parse").command {
@@ -963,6 +994,93 @@ mod tests {
         assert!(
             !args.wants_fragments(),
             "--no-fragments must suppress the Tier-2 fragment section"
+        );
+    }
+
+    /// Global confidence filtering: a 0.2 fragment survives the default (`info`) and
+    /// `low`, but `--min-confidence medium`+ drops it (it falls below the bar).
+    #[test]
+    fn fragments_respect_min_confidence_globally() {
+        let default = carve_args(&["sqlite4n6", "carve", "db.sqlite"]);
+        assert_eq!(
+            default.select_fragments(vec![frag(0.2)]).len(),
+            1,
+            "info keeps a 0.2 fragment"
+        );
+
+        let low = carve_args(&["sqlite4n6", "carve", "db.sqlite", "--min-confidence", "low"]);
+        assert_eq!(
+            low.select_fragments(vec![frag(0.2)]).len(),
+            1,
+            "low (0.2) keeps a 0.2 fragment"
+        );
+
+        let medium = carve_args(&[
+            "sqlite4n6",
+            "carve",
+            "db.sqlite",
+            "--min-confidence",
+            "medium",
+        ]);
+        assert!(
+            medium.select_fragments(vec![frag(0.2)]).is_empty(),
+            "medium drops a 0.2 fragment (global confidence filter)"
+        );
+
+        let critical = carve_args(&[
+            "sqlite4n6",
+            "carve",
+            "db.sqlite",
+            "--min-confidence",
+            "critical",
+        ]);
+        assert!(
+            critical.select_fragments(vec![frag(0.2)]).is_empty(),
+            "critical drops a 0.2 fragment"
+        );
+    }
+
+    /// `--fragments` forces the fragment tier in even above the confidence bar.
+    #[test]
+    fn fragments_flag_forces_fragments_past_the_confidence_bar() {
+        let forced = carve_args(&[
+            "sqlite4n6",
+            "carve",
+            "db.sqlite",
+            "--fragments",
+            "--min-confidence",
+            "critical",
+        ]);
+        assert_eq!(
+            forced.select_fragments(vec![frag(0.2)]).len(),
+            1,
+            "--fragments keeps fragments at any threshold"
+        );
+    }
+
+    /// `--no-fragments` drops the tier regardless of confidence.
+    #[test]
+    fn no_fragments_drops_fragments_regardless_of_confidence() {
+        let none = carve_args(&["sqlite4n6", "carve", "db.sqlite", "--no-fragments"]);
+        assert!(
+            none.select_fragments(vec![frag(0.9)]).is_empty(),
+            "--no-fragments drops even a high-confidence fragment"
+        );
+    }
+
+    /// `--fragments` and `--no-fragments` are mutually exclusive.
+    #[test]
+    fn fragments_and_no_fragments_conflict() {
+        assert!(
+            Cli::try_parse_from([
+                "sqlite4n6",
+                "carve",
+                "db.sqlite",
+                "--fragments",
+                "--no-fragments"
+            ])
+            .is_err(),
+            "--fragments and --no-fragments must conflict"
         );
     }
 

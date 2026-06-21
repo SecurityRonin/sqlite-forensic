@@ -246,6 +246,30 @@ in the provenance note).
 > nature surfaces as a documented 0-identity boundary); this page scores the
 > survey's **false-positive** scenarios. Read the two together for the full picture.
 
+## Capabilities the surveyed tools don't have
+
+The survey scores deleted-record carving. Beyond that axis, this tool recovers
+substrates and structures none of the four surveyed tools address — and is
+validated for them against independent ground truth:
+
+- **Freeblock-clobbered rows the others drop.** When SQLite overwrites a freed
+  cell's first four bytes, we rebuild the record from its surviving serial-type
+  tail plus a same-page schema template — including deletions with a **2-byte
+  rowid** (any rowid ≥ 128, i.e. most real tables) and **coalesced** runs of
+  adjacent deletions (accepted only when they tile the freed slot exactly, so a
+  misaligned read is rejected, never emitted as a phantom).
+- **Dropped-table schema recovery.** A deleted `sqlite_master` row is recovered
+  from page-1 free space, surfacing a dropped table/index/view/trigger's name and
+  `CREATE` statement (`audit` reports `SQLITE-DROPPED-SCHEMA-RECOVERED`).
+- **Rollback-journal + WAL recovery** of the last transaction's deletes **and**
+  edits — the default `DELETE`/`PERSIST` mode the freed-page carvers don't read.
+- **Confirmed on a real case.** On the **NIST CFReDS *Data Leakage Case***, the
+  Google Drive `snapshot.db` carved from a Volume Shadow Copy yields both deleted
+  `cloud_entry` records NIST documents — including the freeblock-clobbered one —
+  with the live row never re-surfaced. The independent **`sqlite-unhide`** corpus
+  (third-party answer keys) and **NIST SFT-05** (native types + a variety of BLOB
+  image formats) are exercised the same way. See [`validation.md`](validation.md).
+
 ## Limits of this comparison
 
 - **Replicated corpus, not the survey's bytes.** The survey's official corpus is
@@ -253,7 +277,7 @@ in the provenance note).
   corpus is released, swap it in and re-measure (tracked in the fixtures README).
 - **Throughput is now measured apples-to-apples (see "Throughput" below).** Every
   tool was timed on the **same** machine (Apple M4 Pro) and the **same**
-  locally-generated ~100 MB image; our `carve --format jsonl` runs in a median
+  locally-generated ~100 MB image; our `carve -f jsonl -o -` runs in a median
   **15.6 s** (release). The survey's numbers are on *its own* 100 MB DB on a
   *different* machine and are not directly comparable — they are kept only as a
   historical anchor, not read against the measured table.
@@ -286,8 +310,8 @@ pinned by the env-gated perf-smoke `forensic/tests/perf_large_carve.rs`
 
 | Tool / mode | Median wall-clock | Records emitted | Recovery discipline |
 |---|---:|---:|---|
-| `sqlite4n6 carve --format jsonl` | 15.6 s | 79,904 deleted | **deleted-only**, live-rowid excluded, 0 live FP; every row content-confirmed in the deleted range |
-| `sqlite4n6 carve --db` | 44.8 s | 79,904 deleted | as above, **plus** it rebuilds a 45 MB queryable `.carved.db` + an 8.7 MB `.xlsx` |
+| `sqlite4n6 carve -f jsonl -o -` | 15.6 s | 79,904 deleted | **deleted-only**, live-rowid excluded, 0 live FP; every row content-confirmed in the deleted range |
+| `sqlite4n6 carve` (workbook) + `-f db` | 44.8 s | 79,904 deleted | as above, **plus** it rebuilds a 45 MB queryable `.carved.db` + an 8.7 MB `.xlsx` |
 | `undark -i` | 1.5 s | 177,906 | **flat-dump**: whole b-tree (live + freespace), no live/deleted split — ~178k rows are almost all *live* |
 | `fqlite` (headless tap) | 2.4 s | 2,935 | **deleted-only** bucket (status flag `D`), but mostly freelist-page fragments — only 31 rows carry an `MSG-` tag, 6 of them in the true deleted range |
 | `sqldrp` (sqlparse v1.3) | 0.2 s | 5 | **metadata/string carve**: printable-ASCII blobs from a handful of freeblock/unallocated regions; no per-column record, no live/deleted split |
@@ -306,6 +330,10 @@ Notes on the measurements:
   output, and the row count is complete regardless of the exit-time crash.
 - **`sqldrp`** is a printable-string carver: on this db it surfaces 5 freeblock /
   unallocated string blobs, not 80k records — it does not chase freed pages.
+- **Flags shown are the current `-f`/`-o` form.** These figures were measured
+  before the output-flag redesign, when a single `--db` run materialized the
+  workbook *and* the carved db together (the 44.8 s row); the carve work itself is
+  unchanged.
 
 **Reported by the paper (its own 100 MB db, a *different* machine — NOT comparable
 with the table above; kept only as a historical order-of-magnitude anchor):**

@@ -83,6 +83,8 @@ def panel_pr(ax, rows):
     )
 
     for (cat, tool), m in rows.items():
+        if tool not in TOOL_COLOR:  # headline P/R chart plots the 3 full-recall tools
+            continue
         ax.scatter(
             m["recall"],
             m["precision"],

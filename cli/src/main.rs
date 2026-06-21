@@ -169,7 +169,13 @@ struct CarveArgs {
     #[arg(short = 'o', long, value_name = "FILE")]
     out: Option<PathBuf>,
 
-    /// Drop records below this confidence level.
+    /// Drop output below this confidence level — a recall/noise dial applied to
+    /// every emitted item (full records AND Tier-2 fragments). Fragments carry the
+    /// flat confidence 0.2, so they appear at `info`/`low` but are dropped at
+    /// `medium` and above; `--fragments` forces them back in, `--no-fragments`
+    /// always drops them. This is NOT a safety control: a still-live row is never
+    /// reported as deleted regardless of this threshold (that guarantee is
+    /// structural and confidence-independent).
     #[arg(long, value_enum, default_value = "info")]
     min_confidence: ConfidenceArg,
 
@@ -195,7 +201,7 @@ struct CarveArgs {
     /// would otherwise drop it. Fragments carry the flat confidence 0.2, so they are
     /// filtered out at `--min-confidence medium` and above; `--fragments` keeps them
     /// regardless. Conflicts with `--no-fragments`.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_fragments")]
     fragments: bool,
 
     /// Ignore any `<db>-journal` rollback-journal sidecar — do not recover the
@@ -208,19 +214,22 @@ struct CarveArgs {
 }
 
 impl CarveArgs {
-    /// Whether to render the Tier-2 fragment section. On by default; suppressed
-    /// only by `--no-fragments`.
-    fn wants_fragments(&self) -> bool {
-        !self.no_fragments
-    }
-
     /// Apply the fragment output policy to a carved fragment set: `--no-fragments`
     /// → none; `--fragments` → all (forced, bypassing the confidence bar);
     /// otherwise only fragments meeting `--min-confidence` (the global filter —
     /// fragments are confidence 0.2, so they appear at `info`/`low`, not `medium`+).
     fn select_fragments(&self, frags: Vec<CarvedFragment>) -> Vec<CarvedFragment> {
-        // RED stub — real policy lands in the GREEN commit.
+        if self.no_fragments {
+            return Vec::new();
+        }
+        if self.fragments {
+            return frags;
+        }
+        let threshold = Into::<MinConfidence>::into(self.min_confidence).threshold();
         frags
+            .into_iter()
+            .filter(|f| f.confidence >= threshold)
+            .collect()
     }
 
     /// The stdout [`OutputFormat`] for a text rendering (`table`/`csv`/`jsonl`).
@@ -435,7 +444,14 @@ fn run_carve_xlsx(args: &CarveArgs, dest: &OutputDest) -> Result<(), String> {
 /// verbatim `-o`, with the summary line; or stdout for `-o -`); this shell only
 /// performs the I/O.
 fn run_carve_db(args: &CarveArgs, dest: &OutputDest) -> Result<(), String> {
-    let (db, records, fragments) = collect_for_rebuild(args)?;
+    let (db, mut records, fragments) = collect_for_rebuild(args)?;
+    // Fold in the rollback-journal recoveries so the carved db matches the xlsx
+    // workbook and the stdout streams, which already include them; `-f db` formerly
+    // omitted the last transaction's journal-recovered deletes/edits.
+    let journal = recover_journal(args, &db)?;
+    if let Some(j) = &journal {
+        records.extend(journal_carved_records(j));
+    }
     let prior_schema = sidecar_prior_schema(args);
 
     let tables = group_attributed_tables(&db, &records, fragments.as_deref(), &prior_schema);
@@ -444,6 +460,7 @@ fn run_carve_db(args: &CarveArgs, dest: &OutputDest) -> Result<(), String> {
 
     if let OutputDest::File(path) = dest {
         print_carve_summary(records.len(), fragments.as_deref(), path);
+        print_journal_summary(journal.as_ref());
     }
     Ok(())
 }
@@ -536,14 +553,16 @@ fn print_journal_summary(journal: Option<&JournalRecovery>) {
 type RebuildInputs = (Database, Vec<CarvedRecord>, Option<Vec<CarvedFragment>>);
 
 /// Collect the rebuilt db's record sets from the evidence: the open database, the
-/// full (Tier-1) rows always, and the Tier-2 fragments when
-/// `args.wants_fragments()` (else `None`, which omits the fragment table).
+/// full (Tier-1) rows always, and the Tier-2 fragments per the output policy
+/// ([`CarveArgs::select_fragments`]: `--no-fragments` → `None`; `--fragments` →
+/// all; otherwise those meeting `--min-confidence`). `None` (or an all-filtered
+/// empty set) omits the fragment table.
 ///
 /// The evidence bytes are read once. Fragments are sourced from the **on-disk
 /// image only** (v1 has no WAL fragment pass), matching the stdout carve; so under
 /// a WAL the records use the WAL-applied view while the fragments come from the
-/// same bytes opened without the WAL. The confidence filter is a full-row policy
-/// and is not applied to fragments.
+/// same bytes opened without the WAL. `--min-confidence` applies globally — to the
+/// full records here and to the fragments via `select_fragments`.
 fn collect_for_rebuild(args: &CarveArgs) -> Result<RebuildInputs, String> {
     let db_bytes = std::fs::read(&args.db)
         .map_err(|e| format!("cannot read database {}: {e}", args.db.display()))?;
@@ -576,9 +595,13 @@ fn collect_for_rebuild(args: &CarveArgs) -> Result<RebuildInputs, String> {
     // Tier-2 fragments share the already-open `db` (no second read/parse); `None`
     // omits the fragment table. v1 has no WAL fragment pass, so a WAL-applied `db`
     // still yields its on-disk fragment residue here, as on the stdout path.
-    let fragments = args
-        .wants_fragments()
-        .then(|| carve_with_fragments(&db).fragments);
+    // The fragment tier is emitted as a tab whenever it is enabled (not
+    // `--no-fragments`), with its content filtered by the output policy
+    // (`--fragments` forces all; otherwise `--min-confidence`). An empty set — none
+    // found, or all below the threshold — yields an empty tab, not a missing one,
+    // so the tier's presence is stable regardless of confidence.
+    let fragments =
+        (!args.no_fragments).then(|| args.select_fragments(carve_with_fragments(&db).fragments));
     Ok((db, records, fragments))
 }
 
@@ -671,9 +694,12 @@ fn render_carve_stream(args: &CarveArgs) -> Result<RenderedStream, String> {
         let mut lines = render_carve_with_snapshot(&records, &risks, fmt, false);
         // v1 fragments are sourced from the on-disk image only (no WAL fragment
         // pass yet); render the default section under the WAL-applied view's `db`.
-        let frags = args
-            .wants_fragments()
-            .then(|| carve_with_fragments(&db).fragments);
+        let frags = if args.no_fragments {
+            None
+        } else {
+            let selected = args.select_fragments(carve_with_fragments(&db).fragments);
+            (!selected.is_empty()).then_some(selected)
+        };
         if let Some(frags) = &frags {
             lines.extend(render_fragments(frags, fmt));
         }
@@ -694,36 +720,34 @@ fn render_carve_stream(args: &CarveArgs) -> Result<RenderedStream, String> {
             .as_ref()
             .map(journal_carved_records)
             .unwrap_or_default();
-        if args.wants_fragments() {
-            // Tier-1 + Tier-2 in one pass; both sections rendered together.
-            let tiers = carve_with_fragments(&db);
-            let mut full = filter_by_confidence(tiers.full, args.min_confidence.into());
-            full.extend(journal_records);
-            let attrs = attribute_records(&db, &full);
-            let risks = table_instance_risks_with_sidecar(&db, &full, &attrs, &prior_schema);
-            let lines = render_carve_tiered(&full, &risks, &tiers.fragments, fmt, false);
-            let blob_cells = count_blob_cells(&full, Some(&tiers.fragments));
-            Ok(RenderedStream {
-                lines,
-                records: full.len(),
-                fragments: Some(tiers.fragments.len()),
-                blob_cells,
-            })
+        // Carve full rows always; the fragment pass too unless `--no-fragments`.
+        // Then apply the fragment output policy (`--no-fragments` / `--fragments` /
+        // the global `--min-confidence` filter) and render the tiered section only
+        // when a fragment survives.
+        let (full_raw, frags_raw) = if args.no_fragments {
+            (carve_all_deleted_records(&db), Vec::new())
         } else {
-            let mut records =
-                filter_by_confidence(carve_all_deleted_records(&db), args.min_confidence.into());
-            records.extend(journal_records);
-            let attrs = attribute_records(&db, &records);
-            let risks = table_instance_risks_with_sidecar(&db, &records, &attrs, &prior_schema);
-            let lines = render_carve(&records, &risks, fmt, false);
-            let blob_cells = count_blob_cells(&records, None);
-            Ok(RenderedStream {
-                lines,
-                records: records.len(),
-                fragments: None,
-                blob_cells,
-            })
-        }
+            let tiers = carve_with_fragments(&db);
+            (tiers.full, tiers.fragments)
+        };
+        let mut full = filter_by_confidence(full_raw, args.min_confidence.into());
+        full.extend(journal_records);
+        let attrs = attribute_records(&db, &full);
+        let risks = table_instance_risks_with_sidecar(&db, &full, &attrs, &prior_schema);
+        let frags = args.select_fragments(frags_raw);
+        let frag_slice = (!frags.is_empty()).then_some(frags.as_slice());
+        let blob_cells = count_blob_cells(&full, frag_slice);
+        let lines = if frags.is_empty() {
+            render_carve(&full, &risks, fmt, false)
+        } else {
+            render_carve_tiered(&full, &risks, &frags, fmt, false)
+        };
+        Ok(RenderedStream {
+            lines,
+            records: full.len(),
+            fragments: (!frags.is_empty()).then_some(frags.len()),
+            blob_cells,
+        })
     }
 }
 
@@ -984,7 +1008,10 @@ mod tests {
     #[test]
     fn default_carve_includes_fragments() {
         let args = carve_args(&["sqlite4n6", "carve", "db.sqlite"]);
-        assert!(args.wants_fragments(), "fragments must be on by default");
+        assert!(
+            !args.select_fragments(vec![frag(0.2)]).is_empty(),
+            "fragments must be on by default"
+        );
     }
 
     /// `--no-fragments` opts back into the high-precision full-row-only output.
@@ -992,7 +1019,7 @@ mod tests {
     fn no_fragments_opts_out() {
         let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "--no-fragments"]);
         assert!(
-            !args.wants_fragments(),
+            args.select_fragments(vec![frag(0.2)]).is_empty(),
             "--no-fragments must suppress the Tier-2 fragment section"
         );
     }
@@ -1091,7 +1118,7 @@ mod tests {
         let args = carve_args(&["sqlite4n6", "carve", "db.sqlite"]);
         assert_eq!(args.format, FormatArg::Xlsx, "the default format is xlsx");
         assert!(
-            args.wants_fragments(),
+            !args.select_fragments(vec![frag(0.2)]).is_empty(),
             "fragments are on by default (no --no-fragments)"
         );
     }

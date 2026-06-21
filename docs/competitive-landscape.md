@@ -60,8 +60,8 @@ serial-type carve of unallocated space, and WAL + rollback-journal recovery — 
 a 0-false-positive discipline on the in-page tier (live rowids are excluded by
 construction).
 
-On the survey's three axes (Fig. 8 — the paper notes these per-technique values are
-**heuristically assigned, not measured**, so they are qualitative):
+The three techniques trade off along three axes — qualitative characterizations,
+not measured values:
 
 | Technique | Throughput | Coverage | Anti-forensic resilience |
 |---|---|---|---|

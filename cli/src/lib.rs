@@ -735,47 +735,59 @@ fn render_audit_jsonl(anomalies: &[Anomaly]) -> Vec<String> {
 
 // ---- carve output paths (.carved.db / .recovered.xlsx) ---------------------
 
-/// Resolve the output path for the rebuilt **carved** database (`<stem>.carved.db`),
-/// enforcing the forensic-soundness guard.
+/// Resolve the output path for the rebuilt **carved** database, enforcing the
+/// forensic-soundness guard.
 ///
-/// The db holds the raw carved records, hence the `.carved.db` suffix. With no
-/// `--out`, the stem is the evidence file's own stem in the **current working
-/// directory** (`History.db` → `History.carved.db`), never beside the evidence.
-/// An explicit `out` sets the stem instead (its directory + filename stem, with
-/// any extension dropped), so `--out /p/foo` and `--out /p/foo.db` both yield
-/// `/p/foo.carved.db`. Either way the resolved path is **refused** (an `Err`)
-/// when it equals the evidence database or any of its `-wal` / `-shm` /
+/// With no `-o`, the path is the evidence file's own stem with the `.carved.db`
+/// suffix, in the **current working directory** (`History.db` →
+/// `History.carved.db`), never beside the evidence. An explicit `out` is honored
+/// **verbatim** — the exact path given, with no stem or extension stripping
+/// (`-o /p/foo.db` → `/p/foo.db`). Either way the resolved path is **refused** (an
+/// `Err`) when it equals the evidence database or any of its `-wal` / `-shm` /
 /// `-journal` sidecars, so a carved db can never overwrite the evidence set.
 pub fn carved_db_path(db: &Path, out: Option<&Path>) -> Result<PathBuf, String> {
     resolve_output_path(db, out, "carved.db", "carved db")
 }
 
-/// Resolve the output path for the **recovered** combined workbook
-/// (`<stem>.recovered.xlsx`) — the reconstructed live + recovered view.
+/// Resolve the output path for the **recovered** combined workbook — the
+/// reconstructed live + recovered view.
 ///
-/// Stem resolution mirrors [`carved_db_path`] (evidence stem by default, `--out`
-/// sets the stem), and the same evidence-set guard applies, so `History.db` →
-/// `History.recovered.xlsx` and `--out /p/foo[.db]` → `/p/foo.recovered.xlsx`.
-/// The two output paths are derived independently from the stem (the db and xlsx
-/// suffixes differ), never one from the other.
+/// Resolution mirrors [`carved_db_path`]: the evidence stem with the
+/// `.recovered.xlsx` suffix in the CWD by default (`History.db` →
+/// `History.recovered.xlsx`), or the explicit `-o` path **verbatim**
+/// (`-o /p/foo.xlsx` → `/p/foo.xlsx`, no stripping). The same evidence-set guard
+/// applies.
 pub fn recovered_xlsx_path(db: &Path, out: Option<&Path>) -> Result<PathBuf, String> {
     resolve_output_path(db, out, "recovered.xlsx", "recovered xlsx")
 }
 
-/// Shared stem resolution + evidence guard for a carve output: append the
-/// two-part `suffix` (e.g. `carved.db`, `recovered.xlsx`) to the resolved stem
-/// (the evidence stem in the CWD, or `--out`'s directory + stem), then refuse the
-/// result if it lands on the evidence db or a sidecar (`label` names the output
-/// in the diagnostic). Suffix is appended via `set_extension` on the stem path so
-/// no input extension leaks through.
+/// Shared output-path resolution + evidence guard for a carve output. With an
+/// explicit `out`, that path is used **verbatim** (the caller asked for an exact
+/// file). With no `out`, the path is the evidence file's stem with the two-part
+/// `suffix` (e.g. `carved.db`, `recovered.xlsx`) appended, as a bare filename so
+/// it lands in the CWD; a source with no filename component degrades to the fixed
+/// `recovered` stem rather than panicking. Either way the result is refused if it
+/// lands on the evidence db or a sidecar (`label` names the output in the
+/// diagnostic).
 fn resolve_output_path(
     db: &Path,
     out: Option<&Path>,
     suffix: &str,
     label: &str,
 ) -> Result<PathBuf, String> {
-    let mut resolved = stem_path(db, out);
-    resolved.set_extension(suffix);
+    let resolved = if let Some(path) = out {
+        // An explicit `-o` is honored verbatim — the exact file the caller named.
+        path.to_path_buf()
+    } else {
+        // No `-o`: the evidence file's stem with the format suffix, in the CWD.
+        let stem = db.file_stem().map_or_else(
+            || "recovered".to_string(),
+            |s| s.to_string_lossy().into_owned(),
+        );
+        let mut p = PathBuf::from(stem);
+        p.set_extension(suffix);
+        p
+    };
     if let Some(clash) = evidence_path_clash(db, &resolved) {
         return Err(format!(
             "refusing to write {label} to {} — it is the evidence {}; \
@@ -785,24 +797,6 @@ fn resolve_output_path(
         ));
     }
     Ok(resolved)
-}
-
-/// The stem path the carve outputs are built on. With `--out`, it is that path's
-/// directory joined with its filename stem (any extension dropped), so the output
-/// lands exactly where the caller asked. With no `--out`, it is just the evidence
-/// file's own stem — a bare filename, so the outputs land in the **current working
-/// directory**, never beside the evidence. A source with no filename component
-/// degrades to the fixed `recovered` stem rather than panicking.
-fn stem_path(db: &Path, out: Option<&Path>) -> PathBuf {
-    let source = out.unwrap_or(db);
-    let stem = source.file_stem().map_or_else(
-        || "recovered".to_string(),
-        |s| s.to_string_lossy().into_owned(),
-    );
-    match out.and_then(Path::parent) {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(stem),
-        _ => PathBuf::from(stem),
-    }
 }
 
 /// If `out` names the evidence db or one of its sidecars, return a label for the
@@ -3405,40 +3399,45 @@ mod tests {
     }
 
     #[test]
-    fn out_sets_the_stem_for_both_outputs() {
-        // --out /p/foo (or /p/foo.db) sets the STEM `foo`; the db and xlsx suffixes
-        // are derived independently from it, so the stems differ by suffix only.
-        for out in ["/p/foo", "/p/foo.db"] {
-            assert_eq!(
-                carved_db_path(Path::new("History.db"), Some(Path::new(out))).unwrap(),
-                PathBuf::from("/p/foo.carved.db")
-            );
-            assert_eq!(
-                recovered_xlsx_path(Path::new("History.db"), Some(Path::new(out))).unwrap(),
-                PathBuf::from("/p/foo.recovered.xlsx")
-            );
-        }
+    fn out_is_honored_verbatim_for_both_outputs() {
+        // `-o /p/foo.xlsx` is the EXACT path — no stem/extension stripping. The db
+        // and xlsx helpers each take the path as given (the caller picks which
+        // suffix to ask for; the helper does not append one).
+        assert_eq!(
+            recovered_xlsx_path(Path::new("History.db"), Some(Path::new("/p/foo.xlsx"))).unwrap(),
+            PathBuf::from("/p/foo.xlsx")
+        );
+        assert_eq!(
+            carved_db_path(Path::new("History.db"), Some(Path::new("/p/foo.db"))).unwrap(),
+            PathBuf::from("/p/foo.db")
+        );
+        // An unusual name (no extension, or a different extension) is kept exactly.
+        assert_eq!(
+            recovered_xlsx_path(Path::new("History.db"), Some(Path::new("/p/bare"))).unwrap(),
+            PathBuf::from("/p/bare")
+        );
+        assert_eq!(
+            carved_db_path(Path::new("History.db"), Some(Path::new("out/x.sqlite"))).unwrap(),
+            PathBuf::from("out/x.sqlite")
+        );
     }
 
     #[test]
-    fn carved_db_guard_refuses_a_derived_output_onto_the_evidence() {
-        // When the derived `<stem>.carved.db` would land on the evidence db itself
-        // it is refused. Evidence `History.carved.db` + --out stem `/evidence/History`
-        // → `/evidence/History.carved.db`, exactly the evidence file.
-        let db = Path::new("/evidence/History.carved.db");
-        assert!(carved_db_path(db, Some(Path::new("/evidence/History"))).is_err());
-        // A genuinely different stem is allowed.
-        assert!(carved_db_path(db, Some(Path::new("/out/History"))).is_ok());
+    fn carved_db_guard_refuses_an_out_onto_the_evidence() {
+        // An explicit `-o` landing exactly on the evidence db is refused.
+        let db = Path::new("/evidence/History.db");
+        assert!(carved_db_path(db, Some(Path::new("/evidence/History.db"))).is_err());
+        // A genuinely different path is allowed.
+        assert!(carved_db_path(db, Some(Path::new("/out/History.carved.db"))).is_ok());
     }
 
     #[test]
-    fn recovered_xlsx_guard_refuses_a_derived_output_onto_the_evidence() {
-        // Evidence `History.recovered.xlsx` + --out stem `/evidence/History` →
-        // `/evidence/History.recovered.xlsx`, exactly the evidence file: refused.
-        let db = Path::new("/evidence/History.recovered.xlsx");
-        assert!(recovered_xlsx_path(db, Some(Path::new("/evidence/History"))).is_err());
-        // A genuinely different stem is allowed.
-        assert!(recovered_xlsx_path(db, Some(Path::new("/out/History"))).is_ok());
+    fn recovered_xlsx_guard_refuses_an_out_onto_a_sidecar() {
+        // An explicit `-o` landing on a `-wal` sidecar is refused.
+        let db = Path::new("/evidence/History.db");
+        assert!(recovered_xlsx_path(db, Some(Path::new("/evidence/History.db-wal"))).is_err());
+        // A genuinely different path is allowed.
+        assert!(recovered_xlsx_path(db, Some(Path::new("/out/History.recovered.xlsx"))).is_ok());
     }
 
     #[test]

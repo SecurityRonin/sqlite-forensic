@@ -55,7 +55,7 @@ fn fragment_fixture() -> PathBuf {
     data_dir().join("nemetz/0D/0D-01.db")
 }
 
-/// `carve --format table` renders deleted records from a real database with
+/// `carve -f table` renders deleted records from a real database with
 /// deletions to stdout and exits 0. The table stdout mode keeps the Tier-2
 /// fragment section, so this also drives the fragment render + dedup path.
 #[test]
@@ -63,14 +63,14 @@ fn carve_table_happy_path() {
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("deleted_places.db"))
-        .args(["--format", "table"])
+        .args(["-f", "table"])
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve must exit 0");
     assert!(!out.stdout.is_empty(), "carve must emit output");
 }
 
-/// The `--format csv` and `--format jsonl` branches each drive a distinct
+/// The `-f csv` and `-f jsonl` branches each drive a distinct
 /// renderer and the `FormatArg -> OutputFormat` conversion.
 #[test]
 fn carve_csv_and_jsonl_formats() {
@@ -78,25 +78,22 @@ fn carve_csv_and_jsonl_formats() {
         let out = bin()
             .args(["carve"])
             .arg(data_dir().join("deleted_places.db"))
-            .args(["--format", fmt])
+            .args(["-f", fmt])
             .output()
             .expect("run carve");
-        assert!(out.status.success(), "carve --format {fmt} must exit 0");
-        assert!(
-            !out.stdout.is_empty(),
-            "carve --format {fmt} must emit output"
-        );
+        assert!(out.status.success(), "carve -f {fmt} must exit 0");
+        assert!(!out.stdout.is_empty(), "carve -f {fmt} must emit output");
     }
 }
 
-/// `--rowid-only` prints recovered rowids, one per line — every non-empty line is
+/// `-f rowids` prints recovered rowids, one per line — every non-empty line is
 /// a bare integer, and the fragment section is coherently omitted.
 #[test]
 fn carve_rowid_only_prints_integers() {
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("deleted_places.db"))
-        .args(["--rowid-only"])
+        .args(["-f", "rowids"])
         .output()
         .expect("run carve");
     assert!(out.status.success());
@@ -110,13 +107,13 @@ fn carve_rowid_only_prints_integers() {
 }
 
 /// `--no-fragments` opts into the high-precision full-row-only stdout output and
-/// still exits 0 (a stdout-mode flag, paired here with `--format table`).
+/// still exits 0 (a stdout-mode flag, paired here with `-f table`).
 #[test]
 fn carve_no_fragments() {
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("deleted_places.db"))
-        .args(["--format", "table", "--no-fragments"])
+        .args(["-f", "table", "--no-fragments"])
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve --no-fragments must exit 0");
@@ -124,7 +121,7 @@ fn carve_no_fragments() {
 
 /// A `-wal` sidecar co-located with the database is auto-detected (the
 /// `resolve_wal_path` auto-detect branch), so the WAL-applied carve runs and
-/// exits 0. Driven in default write-mode with `--out` to a scratch stem so the
+/// exits 0. Driven in default write-mode with `-o` to a scratch xlsx path so the
 /// output lands in isolation (and the WAL branch of `collect_for_rebuild` is
 /// exercised).
 #[test]
@@ -133,8 +130,8 @@ fn carve_auto_detects_wal_sidecar() {
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("wal_places.db"))
-        .arg("--out")
-        .arg(dir.join("recovered"))
+        .arg("-o")
+        .arg(dir.join("recovered.xlsx"))
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve over a WAL db must exit 0");
@@ -149,8 +146,8 @@ fn carve_no_wal_uses_on_disk_only() {
         .args(["carve"])
         .arg(data_dir().join("wal_places.db"))
         .args(["--no-wal"])
-        .arg("--out")
-        .arg(dir.join("recovered"))
+        .arg("-o")
+        .arg(dir.join("recovered.xlsx"))
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve --no-wal must exit 0");
@@ -166,8 +163,8 @@ fn carve_explicit_wal_path() {
         .arg(data_dir().join("wal_places.db"))
         .arg("--wal")
         .arg(data_dir().join("wal_places.db-wal"))
-        .arg("--out")
-        .arg(dir.join("recovered"))
+        .arg("-o")
+        .arg(dir.join("recovered.xlsx"))
         .output()
         .expect("run carve");
     assert!(out.status.success(), "carve --wal <path> must exit 0");
@@ -216,32 +213,35 @@ fn default_carve_writes_combined_xlsx_not_db() {
     );
 }
 
-/// `carve --db` ADDITIONALLY writes the rebuilt `<stem>.carved.db` alongside the
-/// default xlsx. The produced db re-opens as valid SQLite with recovered_* tables;
-/// the summary names both files.
+/// `carve -f db` writes ONLY the rebuilt `<stem>.carved.db` (the xlsx and the db
+/// are now mutually-exclusive single choices, not additive). The produced db
+/// re-opens as valid SQLite with recovered_* tables; the summary names the db and
+/// no xlsx is written.
 #[test]
-fn carve_db_flag_writes_xlsx_and_carved_db() {
-    let dir = Scratch::new("db_flag");
+fn carve_db_format_writes_only_carved_db() {
+    let dir = Scratch::new("db_format");
     let db = dir.join("deleted_places.db");
     std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "deleted_places.db", "--db"])
+        .args(["carve", "deleted_places.db", "-f", "db"])
         .output()
-        .expect("run carve --db");
-    assert!(out.status.success(), "carve --db must exit 0");
+        .expect("run carve -f db");
+    assert!(out.status.success(), "carve -f db must exit 0");
 
     let xlsx = dir.join("deleted_places.recovered.xlsx");
     let carved = dir.join("deleted_places.carved.db");
-    assert!(xlsx.exists(), "the combined .xlsx must be written");
-    assert!(carved.exists(), "--db must additionally write .carved.db");
+    assert!(carved.exists(), "-f db must write .carved.db");
+    assert!(
+        !xlsx.exists(),
+        "-f db is exclusive: it must NOT also write the xlsx"
+    );
 
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("deleted_places.recovered.xlsx")
-            && stdout.contains("deleted_places.carved.db"),
-        "summary must mention both files, got: {stdout:?}"
+        stdout.contains("deleted_places.carved.db") && !stdout.contains(".recovered.xlsx"),
+        "summary must name the carved db only, got: {stdout:?}"
     );
 
     let bytes = std::fs::read(&carved).unwrap();
@@ -256,35 +256,63 @@ fn carve_db_flag_writes_xlsx_and_carved_db() {
     );
 }
 
-/// `--out <STEM>` overrides the derived stem for BOTH outputs; with `--db` the
-/// carved db lands at `<stem>.carved.db` and the xlsx at `<stem>.recovered.xlsx`.
+/// `-o <FILE>` honors the EXACT path given (no stem/extension stripping): the xlsx
+/// lands at precisely the file named, even in a nested directory.
 #[test]
-fn carve_out_flag_sets_stem_for_both_outputs() {
-    let dir = Scratch::new("out_stem");
-    let stem = dir.join("custom");
+fn carve_out_flag_honors_exact_path() {
+    let dir = Scratch::new("out_exact");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    let target = dir.join("sub").join("name.xlsx");
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("deleted_places.db"))
-        .args(["--db"])
-        .arg("--out")
-        .arg(&stem)
+        .arg("-o")
+        .arg(&target)
         .output()
         .expect("run carve");
-    assert!(out.status.success(), "carve --out must exit 0");
+    assert!(out.status.success(), "carve -o must exit 0");
     assert!(
-        dir.join("custom.recovered.xlsx").exists(),
-        "xlsx lands at <stem>.recovered.xlsx"
+        target.exists(),
+        "the xlsx must land at exactly the -o path, got dir listing: {:?}",
+        std::fs::read_dir(dir.join("sub"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
+    // No stem-stripped variant is created beside it.
+    assert!(
+        !dir.join("sub").join("name.recovered.xlsx").exists(),
+        "-o is verbatim: no <stem>.recovered.xlsx is derived"
+    );
+}
+
+/// `-f db -o <FILE>` writes the carved db to exactly the path given.
+#[test]
+fn carve_db_format_out_flag_honors_exact_path() {
+    let dir = Scratch::new("out_exact_db");
+    let target = dir.join("custom.db");
+    let out = bin()
+        .args(["carve"])
+        .arg(data_dir().join("deleted_places.db"))
+        .args(["-f", "db"])
+        .arg("-o")
+        .arg(&target)
+        .output()
+        .expect("run carve");
+    assert!(out.status.success(), "carve -f db -o must exit 0");
+    assert!(
+        target.exists(),
+        "the carved db must land at exactly the -o path"
     );
     assert!(
-        dir.join("custom.carved.db").exists(),
-        "carved db lands at <stem>.carved.db"
+        !dir.join("custom.carved.db").exists(),
+        "-o is verbatim: no <stem>.carved.db is derived"
     );
 }
 
 /// The safety guard refuses to write an output over the evidence database. Here
-/// the evidence is named `case.recovered.xlsx` and `--out` is the stem `case`, so
-/// the derived combined workbook would land exactly on the evidence: refused,
-/// evidence untouched.
+/// the evidence is named `case.recovered.xlsx` and `-o` points exactly at it, so
+/// the workbook would land on the evidence: refused, evidence untouched.
 #[test]
 fn carve_out_collision_with_evidence_is_refused() {
     let dir = Scratch::new("rebuild_guard");
@@ -295,8 +323,8 @@ fn carve_out_collision_with_evidence_is_refused() {
     let out = bin()
         .args(["carve"])
         .arg(&db)
-        .arg("--out")
-        .arg(dir.join("case"))
+        .arg("-o")
+        .arg(dir.join("case.recovered.xlsx"))
         .output()
         .expect("run carve");
     assert!(
@@ -308,6 +336,29 @@ fn carve_out_collision_with_evidence_is_refused() {
         before, after,
         "the evidence file must be left byte-identical"
     );
+}
+
+/// The old `--db` and `--rowid-only` flags are dropped: clap now rejects them as
+/// unknown arguments rather than silently accepting a deprecated alias.
+#[test]
+fn dropped_flags_are_rejected() {
+    for flag in ["--db", "--rowid-only"] {
+        let out = bin()
+            .args(["carve"])
+            .arg(data_dir().join("deleted_places.db"))
+            .arg(flag)
+            .output()
+            .expect("run carve");
+        assert!(
+            !out.status.success(),
+            "{flag} must be rejected as an unknown flag"
+        );
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            stderr.contains("unexpected") || stderr.contains("unknown") || stderr.contains("error"),
+            "{flag} rejection must report the bad argument, got: {stderr}"
+        );
+    }
 }
 
 /// `audit` grades anomalies on a real database and exits 0, driving `run_audit`,
@@ -389,7 +440,7 @@ fn malformed_db_audit_exits_nonzero() {
     assert!(stderr.contains("error"), "must report the parse error");
 }
 
-// ---- default combined workbook + opt-in db (`carve` / `carve --db`) ----------
+// ---- default combined workbook + opt-in db (`carve` / `carve -f db`) ----------
 
 /// The default `carve` writes the COMBINED TEMPORAL workbook: the source DB dumped
 /// one VERSION-HISTORY sheet per live table (here `moz_places`), carrying the eight
@@ -517,14 +568,14 @@ fn default_carve_xlsx_write_failure_exits_nonzero() {
     let dir = Scratch::new("xlsx_writefail");
     let db = dir.join("evidence.db");
     std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
-    // Occupy the derived xlsx path with a directory so writing the file there fails.
-    std::fs::create_dir(dir.join("recovered.recovered.xlsx")).unwrap();
+    // Occupy the exact -o xlsx path with a directory so writing the file there fails.
+    std::fs::create_dir(dir.join("recovered.xlsx")).unwrap();
 
     let out = bin()
         .args(["carve"])
         .arg(&db)
-        .arg("--out")
-        .arg(dir.join("recovered"))
+        .arg("-o")
+        .arg(dir.join("recovered.xlsx"))
         .output()
         .expect("run carve");
     assert!(
@@ -538,19 +589,19 @@ fn default_carve_xlsx_write_failure_exits_nonzero() {
     );
 }
 
-/// `--db` is refused in the stdout text modes (`--format`): clap rejects the
-/// combination with a nonzero exit rather than silently ignoring the flag.
+/// `-f` is a single closed value-set: an unrecognized format value is rejected by
+/// clap rather than silently falling back to a default.
 #[test]
-fn carve_db_flag_conflicts_with_format() {
+fn carve_unknown_format_value_is_rejected() {
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("deleted_places.db"))
-        .args(["--db", "--format", "csv"])
+        .args(["-f", "bogus"])
         .output()
         .expect("run carve");
     assert!(
         !out.status.success(),
-        "--db with --format must be refused by clap"
+        "an unknown -f value must be refused by clap"
     );
 }
 
@@ -643,7 +694,7 @@ fn carve_malformed_db_with_wal_exits_nonzero() {
 #[test]
 fn carve_format_missing_file_exits_nonzero() {
     let out = bin()
-        .args(["carve", "/no/such/database.db", "--format", "jsonl"])
+        .args(["carve", "/no/such/database.db", "-f", "jsonl"])
         .output()
         .expect("run carve");
     assert!(
@@ -664,7 +715,7 @@ fn carve_format_malformed_db_exits_nonzero() {
     let out = bin()
         .args(["carve"])
         .arg(&db)
-        .args(["--format", "table"])
+        .args(["-f", "table"])
         .output()
         .expect("run carve");
     assert!(
@@ -687,7 +738,7 @@ fn carve_format_unreadable_wal_exits_nonzero() {
     let out = bin()
         .args(["carve"])
         .arg(&db)
-        .args(["--format", "csv"])
+        .args(["-f", "csv"])
         .output()
         .expect("run carve");
     assert!(
@@ -710,7 +761,7 @@ fn carve_format_malformed_db_with_wal_exits_nonzero() {
     let out = bin()
         .args(["carve"])
         .arg(&db)
-        .args(["--format", "jsonl"])
+        .args(["-f", "jsonl"])
         .output()
         .expect("run carve");
     assert!(
@@ -721,21 +772,21 @@ fn carve_format_malformed_db_with_wal_exits_nonzero() {
     assert!(stderr.contains("error"), "must report the parse error");
 }
 
-/// `--db` mode when the carved db cannot be written (the `--out` stem's directory
+/// `-f db` mode when the carved db cannot be written (the `-o` path's directory
 /// does not exist) is a write error: nonzero exit with a diagnostic naming the db.
 #[test]
 fn carve_db_write_failure_exits_nonzero() {
     let dir = Scratch::new("rebuild_writefail");
     let db = dir.join("evidence.db");
     std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
-    // A stem inside a directory that does not exist → std::fs::write fails.
-    let target = dir.join("nonexistent_subdir").join("recovered");
+    // A path inside a directory that does not exist → std::fs::write fails.
+    let target = dir.join("nonexistent_subdir").join("recovered.carved.db");
 
     let out = bin()
         .args(["carve"])
         .arg(&db)
-        .args(["--db"])
-        .arg("--out")
+        .args(["-f", "db"])
+        .arg("-o")
         .arg(&target)
         .output()
         .expect("run carve");
@@ -770,10 +821,10 @@ fn default_carve_writes_attributed_table_and_fragments() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "0D-01.db", "--db"])
+        .args(["carve", "0D-01.db", "-f", "db"])
         .output()
         .expect("run carve");
-    assert!(out.status.success(), "carve --db must exit 0");
+    assert!(out.status.success(), "carve -f db must exit 0");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
         stdout.contains("record(s)") && stdout.contains("fragment(s)"),
@@ -867,12 +918,12 @@ fn no_fragments_omits_the_fragment_table() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "0D-01.db", "--db", "--no-fragments"])
+        .args(["carve", "0D-01.db", "-f", "db", "--no-fragments"])
         .output()
         .expect("run carve");
     assert!(
         out.status.success(),
-        "carve --db --no-fragments must exit 0"
+        "carve -f db --no-fragments must exit 0"
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
@@ -954,10 +1005,10 @@ fn three_tier_attribution_round_trips_through_sqlite3() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "tier.db", "--db"])
+        .args(["carve", "tier.db", "-f", "db"])
         .output()
         .expect("run carve");
-    assert!(out.status.success(), "carve --db must exit 0");
+    assert!(out.status.success(), "carve -f db must exit 0");
 
     let produced = dir.join("tier.carved.db");
     let tables = sqlite3_query(
@@ -1145,10 +1196,10 @@ fn deleted_places_rows_all_attribute_somewhere() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "deleted_places.db", "--db"])
+        .args(["carve", "deleted_places.db", "-f", "db"])
         .output()
         .expect("run carve");
-    assert!(out.status.success(), "carve --db must exit 0");
+    assert!(out.status.success(), "carve -f db must exit 0");
 
     let produced = dir.join("deleted_places.carved.db");
     // Sum the row counts across every recovered_* attribution table.
@@ -1596,7 +1647,7 @@ fn stdout_carve_surfaces_rollback_journal_records() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "SFT-03_PERSIST_ios.sqlite", "--format", "jsonl"])
+        .args(["carve", "SFT-03_PERSIST_ios.sqlite", "-f", "jsonl"])
         .output()
         .expect("run carve");
     assert!(
@@ -1620,7 +1671,7 @@ fn stdout_carve_surfaces_rollback_journal_records() {
         .args([
             "carve",
             "SFT-03_PERSIST_ios.sqlite",
-            "--format",
+            "-f",
             "jsonl",
             "--no-journal",
         ])
@@ -1634,7 +1685,7 @@ fn stdout_carve_surfaces_rollback_journal_records() {
     );
 }
 
-/// `carve --db` over the AUTOINCREMENT drop-recreate fixture writes a
+/// `carve -f db` over the AUTOINCREMENT drop-recreate fixture writes a
 /// `_table_instance_risk` provenance column into `recovered_students`, populated
 /// (non-NULL) for the residue rowids 6..=10 that exceed `sqlite_sequence=5`. The
 /// honesty flag rides as a column alongside the other provenance columns — never
@@ -1652,10 +1703,10 @@ fn carved_db_carries_table_instance_risk_column() {
 
     let out = bin()
         .current_dir(&dir.0)
-        .args(["carve", "b_autoinc.db", "--db"])
+        .args(["carve", "b_autoinc.db", "-f", "db"])
         .output()
-        .expect("run carve --db");
-    assert!(out.status.success(), "carve --db must exit 0");
+        .expect("run carve -f db");
+    assert!(out.status.success(), "carve -f db must exit 0");
 
     let produced = dir.join("b_autoinc.carved.db");
     let cols = sqlite3_query(
@@ -1690,7 +1741,7 @@ fn carve_jsonl_carries_table_instance_risk_field() {
     let out = bin()
         .args(["carve"])
         .arg(data_dir().join("drop_recreate/b_autoinc.db"))
-        .args(["--format", "jsonl"])
+        .args(["-f", "jsonl"])
         .output()
         .expect("run carve --format jsonl");
     assert!(out.status.success(), "carve --format jsonl must exit 0");

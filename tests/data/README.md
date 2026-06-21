@@ -317,3 +317,32 @@ its own provenance README (source, NIST/author hashes, licence, ground truth):
 - **md5:** `69087f66e1fc37a47ebf1803d951301d` — 12288 bytes.
 - **Notable contents:** live table `keep`; dropped table `secrets` recovered with
   its `CREATE TABLE secrets(...)` statement from page-1 residue.
+
+#### nist_dlc_snapshot.db  (REAL-ext, NIST public domain, **Tier-1**)
+
+- **Source:** NIST CFReDS **Data Leakage Case** (2015) — the Google Drive client
+  `snapshot.db`, recovered from a **Volume Shadow Copy** of the case's PC disk
+  image. Authored by NIST (not us, not our oracles); the published answer key is
+  the independent ground truth. U.S.-Government public domain.
+- **Case + answer key:**
+  <https://cfreds-archive.nist.gov/data_leakage_case/data-leakage-case.html> ·
+  answer PDF <https://cfreds-archive.nist.gov/data_leakage_case/leakage-answers.pdf>
+  (question 49: "What files were deleted from Google Drive?").
+- **Extraction recipe** (the PC image is ~20 GB, gitignored/not committed — only
+  the 20 KB `snapshot.db` is committed):
+
+  ```sh
+  # download cfreds_2015_data_leakage_pc.7z.001..003, then:
+  7z x cfreds_2015_data_leakage_pc.7z.001          # -> cfreds_2015_data_leakage_pc.dd
+  mmls cfreds_2015_data_leakage_pc.dd              # C: partition starts at sector 206848
+  # open the partition's Volume Shadow Copy (libvshadow) and read the NTFS within
+  # it (pytsk3): /Users/informant/AppData/Local/Google/Drive/user_default/snapshot.db
+  ```
+
+- **md5:** `a37a765981eea87d2c2cd5f7be0c6c0a` — 20480 bytes, `page_size` 1024.
+- **Notable contents / ground truth:** live `cloud_entry` holds only the Drive
+  `root`; the two **deleted** file entries —
+  `do_u_wanna_build_a_snow_man.mp3` (a clean freed cell, RowID 3) and
+  `happy_holiday.jpg` (a **freeblock-clobbered** cell, first 4 bytes overwritten)
+  — are both recovered by `forensic/tests/nist_dlc_snapshot.rs`, the latter via
+  freeblock reconstruction (surviving tail `…holiday.jpg`).

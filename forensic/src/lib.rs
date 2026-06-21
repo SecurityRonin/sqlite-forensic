@@ -882,12 +882,10 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
     // A rowid-only filter cannot tell these apart and drops both (a false
     // negative on prior versions). Comparing decoded values does.
     // Structural-noise rejection (precision, not the live-row guarantee): drop
-    // any carved record that cannot belong to a table in this schema — more
-    // columns than the widest live table, or no non-NULL cell. Applied to every
-    // tier uniformly (no per-source special-case); the dropped-table db has no
-    // live bound, so only the all-NULL arm fires there.
-    let max_live_columns = db.live_tables().iter().map(|t| t.affinities.len()).max();
-    out.retain(|rec| !is_structural_noise(&rec.values, max_live_columns));
+    // any carved record that carries no content — a rowid echo followed by an
+    // all-NULL tail, the inferred over-read of free-space zero bytes. Applied to
+    // every tier uniformly (no per-source special-case).
+    out.retain(|rec| !is_structural_noise(&rec.values));
 
     let live = db.live_rows();
     // Value-level identity of every live row, for collision-checking records whose
@@ -937,20 +935,19 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
 }
 
 /// A carved full record is **structural noise** — not an information-bearing
-/// deleted row — when it cannot belong to any table in the schema. Two
-/// fixture-independent conditions, derived from the data's structure rather
-/// than any specific input: it has more columns than the widest live table
-/// (`max_live_columns`), so it matches no table; or every column is NULL, so it
-/// carries no recoverable content. The inferred carver, lacking a column hint,
-/// can read a run of free-space zero/garbage bytes as a long serial-type-0
-/// (NULL) array — this rejects that noise at any confidence. With no live table
-/// to bound against (`None` — a fully dropped-table db), only the all-NULL arm
-/// applies; the dropped-table tier governs column counts there.
-fn is_structural_noise(values: &[Value], max_live_columns: Option<usize>) -> bool {
-    if max_live_columns.is_some_and(|max| values.len() > max) {
-        return true;
-    }
-    values.iter().all(|v| matches!(v, Value::Null))
+/// deleted row — when every column past the first is NULL. The inferred carver,
+/// lacking a column hint, can read a run of free-space zero bytes as a long
+/// serial-type-0 (NULL) array; that surfaces as a rowid echo (the INTEGER-PK
+/// column) followed by an all-NULL tail, carrying no recoverable content. A
+/// genuine row — live, dropped-table, or overflow — has a non-NULL value in some
+/// non-leading column.
+///
+/// The column count is deliberately NOT bounded against the live tables: a
+/// dropped table can legitimately be wider than every surviving one, so a
+/// width cap would discard genuine unattributed records. Requiring length >= 2
+/// keeps a real single-column row from being mistaken for noise.
+fn is_structural_noise(values: &[Value]) -> bool {
+    values.len() >= 2 && values.iter().skip(1).all(|v| matches!(v, Value::Null))
 }
 
 /// Two-tier deleted-record recovery: Tier-1 full rows **plus** Tier-2 partial
@@ -2049,21 +2046,21 @@ mod structural_noise_tests {
     use sqlite_core::Value;
 
     #[test]
-    fn rejects_record_wider_than_any_live_table() {
+    fn rejects_rowid_echo_with_all_null_tail() {
         // The inferred over-read: a rowid echoed as the INTEGER-PK first column
-        // followed by a long serial-type-0 (NULL) tail — 102 columns where the
-        // widest live table has 6. It belongs to no table → noise.
+        // followed by a long serial-type-0 (NULL) tail — no recoverable content.
         let mut overwide = vec![Value::Null; 102];
         overwide[0] = Value::Integer(14);
-        assert!(is_structural_noise(&overwide, Some(6)));
+        assert!(is_structural_noise(&overwide));
     }
 
     #[test]
     fn rejects_all_null_record() {
-        assert!(is_structural_noise(
-            &[Value::Null, Value::Null, Value::Null],
-            Some(6)
-        ));
+        assert!(is_structural_noise(&[
+            Value::Null,
+            Value::Null,
+            Value::Null
+        ]));
     }
 
     #[test]
@@ -2074,18 +2071,27 @@ mod structural_noise_tests {
             Value::Real(11.23),
             Value::Null,
         ];
-        assert!(!is_structural_noise(&good, Some(6)));
+        assert!(!is_structural_noise(&good));
     }
 
     #[test]
-    fn dropped_table_db_has_no_column_bound() {
-        // No live table → max_live_columns is None → the column-cap arm is
-        // disabled; a wide real dropped-table row (08.db's 6-column books rows)
-        // must still be kept, only all-NULL noise rejected.
-        let row: Vec<Value> = (0..6).map(Value::Integer).collect();
-        assert!(!is_structural_noise(&row, None));
-        let all_null = vec![Value::Null; 6];
-        assert!(is_structural_noise(&all_null, None));
+    fn keeps_dropped_table_row_wider_than_any_live_table() {
+        // A dropped table can be wider than every surviving live table; such an
+        // unattributed record carries real values and MUST be kept (a width cap
+        // would discard it — the regression this guards).
+        let wide_real = vec![
+            Value::Integer(7),
+            Value::Text("secret".into()),
+            Value::Integer(42),
+            Value::Text("more".into()),
+        ];
+        assert!(!is_structural_noise(&wide_real));
+    }
+
+    #[test]
+    fn keeps_single_column_row() {
+        // A genuine one-column row is not noise (length < 2 short-circuits).
+        assert!(!is_structural_noise(&[Value::Text("solo".into())]));
     }
 }
 

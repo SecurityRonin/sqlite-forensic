@@ -3223,9 +3223,7 @@ fn reconstruct_freeblock_inner(
                 // cell whose serial array fully survives. Reconstruct it ONLY if
                 // the record tiles the freeblock exactly — the precision gate that
                 // rejects the misaligned runs a loose walk would manufacture.
-                if let Some(cell) = template.reconstruct_exact_single(page_bytes, fb, fb_end) {
-                    cells.push(cell);
-                }
+                cells.extend(template.reconstruct_span_exact(page_bytes, fb, fb_end));
             } else {
                 template
                     .reconstruct_span_tiered(page_bytes, fb, fb_end, false, &mut cells, &mut frags);
@@ -3619,25 +3617,19 @@ impl FreeblockTemplate {
         ))
     }
 
-    /// Reconstruct a freeblock-clobbered cell that occupies the **entire**
-    /// freeblock `[cell_start, fb_end)` — the empty-leading-serial case (a 2-byte
-    /// or wider rowid varint, so the 4-byte clobber destroyed no serial type and
-    /// the whole serial array survives at `cell_start + surviving_serials_off`).
-    ///
-    /// A freed cell's slot becomes a freeblock of **exactly** its own size, so the
-    /// record is emitted ONLY when it tiles the freeblock precisely
-    /// (`record_end == fb_end`). That exact-tile constraint is the strong precision
-    /// signal that the surviving bytes are a real record: a wrong serial offset (a
-    /// deleted cell whose destroyed rowid width differs from the template's) yields
-    /// a body that does not reach `fb_end`, and is rejected rather than emitted as
-    /// a column-shifted phantom. Returns the carved cell (rowid destroyed → 0), or
-    /// `None` on any out-of-bounds parse or inexact fit.
-    fn reconstruct_exact_single(
+    /// Reconstruct ONE freeblock-clobbered empty-leading-serial cell at
+    /// `cell_start` — a 2-byte-or-wider rowid, so the 4-byte clobber destroyed no
+    /// serial type and the whole serial array survives at
+    /// `cell_start + surviving_serials_off`. Returns the carved cell (rowid
+    /// destroyed → 0) **and the record's end offset**, or `None` on any
+    /// out-of-bounds parse or a record that overruns `span_end`. Does NOT enforce
+    /// an exact tile — the span walker [`Self::reconstruct_span_exact`] does.
+    fn reconstruct_cell_empty_lead(
         &self,
         page: &[u8],
         cell_start: usize,
-        fb_end: usize,
-    ) -> Option<CarvedCell> {
+        span_end: usize,
+    ) -> Option<(CarvedCell, usize)> {
         let tail_start = cell_start.checked_add(self.surviving_serials_off)?;
         // The whole serial array survives (no clobbered leading serial); read all
         // `column_count` serials from the freeblock.
@@ -3648,7 +3640,7 @@ impl FreeblockTemplate {
             serial_body_len(s)?;
             serials.push(s);
             pos = pos.checked_add(used)?;
-            if pos > fb_end {
+            if pos > span_end {
                 return None;
             }
         }
@@ -3658,8 +3650,7 @@ impl FreeblockTemplate {
         }
         let body_start = pos;
         let record_end = body_start.checked_add(body_len)?;
-        // Exact tile: the reconstructed record must fill the freeblock precisely.
-        if record_end != fb_end {
+        if record_end > span_end {
             return None;
         }
         let body = page.get(body_start..record_end)?;
@@ -3667,13 +3658,53 @@ impl FreeblockTemplate {
         if values.len() != self.column_count {
             return None; // cov:unreachable: one value per serial by construction
         }
-        Some(CarvedCell {
-            offset: cell_start,
-            byte_len: record_end - cell_start,
-            rowid: 0, // destroyed by freeblock conversion — surfaced as unknown
-            values,
-            confidence: FREEBLOCK_RECONSTRUCT_CONFIDENCE,
-        })
+        Some((
+            CarvedCell {
+                offset: cell_start,
+                byte_len: record_end - cell_start,
+                rowid: 0, // destroyed by freeblock conversion — surfaced as unknown
+                values,
+                confidence: FREEBLOCK_RECONSTRUCT_CONFIDENCE,
+            },
+            record_end,
+        ))
+    }
+
+    /// Reconstruct every empty-leading-serial cell coalesced into the freeblock
+    /// `[lo, hi)`, returned ONLY when they tile the freeblock **exactly** (the
+    /// walk reaches `hi` with no leftover bytes).
+    ///
+    /// A single freed cell fills its freeblock exactly; adjacent deletions
+    /// coalesce into one freeblock whose interior holds the freed cells
+    /// back-to-back, each clobbered in its first 4 bytes. Walking cell-to-cell and
+    /// requiring the run to land precisely on `hi` is the precision gate: a
+    /// misaligned read (a deleted cell whose destroyed rowid width differs from the
+    /// template's) fails to reach `hi` exactly, so the whole span is rejected
+    /// rather than emitted as column-shifted phantoms. Bounded by
+    /// [`MAX_FREEBLOCKS_PER_PAGE`]; a record always advances `cell_start`.
+    fn reconstruct_span_exact(&self, page: &[u8], lo: usize, hi: usize) -> Vec<CarvedCell> {
+        let mut cells = Vec::new();
+        let mut cell_start = lo;
+        let mut guard = 0usize;
+        while cell_start < hi && guard < MAX_FREEBLOCKS_PER_PAGE {
+            guard += 1;
+            let Some((cell, record_end)) = self.reconstruct_cell_empty_lead(page, cell_start, hi)
+            else {
+                return Vec::new(); // a cell did not reconstruct → not a clean tiling
+            };
+            if record_end <= cell_start {
+                return Vec::new(); // cov:unreachable: a non-empty record advances cell_start
+            }
+            cells.push(cell);
+            cell_start = record_end;
+        }
+        // Exact tile: leftover bytes (or a walk stopped by the bound) mean a
+        // misaligned run — emit nothing.
+        if cell_start == hi {
+            cells
+        } else {
+            Vec::new()
+        }
     }
 
     /// Reconstruct a freeblock-clobbered **spilled** cell at `cell_start` (task

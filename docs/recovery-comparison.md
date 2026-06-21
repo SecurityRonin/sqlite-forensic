@@ -20,6 +20,16 @@ regenerate its table). Corpus and oracle provenance are in
 > survey's scenarios (identical bytes), with the survey's three-technique
 > framework — see [`competitive-landscape.md`](competitive-landscape.md).
 
+> The matrices below score **freed-space deleted-record carving** on Nemetz.
+> Other recovery surfaces are validated separately in
+> [`validation.md`](validation.md): freeblock-clobbered **2-byte-rowid** and
+> **coalesced** rows (the general freeblock-reconstruction improvement), **dropped
+> table schema** recovery, the rollback-journal/WAL substrate, the real-case **NIST
+> Data Leakage `snapshot.db`** (both deleted `cloud_entry` records, incl. the
+> freeblock-clobbered one), **NIST SFT-05** native-type/BLOB reading, and the
+> independent **`sqlite-unhide`** answer-keyed corpus. Those carver improvements
+> left the Nemetz numbers below **unchanged** (0C cross-tool recall 0.833).
+
 ## Executive summary
 
 - **Freeblock-aware reconstruction leads in-page recall, at the highest precision

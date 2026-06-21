@@ -394,6 +394,42 @@ fn carve_db_format_writes_only_carved_db() {
     );
 }
 
+/// `-f db` must fold in the rollback-journal recoveries, exactly like `-f xlsx` and
+/// the stdout streams do — previously the carved db silently omitted them. On the
+/// NIST SFT-03 PERSIST artifact the `-journal` recovers ~200 rows (100 deleted +
+/// 100 modified); the carved db's record count must reflect them.
+#[test]
+fn db_format_includes_rollback_journal_records() {
+    let dir = Scratch::new("db_journal");
+    let db = dir.join("ev.db");
+    std::fs::copy(data_dir().join("cfreds/SFT-03_PERSIST_android.sqlite"), &db).unwrap();
+    std::fs::copy(
+        data_dir().join("cfreds/SFT-03_PERSIST_android.sqlite-journal"),
+        dir.join("ev.db-journal"),
+    )
+    .unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "ev.db", "-f", "db"])
+        .output()
+        .expect("run carve -f db");
+    assert!(out.status.success(), "carve -f db must exit 0");
+
+    // The summary reports records.len() — what is folded into the carved db.
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let count: usize = stdout
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("expected 'wrote N record(s)' summary, got: {stdout:?}"));
+    assert!(
+        count >= 200,
+        "carve -f db must include the ~200 rollback-journal recoveries (xlsx/stream do); \
+         got {count} records in: {stdout:?}"
+    );
+}
+
 /// `-o <FILE>` honors the EXACT path given (no stem/extension stripping): the xlsx
 /// lands at precisely the file named, even in a nested directory.
 #[test]

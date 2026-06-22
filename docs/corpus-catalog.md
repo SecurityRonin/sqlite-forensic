@@ -276,7 +276,7 @@ at fields 1/2.
 
 - Classification: `VENDORED` (third-party tool), confidence `✓` (run on the full
   0C/0D/0E head-to-head scope).
-- Tool: SQLite Dissect, DoD Cyber Crime Center (DC3); see upstream for license.
+- Tool: SQLite Dissect 1.0.0, DoD Cyber Crime Center (DC3); see upstream for license.
 - Upstream: <https://github.com/dod-cyber-crime-center/sqlite-dissect>; install via
   `pip install sqlite-dissect`.
 - Invocation (the harness gate): `SQLITE_DISSECT_CMD=scripts/run-sqlite-dissect.sh`,

@@ -11,12 +11,21 @@ artifacts we authored — the patches (diffs against pristine upstream), the hea
 shims/tap, and a per-tool `SETUP.md` recipe. You download each upstream yourself,
 at the pinned version, under its own license, and apply our patch.
 
-| Tool | Gate | Upstream | License | Our committed artifacts |
-|---|---|---|---|---|
-| **undark** 0.7.1 | `UNDARK_BIN` | [inflex/undark](https://github.com/inflex/undark) | BSD-Revised | `undark/undark.patch`, `undark/SETUP.md` |
-| **fqlite** 4.22 | `FQLITE_TAP` + `FQLITE_JAVA` | [pawlaszczyk/fqlite](https://github.com/pawlaszczyk/fqlite) | see upstream | `fqlite/{SETUP.md, run-tap.sh, fqlite.patch, tap/, stubs/}` |
-| **bring2lite** | `BRING2LITE_CMD` | [bring2lite/bring2lite](https://github.com/bring2lite/bring2lite) | see upstream | `bring2lite/{SETUP.md, bring2lite.patch, shim/}` |
-| **sqlite_dissect** (DC3) | `SQLITE_DISSECT_CMD` | [dod-cyber-crime-center/sqlite-dissect](https://github.com/dod-cyber-crime-center/sqlite-dissect) | see upstream | `scripts/run-sqlite-dissect.sh` (install via `pip install sqlite-dissect`) |
+| Tool | Pinned version / commit | Gate | Upstream | License | Our committed artifacts |
+|---|---|---|---|---|---|
+| **undark** | 0.7.1 (tarball sha256 `c0a9ee7e…`) | `UNDARK_BIN` | [inflex/undark](https://github.com/inflex/undark) | BSD-Revised | `undark/undark.patch`, `undark/SETUP.md` |
+| **fqlite** | 4.22 — commit `26922bd9e3cdc60c93b72dfb1fb2f5972a0af6a6` | `FQLITE_TAP` + `FQLITE_JAVA` | [pawlaszczyk/fqlite](https://github.com/pawlaszczyk/fqlite) | see upstream | `fqlite/{SETUP.md, run-tap.sh, fqlite.patch, tap/, stubs/}` |
+| **bring2lite** | commit `e876bf28c1ba03fc598d92832374f72794760ca1` | `BRING2LITE_CMD` | [bring2lite/bring2lite](https://github.com/bring2lite/bring2lite) | see upstream | `bring2lite/{SETUP.md, bring2lite.patch, shim/}` |
+| **sqlite_dissect** (DC3) | 1.0.0 (`pip install sqlite-dissect`) | `SQLITE_DISSECT_CMD` | [dod-cyber-crime-center/sqlite-dissect](https://github.com/dod-cyber-crime-center/sqlite-dissect) | see upstream | `scripts/run-sqlite-dissect.sh` |
+
+These pins are the authoritative record for **independent verification**; each
+`SETUP.md` repeats them with the full toolchain detail (e.g. the `fqlite` tap builds
+with OpenJDK 25 `--release 21` against OpenJFX 22.0.2). The Nemetz/false-positive
+**fixtures** are built with the stock `sqlite3` shell **3.45.3**. Note `fqlite.patch`
+is intentionally empty (no diff hunks) — at the pinned commit the engine's GUI calls
+are already `null`-guarded upstream, so the headless tap needs no edit to fqlite's
+source; the instrumentation is `tap/HeadlessTap.java` plus six compile-only LLM-package
+stubs (see `fqlite/SETUP.md`).
 
 The bulky upstream checkouts/builds (`*/checkout/`, `fqlite/{sdk,lib,build}`,
 `*/pkg/`, downloaded scripts, built binaries) are gitignored — see `.gitignore`.

@@ -341,8 +341,9 @@ fn category_0d_true_positive_floor() {
 /// threshold) is a single contiguous run and the contiguity test is exact; a
 /// record large enough to spill onto a non-contiguous overflow-page chain (SQLite
 /// file format, "Cell payload overflow pages") cannot be modelled by a flat-file
-/// contiguity test and is treated conservatively as not-recoverable (chain-aware
-/// overflow recoverability is future work).
+/// contiguity test and is treated conservatively as not-recoverable. (The carver
+/// itself DOES recover surviving overflow chains — see `overflow_chain.rs`; this
+/// flat-file estimator simply does not model them, keeping the denominator honest.)
 ///
 /// For 0D this tightens `d_recoverable` from the inflated 36 to the honest 19 —
 /// the substrate is small because overwrites genuinely destroyed roughly half the

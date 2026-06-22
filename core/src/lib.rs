@@ -13,8 +13,8 @@
 //! Format constants are consumed from [`forensicnomicon::sqlite`] (the KNOWLEDGE
 //! leaf) where exposed; a few not-yet-promoted offsets (reserved-space 20,
 //! in-header DB-size 28, freelist-count 36) are held locally and flagged for
-//! promotion. Still out of scope: index b-trees, `WITHOUT ROWID` tables,
-//! UTF-16 text, and WAL frame-checksum verification.
+//! promotion. Still out of scope: index b-trees and `WITHOUT ROWID` tables.
+//! (UTF-16 text decoding and WAL frame-checksum verification are implemented.)
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 

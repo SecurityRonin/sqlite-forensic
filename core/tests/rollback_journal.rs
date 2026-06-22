@@ -232,6 +232,27 @@ fn duplicate_pgno_keeps_first_and_flags_anomaly() {
 }
 
 #[test]
+fn duplicate_pgnos_reports_the_repeated_page() {
+    // roadmap §2.2: surface the offending VALUE (which page repeated), not just a
+    // boolean flag — `from_walk` first-wins-dedups and must retain the dup pgno.
+    let ps = 512u32;
+    let nonce = 11u32;
+    let first = page_bytes(ps as usize);
+    let mut second = first.clone();
+    second[0] ^= 0xff; // a DIFFERENT image for the same pgno
+    let mut j = header(2, nonce, 5, 512, ps);
+    j.extend_from_slice(&record(2, &first, nonce));
+    j.extend_from_slice(&record(2, &second, nonce));
+
+    let parsed = RollbackJournal::parse(&j, ps).expect("duplicate pgno parse");
+    assert_eq!(
+        parsed.duplicate_pgnos(),
+        [2],
+        "the repeated page number itself must be surfaced, not just a boolean"
+    );
+}
+
+#[test]
 fn garbage_yields_empty_not_panic() {
     let ps = 512u32;
     // Non-magic, too short to hold any record at any sector candidate.

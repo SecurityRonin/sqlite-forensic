@@ -2,7 +2,7 @@
 """Render docs/img/recovery-comparison.png from docs/img/comparison_metrics.csv.
 
 The CSV is emitted by ``forensic/tests/nemetz_tool_comparison.rs`` (run with the
-oracle gates set — UNDARK_BIN/FQLITE_TAP/BRING2LITE_CMD/SQLDRP_CMD), so every
+oracle gates set — UNDARK_BIN/FQLITE_TAP/BRING2LITE_CMD/SQLITE_DISSECT_CMD), so every
 number plotted here is the harness's computed value — never hand-typed.
 Re-run that test to refresh the CSV, then re-run this script to refresh the PNG.
 
@@ -26,10 +26,6 @@ CSV_PATH = HERE / "img" / "comparison_metrics.csv"
 PNG_PATH = HERE / "img" / "recovery-comparison.png"
 
 # Tool -> colour; category -> marker.
-# SQL-DRP is omitted from the chart: it emits space-joined string blobs, not
-# per-column records, so it scores 0 under the (col1,col2) identity metric -- a
-# capability boundary, not a recovery failure (see recovery-comparison.md). It is
-# kept in the table and prose, but plotting a metric-artifact 0 misrepresents it.
 TOOL_COLOR = {
     "ours": "#1b9e8a",          # teal
     "fqlite": "#e6840f",        # orange
@@ -194,7 +190,7 @@ def main():
     grouped_bars(axes[2], rows, "f0_5", "F0.5 (precision-weighted)")
     fig.suptitle(
         "Deleted-record recovery on the Nemetz corpus — ours vs undark vs fqlite "
-        "vs bring2lite vs SQL-DRP (0C/0D/0E, harness-computed)",
+        "vs bring2lite vs sqlite_dissect (0C/0D/0E, harness-computed)",
         fontsize=12,
     )
     fig.tight_layout(rect=(0, 0.07, 1, 0.96))

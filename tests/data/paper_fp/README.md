@@ -46,7 +46,7 @@ The paper classifies two false-positive classes that existing carvers mishandle:
 
 `f.db`'s `v` embeds the row id (`ROW-<id>-XXXX…`, ~420 bytes). The id-alias
 (`INTEGER PRIMARY KEY`) is stored as a header rowid, which content-keyed tools
-that drop the rowid (bring2lite and SQL-DRP both emit a `NULL` rowid-alias cell)
+that drop the rowid (bring2lite emits a `NULL` rowid-alias cell)
 cannot recover — so the embedded tag is what lets every tool's output be scored
 against the live/deleted sets. Without it, an all-identical payload would make a
 Type-\*\* false positive (a *live* 51..80 row surfaced from a freed page)

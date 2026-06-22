@@ -1,8 +1,8 @@
 # Deleted-Record Recovery — Measured Capability
 
 What `sqlite_forensic::carve_all_deleted_records` actually recovers, and how it
-compares **head-to-head against `undark`, `fqlite`, `bring2lite`, and the SQLite
-Deleted Records Parser (SQL-DRP)** — every tool scored
+compares **head-to-head against `undark`, `fqlite`, `bring2lite`, and DC3's
+`sqlite_dissect`** — every tool scored
 against the **same independent third-party ground truth**: the SQLite Forensic
 Corpus (Nemetz, Schmitt & Freiling, DFRWS-EU 2018, CC0), whose authors shipped,
 per database, an `.xml` answer key tagging every deleted row with its full
@@ -10,13 +10,13 @@ content.
 
 Both matrices below are **harness-computed**, not hand-written: the single-tool
 matrix by `forensic/tests/nemetz_metrics.rs` and the head-to-head (up to five
-tools — ours, `undark`, `fqlite`, `bring2lite`, SQL-DRP) by
+tools — ours, `undark`, `fqlite`, `bring2lite`, `sqlite_dissect`) by
 `forensic/tests/nemetz_tool_comparison.rs` (run either with `--nocapture` to
 regenerate its table). Corpus and oracle provenance are in
 [`corpus-catalog.md`](corpus-catalog.md) and [`validation.md`](validation.md).
 
 > For the **false-positive** angle — our 0-FP discipline measured against
-> `bring2lite` and the SQLite Deleted Records Parser on the 2025 SQLite-recovery
+> `bring2lite` on the 2025 SQLite-recovery
 > survey's scenarios (identical bytes), with the survey's three-technique
 > framework — see [`competitive-landscape.md`](competitive-landscape.md).
 
@@ -83,7 +83,7 @@ regenerate its table). Corpus and oracle provenance are in
   ground truth (SFT-03: WAL, and PERSIST journal 100/100); see
   [`validation.md`](validation.md).
 
-## Head-to-head — ours vs undark vs fqlite vs bring2lite vs SQL-DRP vs sqlite_dissect (computed)
+## Head-to-head — ours vs undark vs fqlite vs bring2lite vs sqlite_dissect (computed)
 
 Every tool's recovered rows are matched against the **same** answer key by a
 format-stable `(col1, col2)` identity (the two integer/text columns at positions
@@ -144,25 +144,22 @@ key. Under this rule:
 | 0C | undark | 84 | 84 | 14 | 10 | 70 | 4 | 0.167 | 0.167 | 0.583 |
 | 0C | fqlite | 84 | 84 | 67 | 17 | 17 | **0** | 0.798 | 0.798 | 0.798 |
 | 0C | bring2lite | 84 | 84 | 40 | 0 | 44 | **0** | 0.476 | 0.476 | 1.000 |
-| 0C | sqldrp | 84 | 84 | 0 | 1 | 84 | 0 | 0.000 | 0.000 | 0.000 |
 | 0C | sqlite_dissect | 84 | 84 | 51 | 23 | 33 | 0 | 0.607 | 0.607 | 0.689 |
 | 0D | **ours** | 45 | 19 | 19 | 0 | 0 | **0** | **1.000** | 0.422 | **1.000** |
 | 0D | undark | 45 | 19 | 1 | 10 | 18 | 56 | 0.053 | 0.022 | 0.091 |
 | 0D | fqlite | 45 | 19 | **20** | 0 | 0 | **0** | **1.000** | **0.444** | **1.000** |
 | 0D | bring2lite | 45 | 19 | 7 | 0 | 12 | **0** | 0.368 | 0.156 | 1.000 |
-| 0D | sqldrp | 45 | 19 | 0 | 0 | 19 | 0 | 0.000 | 0.000 | 1.000 |
 | 0D | sqlite_dissect | 45 | 19 | 18 | 3 | 2 | 0 | 0.895 | 0.400 | 0.857 |
 | 0E | **ours** | 12 | 4 | **4** | 0 | 0 | **0** | **1.000** | **0.333** | **1.000** |
 | 0E | undark | 12 | 4 | 3 | 6 | 1 | 27 | 0.750 | 0.250 | 0.333 |
 | 0E | fqlite | 12 | 4 | 2 | 6 | 2 | **0** | 0.500 | 0.167 | 0.250 |
 | 0E | bring2lite | 12 | 4 | 3 | 5 | 1 | 7 | 0.750 | 0.250 | 0.375 |
-| 0E | sqldrp | 12 | 4 | 0 | 0 | 4 | 0 | 0.000 | 0.000 | 1.000 |
 | 0E | sqlite_dissect | 12 | 4 | 3 | 633 | 1 | 7 | 0.750 | 0.250 | 0.005 |
 
 (Totals exclude 0C-06/0C-07; `0C` therefore sums 8 databases, 84 deleted rows.
 Regenerate with `cargo test -p sqlite-forensic --test nemetz_tool_comparison --
 --nocapture`, with the tool gates set — `UNDARK_BIN`, `FQLITE_TAP`,
-`BRING2LITE_CMD`, `SQLDRP_CMD`. Each column is present only when its gate is set;
+`BRING2LITE_CMD`, `SQLITE_DISSECT_CMD`. Each column is present only when its gate is set;
 a bare run prints only the `ours` rows.)
 
 **Measurement provenance.** All rows are measured in this repo against the same
@@ -179,10 +176,10 @@ four oracle gates set. Two methodological notes:
   1.000, `0E` 0.500); its *precision* reflects that tap's emission policy, so weigh
   the recall.
 
-The **bring2lite** and **sqldrp** rows are **measured by us** in this repo against
-the same answer key and the same `(col1,col2)` matcher (`BRING2LITE_CMD` =
-`scripts/run-bring2lite.sh`, `SQLDRP_CMD` = `scripts/run-sqldrp.sh`; provenance in
-[`corpus-catalog.md`](corpus-catalog.md) §F.3/§F.4).
+The **bring2lite** and **sqlite\_dissect** rows are **measured by us** in this repo
+against the same answer key and the same `(col1,col2)` matcher (`BRING2LITE_CMD` =
+`scripts/run-bring2lite.sh`, `SQLITE_DISSECT_CMD` = `scripts/run-sqlite-dissect.sh`;
+provenance in [`corpus-catalog.md`](corpus-catalog.md) §F).
 
 - **bring2lite** carves a real but smaller slice of the deleted set: it reaches
   40/84 of the `0C` free-block rows at precision **1.000** (no phantom, no live
@@ -198,18 +195,6 @@ the same answer key and the same `(col1,col2)` matcher (`BRING2LITE_CMD` =
   live rows as deleted (precision 0.005), the false-positive hazard our structural
   exclusion rules out. Measured via `scripts/run-sqlite-dissect.sh`
   (`SQLITE_DISSECT_CMD`).
-- **SQL-DRP records a measured capability boundary, not a recall number.** It is a
-  printable-**string** carver: its TSV output is a single space-joined `Data` blob
-  per freed region, never a per-column `(col0,col1,col2)` record, so it exposes no
-  format-stable `(col1,col2)` identity for this matcher and recovers **0** answer-key
-  rows in every category (and nothing at all from the integer tables, whose values
-  are not printable strings). The lone `0C` "FP" is one carved blob that happened to
-  contain commas — an honest phantom, not a recovered row. This is reported
-  explicitly rather than scored against a confounded key, the same discipline that
-  excludes the 0C-06/0C-07 FLOAT tables. For where SQL-DRP's string-carving *does*
-  pay off (false-positive avoidance, WAL-vs-main-image substrate) see
-  [`competitive-landscape.md`](competitive-landscape.md).
-
 ![Precision-recall plane plus F1 and F0.5 grouped bars for ours, undark,
 fqlite, bring2lite, and sqlite_dissect across categories 0C/0D/0E](img/recovery-comparison.png)
 
@@ -218,11 +203,7 @@ The figure plots the **same harness-computed numbers** as the table above:
 `recall_substrate`, `precision`, `F1`, and `F0.5` to
 [`img/comparison_metrics.csv`](img/comparison_metrics.csv) when run with the
 undark/fqlite oracles, and `docs/plot_comparison.py` renders the chart straight
-from that CSV — chart and table are the same dataset by construction. SQL-DRP is
-omitted from the chart: it scores 0 under the `(col1,col2)` identity metric because
-it emits space-joined string blobs, not per-column records — a measured capability
-boundary (kept in the table and detailed below), not a recovery failure, and a
-metric-artifact 0 would misrepresent it as plotted. By **F1**
+from that CSV — chart and table are the same dataset by construction. By **F1**
 (balanced), sqlite-forensic leads `0C` (0.909 vs fqlite 0.798); under **F0.5**
 (precision-weighted — the forensic β, since a phantom row costs an examiner more
 than a missed low-confidence one) the `0C` lead widens (0.962 vs fqlite 0.798). The `0E`

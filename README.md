@@ -307,7 +307,7 @@ Carved records remain **confidence-graded observations** ("consistent with a del
 
 - [`docs/validation.md`](docs/validation.md) — the Doer-Checker differential: how the carver was reconciled against undark and fqlite, page-level divergence diagnosis, build recipes.
 - [`docs/recovery-comparison.md`](docs/recovery-comparison.md) — the measured per-database recall/precision confusion matrix against independent Nemetz ground truth, with the undark/fqlite concordance and DC3 no-FP regression set as secondary checks.
-- [`docs/competitive-landscape.md`](docs/competitive-landscape.md) — the 2025 SQLite false-positive survey (Lee, Park, Lee & Choi, FSI:DI 55), its three-technique framework, and our measured 0-FP discipline vs `bring2lite` and the SQLite Deleted Records Parser on the survey's scenarios (identical bytes).
+- [`docs/competitive-landscape.md`](docs/competitive-landscape.md) — the 2025 SQLite false-positive survey (Lee, Park, Lee & Choi, FSI:DI 55), its three-technique framework, and our measured 0-FP discipline vs `bring2lite`, `FQLite`, and `Undark` on the survey's scenarios (identical bytes).
 - [`docs/corpus-catalog.md`](docs/corpus-catalog.md) — every test fixture with its verbatim generator command and MD5.
 - [`tests/data/README.md`](tests/data/README.md) — the committed synthetic fixtures, co-located.
 

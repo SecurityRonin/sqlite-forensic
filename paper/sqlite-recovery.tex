@@ -120,8 +120,8 @@ We contribute: (1)~a treatment of SQLite deletion and free-space conventions,
 including an application case study of \zh{微信} (WeChat) message deletion;
 (2)~\sys, an open, \code{forbid(unsafe)} Rust reference implementation;
 and (3)~a multi-oracle evaluation---accuracy, false-positive rate, and
-throughput---against five independent recovery tools (\code{undark}, \code{fqlite},
-\code{bring2lite}, the SQLite Deleted-Records Parser, and DC3's SQLite Dissect) on
+throughput---against four independent recovery tools (\code{undark}, \code{fqlite},
+\code{bring2lite}, and DC3's SQLite Dissect) on
 independent third-party corpora with published ground truth. In our scoped harness on the in-page deletion
 category of the Nemetz standardized corpus, our recall is $0.833$ to the
 best-performing competitor's $0.798$ at precision $1.000$, and across the evaluated
@@ -466,10 +466,9 @@ anchor.
 \section{Evaluation}\label{sec:eval}
 
 \subsection*{Accuracy: a multi-oracle head-to-head}
-We compare \sys against five independent recovery tools---\code{undark}
+We compare \sys against four independent recovery tools---\code{undark}
 (C)~\cite{undark}, \code{fqlite} (Java)~\cite{pawlaszczyk2021fqlite}, \code{bring2lite}
-(Python)~\cite{meng2019bring2lite}, the SQLite Deleted-Records Parser
-(SQL-DRP, Python)~\cite{degrazia_sqlparse}, and DC3's \code{sqlite\_dissect}
+(Python)~\cite{meng2019bring2lite}, and DC3's \code{sqlite\_dissect}
 (Python)~\cite{sqlite_dissect_dc3}---each scored against the \emph{same}
 Nemetz answer key with the same two-column identity matcher
 (Table~\ref{tab:headtohead}). Substrate recall ($R_{\mathrm{sub}}$) is computed on
@@ -493,38 +492,31 @@ wrappers/tap.}
 \toprule
 Cat & Tool & TP & FP & FN & $R_{\mathrm{sub}}$ & $R_{\mathrm{e2e}}$ & Prec. \\
 \midrule
-\multirow{6}{*}{\code{0C}}
+\multirow{5}{*}{\code{0C}}
  & \textbf{ours}   & \textbf{70} & \textbf{0}  & 14 & \textbf{0.833} & \textbf{0.833} & \textbf{1.000} \\
  & fqlite          & 67 & 17 & 17 & 0.798 & 0.798 & 0.798 \\
  & sqlite\_dissect & 51 & 23 & 33 & 0.607 & 0.607 & 0.689 \\
  & bring2lite      & 40 & 0  & 44 & 0.476 & 0.476 & 1.000 \\
  & undark          & 14 & 10 & 70 & 0.167 & 0.167 & 0.583 \\
- & sql-drp$^\ddagger$ & 0  & 1  & 84 & 0.000 & 0.000 & 0.000 \\
 \midrule
-\multirow{6}{*}{\code{0D}}
+\multirow{5}{*}{\code{0D}}
  & \textbf{ours}   & 19 & 0 & 0 & \textbf{1.000} & 0.422 & \textbf{1.000} \\
  & fqlite          & 20$^\dagger$ & 0 & 0 & 1.000 & 0.444 & 1.000 \\
  & sqlite\_dissect & 18 & 3 & 2 & 0.895 & 0.400 & 0.857 \\
  & bring2lite      & 7  & 0 & 12 & 0.368 & 0.156 & 1.000 \\
  & undark          & 1  & 10 & 18 & 0.053 & 0.022 & 0.091 \\
- & sql-drp         & 0  & 0 & 19 & 0.000 & 0.000 & --- \\
 \midrule
-\multirow{6}{*}{\code{0E}}
+\multirow{5}{*}{\code{0E}}
  & \textbf{ours}   & \textbf{4} & \textbf{0} & 0 & \textbf{1.000} & \textbf{0.333} & \textbf{1.000} \\
  & undark          & 3 & 6 & 1 & 0.750 & 0.250 & 0.333 \\
  & bring2lite      & 3 & 5 & 1 & 0.750 & 0.250 & 0.375 \\
  & sqlite\_dissect & 3 & 633 & 1 & 0.750 & 0.250 & 0.005 \\
  & fqlite          & 2 & 6 & 2 & 0.500 & 0.167 & 0.250 \\
- & sql-drp         & 0 & 0 & 4 & 0.000 & 0.000 & --- \\
 \bottomrule
 \end{tabular}
 \\[2pt]
 {\footnotesize $^\dagger$\,\code{fqlite}'s two-column projection matches 20 distinct
-identities on the 19-row \code{0D} substrate; substrate recall is capped at $1.000$.
-$^\ddagger$\,SQL-DRP emits space-joined string blobs, not per-column records, so it
-matches no answer-key identity under this metric---a measured capability boundary,
-not a recovery failure; it carves printable strings (assessed on false positives,
-not per-column recall).}
+identities on the 19-row \code{0D} substrate; substrate recall is capped at $1.000$.}
 \end{table}
 
 In this harness, on in-page deletion (\code{0C}) our carver recovers 70 of 84
@@ -580,8 +572,7 @@ $F_{0.5}$ scores by category.
 \end{axis}
 \end{tikzpicture}
 \caption{Substrate precision--recall across categories \code{0C}/\code{0D}/\code{0E}
-with constant-$F_1$ contours (SQL-DRP omitted: it matches no answer-key row under
-the format-stable identity). In this harness our carver lies on precision $1.000$ in
+with constant-$F_1$ contours. In this harness our carver lies on precision $1.000$ in
 each category.}
 \label{fig:pr}
 \end{figure}
@@ -602,7 +593,6 @@ each category.}
 \addplot[fill=bring,draw=white] coordinates {(0C,0.645) (0D,0.538) (0E,0.500)};
 \addplot[fill=undarkc,draw=white] coordinates {(0C,0.259) (0D,0.067) (0E,0.462)};
 \addplot[fill=dissect,draw=white] coordinates {(0C,0.646) (0D,0.876) (0E,0.009)};
-% SQL-DRP omitted: it emits string blobs, not per-column records (see caption + table)
 \end{axis}
 \end{tikzpicture}
 \caption{$F_1$ (balanced)}
@@ -622,7 +612,6 @@ each category.}
 \addplot[fill=bring,draw=white] coordinates {(0C,0.820) (0D,0.745) (0E,0.417)};
 \addplot[fill=undarkc,draw=white] coordinates {(0C,0.389) (0D,0.079) (0E,0.375)};
 \addplot[fill=dissect,draw=white] coordinates {(0C,0.671) (0D,0.864) (0E,0.006)};
-% SQL-DRP omitted: it emits string blobs, not per-column records (see caption + table)
 \end{axis}
 \end{tikzpicture}
 \caption{$F_{0.5}$ (precision-weighted)}
@@ -635,10 +624,7 @@ each category.}
   \tikz\fill[undarkc](0,0)rectangle(1.8mm,1.8mm);~\scriptsize undark\quad
   \tikz\fill[dissect](0,0)rectangle(1.8mm,1.8mm);~\scriptsize sqlite\_dissect%
 }
-\caption{$F_1$ and $F_{0.5}$ by category and tool, on substrate recall. SQL-DRP is
-omitted: it emits space-joined string blobs rather than per-column records, so it
-exposes no identity this per-column metric can score (it is a string-carver assessed
-on a false-positive basis, \S\ref{sec:eval}; see also Table~\ref{tab:headtohead}).
+\caption{$F_1$ and $F_{0.5}$ by category and tool, on substrate recall.
 $F_{0.5}$ weights precision over recall---the forensic preference, since a phantom
 row costs an examiner more than a missed low-confidence one. Bars are computed from
 the same harness figures as Table~\ref{tab:headtohead}.}
@@ -664,8 +650,7 @@ On a generated \SI{100}{\mega\byte} database with 80{,}000 deleted rows
 79{,}904 deleted rows ($R_{\mathrm{e2e}}=0.9988$) with no live false positives in
 \SI{15.6}{\second}. The faster tools do different work: \code{undark} dumps
 177{,}906 rows---live and deleted together, undifferentiated---in
-\SI{1.5}{\second}, and SQL-DRP emits 5 printable-string carves in
-\SI{0.2}{\second}. Throughput is not directly comparable across tools that recover
+\SI{1.5}{\second}. Throughput is not directly comparable across tools that recover
 different things; we report it for completeness.
 
 % === §9 Related work =========================================================
@@ -680,8 +665,7 @@ contributed the standardized corpus and the finding that no tool handles every
 corner case---which our multi-oracle evaluation re-confirms tool by tool.
 \code{fqlite}~\cite{pawlaszczyk2021fqlite} and \code{bring2lite}~\cite{meng2019bring2lite}
 recover free-block and freelist residue; \code{undark}~\cite{undark} dumps all
-intact records without separating live from deleted; SQL-DRP~\cite{degrazia_sqlparse}
-carves printable strings from freed regions; and DC3's
+intact records without separating live from deleted; and DC3's
 \code{sqlite\_dissect}~\cite{sqlite_dissect_dc3} parses the database together with
 its journal and WAL. On the application side, Hur \emph{et al.}~\cite{hur2020wechat}
 recover deleted WeChat messages from full-text-search index residue, complementary

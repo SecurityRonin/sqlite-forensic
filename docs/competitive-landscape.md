@@ -12,12 +12,13 @@ table).
 
 We replicated the survey's scenario *construction* with the real `sqlite3` engine
 and measured our carver against four of the survey's tools on **identical bytes**:
-`bring2lite`, `Undark` (v0.7.1), the SQLite Deleted Records Parser (SQL-DRP,
-Mari DeGrazia), and `FQLite` (4.22, driven headlessly via a source tap). FQLite's
-in-page/freelist carve ran on the two non-WAL scenarios (0F/0B); its WAL recovery
-path is GUI-coupled in the current source and was not reachable headlessly, so
-scenario 10 has no FQLite number (the blocker is documented below — no figure is
-fabricated).
+`bring2lite`, `Undark` (v0.7.1), DC3's `sqlite_dissect`, and `FQLite` (4.22, driven
+headlessly via a source tap). Two tools could not run on every scenario, and we
+report the blocker rather than a fabricated number: FQLite's WAL recovery path is
+GUI-coupled in the current source and was not reachable headlessly, so scenario 10
+has no FQLite number; `sqlite_dissect` crashes on scenario 10's `secure_delete`'d
+main image (schema format 0) before it reaches the WAL. Both blockers are
+documented below.
 
 - **On the B-tree rebalancing scenario, `bring2lite` produced 13 false positives
   (live rows reported as deleted; precision 0.705); our carver produced 0
@@ -28,7 +29,7 @@ fabricated).
   positives here (precision 1.000) — its freelist carve recovers fewer of the
   truly-deleted rows (11/50) but does not re-surface a live one.
 - **On WAL + `secure_delete=ON`, we recover all 20 deleted rows from the `-wal`**;
-  SQL-DRP (a main-image-only carver) recovers 0 because it does not read the
+  `Undark` (a main-image-only carver) recovers 0 because it does not read the
   `-wal`. This matches the survey's observation that only WAL-aware tools recover
   this case.
 - **On the overwritten-same-schema scenario we are honest-but-imperfect.** We
@@ -51,7 +52,7 @@ evaluates tools for false positives within each:
 
 | Technique | What it reads | Survey's tool examples |
 |---|---|---|
-| **Metadata-based** | freeblocks + freelist via the page/b-tree structure | SQLite Deleted Records Parser |
+| **Metadata-based** | freeblocks + freelist via the page/b-tree structure | freeblock/freelist parsers |
 | **Carving-based** | pattern/serial-type scan of unallocated space | Undark, bring2lite, FQLite |
 | **WAL / journal** | the `-wal` and rollback `-journal` sidecars | bring2lite, FQLite |
 
@@ -93,14 +94,19 @@ ground-truth live/deleted sets. `precision = TP / (TP + FP)`,
 | bring2lite | 31 | **13** | 0.705 | 0.620 | measured (this repo, identical bytes) |
 | FQLite | 11 | **0** | 1.000 | 0.220 | measured (this repo, identical bytes) |
 | Undark | 0 | **1** | 0.000 | 0.000 | measured (this repo, identical bytes) |
-| SQL-DRP | 5 | 0 | 1.000 | 0.100 | measured (this repo, identical bytes) |
+| DC3 `sqlite_dissect` | 42 | **13** | 0.764 | 0.840 | measured (this repo, identical bytes) |
 | Bring2Lite | — | ~10 | — | — | reported by the paper (its corpus) |
-| SQLite Deleted Record Parser | — | 0 | — | (lower) | reported by the paper (its corpus) |
 
-The headline: on identical bytes, the freed-page carver (`bring2lite`) re-surfaces
-**13 live rows** as deleted; our live-rowid exclusion yields **0**. SQL-DRP, a
-metadata-only freeblock scanner, also avoids the live-row false positives but
-recovers far fewer truly-deleted rows (it does not chase whole freed pages).
+The headline: on identical bytes, the freed-page carvers re-surface live rows as
+deleted — `bring2lite` **13**, `sqlite_dissect` **13** (ids 51–63) — while our
+live-rowid exclusion yields **0**. `sqlite_dissect` recovers the most truly-deleted
+rows (42 of 50) but pays for it in noise and live re-reads: its `-c -f` carve emits
+**2,543 carved records** that collapse to just **55 distinct tagged rows** (42
+deleted + 13 live) plus **1,111 untagged fragments** and ~1,377 duplicate re-reads
+of the same row across page versions (precision is scored on the tagged data rows
+only, as for the other tools; the untagged fragments are not scoreable as
+live/deleted). This is the same aggressive-freelist-carve noise measured in the
+Nemetz head-to-head (`recovery-comparison.md`).
 **FQLite** recovers 11 of the 50 truly-deleted freelist rows (ids 1–9, 18, 27,
 content-scored by the embedded `ROW-<id>-…` tag) with **0** live false positives
 (its 15 output lines also include 1 `sqlite_master` schema row and 2 untagged
@@ -118,7 +124,7 @@ live-row fragment, exactly the survey's Type-\*\* weakness.
 | **sqlite4n6 (ours)** | 5 | 0 | 1.000 | 0.500 | measured (this repo, identical bytes) |
 | bring2lite | 5 | 0 | 1.000 | 0.500 | measured (this repo, identical bytes) |
 | FQLite | 5 | 0 | 1.000 | 0.500 | measured (this repo, identical bytes) |
-| SQL-DRP | 5 | 0 | 1.000 | 0.500 | measured (this repo, identical bytes) |
+| DC3 `sqlite_dissect` | 5 | 0 | 1.000 | 0.500 | measured (this repo, identical bytes) |
 
 All four recover the 5 surviving OLD residue rows (rowids 6..=10; the other 5 OLD
 rows lost their cells to same-rowid reuse by the NEW rows) and none re-surface a
@@ -126,7 +132,12 @@ live NEW row, so the *content* false-positive count is 0 for all four on this
 replication. `FQLite` carves the OLD residue as a flat list under the recreated
 `students` table (its output is the 5 `OLD-NAME-6..10` rows, plus the
 `sqlite_master` schema row and one malformed fragment, neither a live NEW row), so
-it shares the others' clean 0-false-positive result on this replication. **Our nuance (the Type-\* caveat):** we attribute the OLD residue by
+it shares the others' clean 0-false-positive result on this replication.
+`sqlite_dissect` likewise surfaces the 5 `OLD-NAME-6..10` residue rows with **0**
+live false positives, alongside 26 untagged phantom fragments from its freelist
+carve; its CSV export then aborts (`IndexError` while writing the `sqlite_master`
+schema commit) *after* the table data is fully written, so the residue scoring is
+complete. **Our nuance (the Type-\* caveat):** we attribute the OLD residue by
 page ownership to the recreated `recovered_students` table; we do not reroute or
 re-tier it. Where the recreated table is `AUTOINCREMENT`, we now ALSO surface a
 `table_instance_risk` provenance flag on each residue row whose `rowid` exceeds the
@@ -134,9 +145,8 @@ table's `sqlite_sequence` high-water mark — a **hint**, not a predecessor proo
 (the same `rowid > seq` is reachable by an `UPDATE` of the rowid or a
 `sqlite_sequence` edit), carrying its evidence (the rowid, the seq) so the examiner
 can cross-check. For a plain `INTEGER PRIMARY KEY` recreate the flag stays silent —
-the survey's genuinely-undecidable case. `bring2lite`/SQL-DRP sidestep the
-attribution question entirely by emitting the residue as schema-less unallocated
-blobs.
+the survey's genuinely-undecidable case. `bring2lite` sidesteps the attribution
+question entirely by emitting the residue as schema-less unallocated blobs.
 
 ### 10 — WAL + secure_delete=ON (deleted denom = 20; residue only in `-wal`)
 
@@ -145,15 +155,18 @@ blobs.
 | **sqlite4n6 (ours)** | 20 | 0 | 1.000 | 1.000 | measured (this repo, identical bytes) |
 | bring2lite | 20 | 0 | 1.000 | 1.000 | measured (this repo, identical bytes) |
 | Undark | 0 | 0 | n/a | 0.000 | measured (this repo, identical bytes) |
-| SQL-DRP | 0 | 0 | n/a | 0.000 | measured (this repo, identical bytes) |
+| DC3 `sqlite_dissect` | — | — | — | — | did not complete — crashes on the `secure_delete`'d main image (see provenance) |
 | FQLite | — | — | — | recover | cited (paper) — WAL path not reachable headlessly (see provenance) |
-| SQLite-DRP | — | — | — | do not recover | reported by the paper (its corpus) |
 
 With `secure_delete=ON` the main image holds none of the message bodies; the only
 residue is in the uncheckpointed `-wal`. We and `bring2lite` (both WAL-aware)
-recover all 20; SQL-DRP and **Undark** (both main-image only — Undark has no `-wal`
-awareness) recover none, confirming the survey's main-image-vs-WAL split on
-identical bytes. **FQLite** is WAL-aware in its GUI, and the paper reports it
+recover all 20; **Undark** (main-image only, no `-wal` awareness) recovers none,
+confirming the survey's main-image-vs-WAL split on identical bytes.
+**`sqlite_dissect` did not complete on this scenario:** because `secure_delete=ON`
+left the main image with schema format number 0 (no schema/data in the main file —
+everything lives in the uncheckpointed `-wal`), its header parser raises
+`KeyError: 0` in `database_header.stringify` *before* it reaches any WAL carving,
+with or without an explicit `-w wcase.db-wal`. No figure is fabricated for it. **FQLite** is WAL-aware in its GUI, and the paper reports it
 recovering this case, but its WAL recovery is structurally GUI-coupled in the
 current source (the `-wal` reader is instantiated by a JavaFX `ImportDBTask`, and
 the WAL table wiring in `Job.processDB()` sits entirely inside `if (gui != null)`
@@ -178,11 +191,6 @@ in the provenance note).
   (`unalloc-parsing/`, `freelists/`, `WALs/` vs live `regular-page-parsing/`),
   which is how live-vs-deleted attribution was scored. It emits `is`-with-literal
   `SyntaxWarning`s under 3.11 but runs.
-- **SQLite Deleted Records Parser (SQL-DRP, v1.3, Mari DeGrazia)** — **RAN** on all
-  three files. [Repo](https://github.com/mdegrazia/SQLite-Deleted-Records-Parser).
-  It is Python 2; converted with `2to3` plus two minor bytes-vs-str fixes (the
-  `b"SQLite"` header check and a bytes-aware `remove_ascii_non_printable`). TSV
-  (`-f`/`-o`) mode; it reads the main image only and does not consult a `-wal`.
 - **Undark** (v0.7.1, Paul L. Daniels, C) — **RAN** on all three files.
   [Repo](https://github.com/inflex/undark). Built from the master tarball (sha256
   `c0a9ee7ebd180727deef52fbafe0ef0e2b7c9b43c5604761bfeb86bc9306912a`) with two
@@ -195,6 +203,20 @@ in the provenance note).
   recovered, and on 0F its lone freespace fragment is a live row (id 56). It reads
   the main image only (no `-wal`), so it recovers nothing from scenario 10 —
   confirmed (0 records).
+- **DC3 `sqlite_dissect`** (Python) — **RAN on 0F and 0B**; **crashed on scenario
+  10**. [Repo](https://github.com/dod-cyber-crime-center/sqlite-dissect); installed
+  via `pip install sqlite-dissect`. Driven through `scripts/run-sqlite-dissect.sh`
+  (`SQLITE_DISSECT_CMD`), which runs `sqlite_dissect <db> -c -f -e csv` (carving +
+  freelist carving on; off by default) and normalizes the per-table CSV to column
+  order, skipping the `Operation == "Added"` (live) rows so only carved records are
+  scored. On 0F it recovers 42 of 50 deleted rows but re-surfaces 13 live rows
+  (ids 51–63) and emits 1,111 untagged fragments + heavy duplicate re-reads across
+  page versions; on 0B it recovers the 5 OLD residue rows with 0 live FP (the CSV
+  export aborts on the `sqlite_master` commit *after* the table data is written, so
+  scoring is complete). On scenario 10 it raises `KeyError: 0` in
+  `database_header.stringify` on the `secure_delete`'d main image (schema format
+  number 0) before any WAL carving, with or without `-w` — so no figure is entered.
+  Setup in `tools/README.md` and `docs/corpus-catalog.md` §F.4.
 - **FQLite** (4.22, Dirk Pawlaszczyk, Java) — **RAN on 0F and 0B**; its WAL path on
   scenario 10 was **not reachable headlessly** (genuine blocker, no number
   fabricated). [Repo](https://github.com/pawlaszczyk/fqlite). FQLite's command-line
@@ -236,15 +258,16 @@ in the provenance note).
   (both gitignored); also in `docs/validation.md` and `docs/corpus-catalog.md`
   §F.2.
 
-> **Companion comparison — the Nemetz head-to-head.** `bring2lite` and SQL-DRP are
-> also wired as standing, env-gated oracles into the repo's third-party-ground-truth
-> head-to-head (`forensic/tests/nemetz_tool_comparison.rs`, written up in
-> [`recovery-comparison.md`](recovery-comparison.md)), through the **same** committed
-> wrappers used here — `scripts/run-bring2lite.sh` (`BRING2LITE_CMD`) and
-> `scripts/run-sqldrp.sh` (`SQLDRP_CMD`). That table scores precision/recall against
-> the Nemetz answer key on the `(col1,col2)` matcher (where SQL-DRP's string-carver
-> nature surfaces as a documented 0-identity boundary); this page scores the
-> survey's **false-positive** scenarios. Read the two together for the full picture.
+> **Companion comparison — the Nemetz head-to-head.** `bring2lite` and DC3
+> `sqlite_dissect` are also wired as standing, env-gated oracles into the repo's
+> third-party-ground-truth head-to-head (`forensic/tests/nemetz_tool_comparison.rs`,
+> written up in [`recovery-comparison.md`](recovery-comparison.md)), through committed
+> wrappers — `scripts/run-bring2lite.sh` (`BRING2LITE_CMD`) and
+> `scripts/run-sqlite-dissect.sh` (`SQLITE_DISSECT_CMD`). That table scores
+> precision/recall against the Nemetz answer key on the `(col1,col2)` matcher (both
+> tools emit per-column records, so their recall is directly comparable); this page
+> scores the survey's **false-positive** scenarios. Read the two together for the
+> full picture.
 
 ## Capabilities the surveyed tools don't have
 
@@ -314,7 +337,6 @@ pinned by the env-gated perf-smoke `forensic/tests/perf_large_carve.rs`
 | `sqlite4n6 carve` (workbook) + `-f db` | 44.8 s | 79,904 deleted | as above, **plus** it rebuilds a 45 MB queryable `.carved.db` + an 8.7 MB `.xlsx` |
 | `undark -i` | 1.5 s | 177,906 | **flat-dump**: whole b-tree (live + freespace), no live/deleted split — ~178k rows are almost all *live* |
 | `fqlite` (headless tap) | 2.4 s | 2,935 | **deleted-only** bucket (status flag `D`), but mostly freelist-page fragments — only 31 rows carry an `MSG-` tag, 6 of them in the true deleted range |
-| `sqldrp` (sqlparse v1.3) | 0.2 s | 5 | **metadata/string carve**: printable-ASCII blobs from a handful of freeblock/unallocated regions; no per-column record, no live/deleted split |
 | `bring2lite` | — (did not complete) | 0 | crashes mid-run (`struct.error: unpack requires a buffer of 1 bytes` in `_extract_trunk_page_content` while parsing a freelist trunk page) before producing any recovered record |
 
 Notes on the measurements:
@@ -328,8 +350,6 @@ Notes on the measurements:
 - **`undark` emits all 177,906 rows then SIGSEGVs at exit** when its stdout is a
   regular file or `/dev/null` (it exits cleanly to a pipe); the timing pipes its
   output, and the row count is complete regardless of the exit-time crash.
-- **`sqldrp`** is a printable-string carver: on this db it surfaces 5 freeblock /
-  unallocated string blobs, not 80k records — it does not chase freed pages.
 - **Flags shown are the current `-f`/`-o` form.** These figures were measured
   before the output-flag redesign, when a single `--db` run materialized the
   workbook *and* the carved db together (the 44.8 s row); the carve work itself is
@@ -341,7 +361,6 @@ with the table above; kept only as a historical order-of-magnitude anchor):**
 | Tool | Reported time |
 |---|---:|
 | Undark | 2.94 s |
-| SQLite-DRP | 3.97 s |
 | FQLite | 13.62 s |
 | Bring2Lite | 21.89 s |
 

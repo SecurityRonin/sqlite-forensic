@@ -38,7 +38,7 @@ def gen_0f_rebalancing():
 
     Construction: 80 rows with a ~420-byte TEXT value, delete ids 1..50. Each
     value embeds its id (`ROW-<id>-XXXX…`) so a content-keyed tool whose output
-    drops the rowid (bring2lite, SQL-DRP emit a NULL rowid-alias cell) can still
+    drops the rowid (bring2lite emits a NULL rowid-alias cell) can still
     be scored against the live/deleted sets — this distinguishes a Type-** false
     positive (a *live* 51..80 row surfaced from a freed page) from a true deleted
     recovery, which an all-identical payload would make impossible to tell apart.

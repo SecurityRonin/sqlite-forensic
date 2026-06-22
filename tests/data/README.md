@@ -291,6 +291,26 @@ its own provenance README (source, NIST/author hashes, licence, ground truth):
 - **Notable contents:** 256 live rows; deleted ids 1100..=1104 recovered (≥4 of
   5), no misaligned phantom; `PRAGMA freelist_count` = 0.
 
+#### exclusion_invariant/cross_table_rowid.db
+
+- **Source:** SYNTHETIC — Python `sqlite3` module (Tier-2; ground truth derivable
+  from the construction). Generator + provenance: `exclusion_invariant/gen.py`.
+- **Identity:** two tables that SHARE rowids, to exercise the exclusion-invariant
+  hole where live-row identity is keyed by a global rowid with no table dimension
+  (`docs/improvement-roadmap.md` §1.1). Table `t` (created first) is the paper 0F
+  B-tree-rebalancing scenario — 80 rows of ~420-byte id-tagged TEXT, `DELETE`
+  ids 1..50 — which frees pages still holding live rows 51..80. Table `z` (created
+  second, so it wins `Database::live_rows()`'s rowid-keyed collapse) holds the same
+  rowids 51..80 with different values. Pins
+  `forensic/tests/exclusion_invariant_cross_table.rs`: with `z` hijacking the
+  collapse, the carver re-surfaces exactly the 13 live `t` rows (ids 51..63) that a
+  rebalance shuffled onto freed pages — the breach the test forbids.
+- **md5:** `f8966f346bf9c6c95aa7791b86e1b52b` — 49152 bytes.
+- **Notable contents:** `t` live ids 51..80 (`v` = `ROW-<id>-XXXX…`), `t` deleted
+  ids 1..50; `z` live ids 51..80 (`v` = `ZZZ-<id>-QQQ…`); `secure_delete=OFF`,
+  `auto_vacuum=NONE`. Ground truth: NO carved record's values may equal any
+  currently-live row of either table.
+
 #### dropped_table_schema.db
 
 - **Source:** SYNTHETIC — `sqlite3` CLI (Tier-2; ground truth derivable from the

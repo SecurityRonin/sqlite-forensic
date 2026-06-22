@@ -134,7 +134,11 @@ pub enum AnomalyKind {
     /// spec journals a page at most once, so a repeat is consistent with
     /// corruption, a savepoint/super-journal artifact, or tampering (design §6
     /// item 9).
-    JournalDuplicatePage,
+    JournalDuplicatePage {
+        /// The page numbers that repeated (each once, first-seen order) — the
+        /// offending values, so the finding can name them.
+        pgnos: Vec<u32>,
+    },
     /// The database page count recorded at transaction start (`mxPage`, Tier A
     /// only) differs from the current page count: the last transaction changed
     /// the db size. `mxPage < current` ⇒ growth (INSERTs); `mxPage > current` ⇒
@@ -161,7 +165,7 @@ impl AnomalyKind {
             | AnomalyKind::WalUncheckpointedState { .. }
             | AnomalyKind::JournalRecoverable { .. }
             | AnomalyKind::JournalSchemaChange { .. }
-            | AnomalyKind::JournalDuplicatePage => Severity::Medium,
+            | AnomalyKind::JournalDuplicatePage { .. } => Severity::Medium,
             AnomalyKind::PageCountMismatch { .. }
             | AnomalyKind::HotJournal
             | AnomalyKind::JournalChecksumMismatch { .. } => Severity::High,
@@ -183,7 +187,7 @@ impl AnomalyKind {
             AnomalyKind::JournalRecoverable { .. } => "SQLITE-JOURNAL-RECOVERABLE",
             AnomalyKind::JournalChecksumMismatch { .. } => "SQLITE-JOURNAL-CHECKSUM-MISMATCH",
             AnomalyKind::JournalSchemaChange { .. } => "SQLITE-JOURNAL-SCHEMA-CHANGE",
-            AnomalyKind::JournalDuplicatePage => "SQLITE-JOURNAL-DUPLICATE-PAGE",
+            AnomalyKind::JournalDuplicatePage { .. } => "SQLITE-JOURNAL-DUPLICATE-PAGE",
             AnomalyKind::JournalDbSizeDelta { .. } => "SQLITE-JOURNAL-DBSIZE-DELTA",
         }
     }
@@ -267,10 +271,12 @@ impl AnomalyKind {
                  database's ({db_cookie}) — consistent with a DDL change (CREATE/DROP/ALTER) \
                  in the last transaction; the prior schema is recoverable"
             ),
-            AnomalyKind::JournalDuplicatePage => "a page number appears more than once across the \
+            AnomalyKind::JournalDuplicatePage { .. } => {
+                "a page number appears more than once across the \
                  journal's page records — the spec journals a page at most once, so this is \
                  consistent with corruption, a savepoint/super-journal artifact, or tampering"
-                .to_string(),
+                    .to_string()
+            }
             AnomalyKind::JournalDbSizeDelta {
                 mx_page,
                 current_pages,
@@ -366,7 +372,7 @@ impl Observation for Anomaly {
             | AnomalyKind::PageCountMismatch { .. }
             | AnomalyKind::HotJournal
             | AnomalyKind::JournalChecksumMismatch { .. }
-            | AnomalyKind::JournalDuplicatePage
+            | AnomalyKind::JournalDuplicatePage { .. }
             | AnomalyKind::JournalDbSizeDelta { .. } => Category::Integrity,
             other => Category::from_code(other.code()),
         }
@@ -495,7 +501,18 @@ impl Observation for Anomaly {
                 // The reserved-space-per-page byte lives at file-header offset 20.
                 location: Some(Location::ByteOffset(20)),
             }],
-            AnomalyKind::HotJournal | AnomalyKind::JournalDuplicatePage => Vec::new(),
+            AnomalyKind::JournalDuplicatePage { pgnos } => pgnos
+                .iter()
+                .map(|pgno| Evidence {
+                    field: "duplicate_pgno".to_string(),
+                    value: pgno.to_string(),
+                    location: Some(Location::Other {
+                        space: "sqlite:page".to_string(),
+                        value: u64::from(*pgno),
+                    }),
+                })
+                .collect(),
+            AnomalyKind::HotJournal => Vec::new(),
         }
     }
 }
@@ -1647,7 +1664,9 @@ pub fn audit_journal(db: &Database, journal: &[u8]) -> Vec<Anomaly> {
 
     // A page journaled more than once (the spec forbids it).
     if parsed.has_duplicate_pgno() {
-        out.push(Anomaly::new(AnomalyKind::JournalDuplicatePage));
+        out.push(Anomaly::new(AnomalyKind::JournalDuplicatePage {
+            pgnos: parsed.duplicate_pgnos().to_vec(),
+        }));
     }
 
     out

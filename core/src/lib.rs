@@ -4472,7 +4472,9 @@ impl RollbackJournal {
             let imgs =
                 walk_journal_records(bytes, sector as usize, ps, None, 0, MAX_JOURNAL_RECORDS);
             let score = score_journal_candidate(&imgs, page_bound);
-            let better = best.as_ref().is_none_or(|(bs, _, _)| score > *bs);
+            // `map_or(true, …)` not `is_none_or` to keep the library MSRV at 1.80
+            // (`Option::is_none_or` stabilised in 1.82); clippy is MSRV-aware.
+            let better = best.as_ref().map_or(true, |(bs, _, _)| score > *bs);
             if better && score > 0 {
                 best = Some((score, sector, imgs));
             }

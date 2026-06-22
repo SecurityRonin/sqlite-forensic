@@ -3,6 +3,10 @@ name = "sqlite-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Published library: a deliberately LOW, CI-verified MSRV (a compatibility signal),
+# distinct from the dev toolchain pin in rust-toolchain.toml. Raise only when a
+# newer-Rust feature is genuinely needed.
+rust-version = "1.80"
 readme = "README.md"
 description = "Native, read-only, panic-free SQLite file-format reader for forensics (WS-C spike prototype)."
 

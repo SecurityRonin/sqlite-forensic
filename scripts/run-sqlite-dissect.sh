@@ -33,21 +33,23 @@ py="${PYTHON:-python3}"
 outdir="$(mktemp -d)"
 trap 'rm -rf "$outdir"' EXIT
 
-# Export recovered cells to CSV (one file per table). Errors are tolerated so a
-# partially-parseable database still yields what it can.
+# Export recovered cells to CSV (one file per table), with carving + freelist
+# carving enabled (SQLite Dissect does NOT carve by default). Errors are tolerated
+# so a partially-parseable database still yields what it can.
 # shellcheck disable=SC2086
-$sd "$db" -e csv -d "$outdir" >/dev/null 2>&1 || true
+$sd "$db" -c -f -e csv -d "$outdir" >/dev/null 2>&1 || true
 
-# Normalize every per-table CSV to `rowid,col1,col2,...` for carved records.
+# Normalize every per-table CSV to one record per line in column order
+# (`col0,col1,col2,...`) for carved records only, so the harness projection of
+# fields[1],fields[2] is the answer key's (col1,col2) identity. SQLite Dissect's
+# CSV prepends these metadata columns before the table's own columns:
 "$py" - "$outdir" <<'PY'
 import csv, glob, os, sys
 
 outdir = sys.argv[1]
-# Leading metadata columns SQLite Dissect prepends before the table's own columns.
 META = {
-    "file source", "version number", "page version number", "source",
-    "cell source", "page number", "location", "operation", "file offset",
-    "md5 hash", "byte offset",
+    "file source", "version", "page version", "cell source", "page number",
+    "location", "operation", "file offset", "row id",
 }
 for path in sorted(glob.glob(os.path.join(outdir, "*.csv"))):
     with open(path, newline="") as fh:
@@ -58,13 +60,12 @@ for path in sorted(glob.glob(os.path.join(outdir, "*.csv"))):
             continue
         low = [h.strip().lower() for h in header]
         op_i = low.index("operation") if "operation" in low else None
-        rid_i = low.index("row id") if "row id" in low else None
-        data_i = [i for i, h in enumerate(low) if h not in META and h != "row id"]
+        data_i = [i for i, h in enumerate(low) if h not in META]
         for row in reader:
-            # Skip live ("Added") rows -- we want recovered deletions only.
+            # Keep recovered deletions only -- skip live ("Added") rows.
             if op_i is not None and op_i < len(row) and row[op_i].strip().lower() == "added":
                 continue
-            rowid = row[rid_i] if (rid_i is not None and rid_i < len(row)) else ""
             cols = [row[i] for i in data_i if i < len(row)]
-            print(",".join([rowid, *cols]))
+            if cols:
+                print(",".join(cols))
 PY

@@ -63,6 +63,20 @@
 \definecolor{undarkc}{HTML}{D62728}
 \definecolor{bring}{HTML}{7570B3}
 
+% --- Double-blind toggle -----------------------------------------------------
+% DFRWS review is double-blind. \blindtrue builds the anonymized submission PDF.
+% For the named camera-ready / arXiv build: set \blindfalse AND restore the real
+% artifact reference in sqlite-recovery.bib (see the @misc{sqlite4n6} note there).
+\newif\ifblind
+\blindtrue
+\ifblind
+  \newcommand{\sys}{our carver}
+  \newcommand{\Sys}{Our carver}
+\else
+  \newcommand{\sys}{\texttt{sqlite4n6}}
+  \newcommand{\Sys}{\texttt{sqlite4n6}}
+\fi
+
 % --- Title -------------------------------------------------------------------
 \title{%
   \textbf{Deleted-Record Recovery from SQLite Databases:}\\[4pt]
@@ -70,8 +84,12 @@
   and a Multi-Oracle Forensic Evaluation%
 }
 
-\author[1]{Albert Kwun Tai Hui\,\orcidlink{0009-0000-8978-0231}}
-\affil[1]{Security Ronin}
+\ifblind
+  \author{Anonymous Submission}
+\else
+  \author[1]{Albert Kwun Tai Hui\,\orcidlink{0009-0000-8978-0231}}
+  \affil[1]{Security Ronin}
+\fi
 
 \date{June 2026}
 
@@ -99,7 +117,7 @@ reported as deleted.
 
 We contribute: (1)~a treatment of SQLite deletion and free-space conventions,
 including an application case study of \zh{微信} (WeChat) message deletion;
-(2)~\code{sqlite4n6}, an open, \code{forbid(unsafe)} Rust reference implementation;
+(2)~\sys, an open, \code{forbid(unsafe)} Rust reference implementation;
 and (3)~a multi-oracle evaluation---accuracy, false-positive rate, and
 throughput---against four independent recovery tools (\code{undark}, \code{fqlite},
 \code{bring2lite}, and the SQLite Deleted-Records Parser) on independent third-party
@@ -154,7 +172,7 @@ third-party corpora with published ground truth
         with an application case study of WeChat
         (\S\ref{sec:storage}--\S\ref{sec:conventions}).
   \item A live-row re-read exclusion invariant and an open, \code{forbid(unsafe)}
-        reference implementation, \code{sqlite4n6}
+        reference implementation, \sys
         (\S\ref{sec:fpzero}--\S\ref{sec:impl}).
   \item A reproducible multi-oracle evaluation---accuracy, false positives, and
         throughput---on independent corpora with published ground truth
@@ -382,10 +400,9 @@ $0.2$   & Tier-2 fragment \\
 % === §6 Reference implementation =============================================
 \section{Reference Implementation}\label{sec:impl}
 
-\code{sqlite4n6}~\cite{sqlite4n6} is an open-source Rust workspace of three crates:
-\code{sqlite-core} (a panic-free, read-only file-format reader: b-tree, WAL,
-freelist, overflow), \code{sqlite-forensic} (the carving and audit harness with the
-recovery oracles), and \code{sqlite4n6} (the command-line tool). All three are
+\Sys~\cite{sqlite4n6} is a Rust workspace of three crates: a panic-free, read-only
+file-format reader (b-tree, WAL, freelist, overflow); a carving and audit harness
+with the recovery oracles; and a command-line tool. All three are
 \code{forbid(unsafe)}; the project pins a current Rust toolchain, declares a
 conservative minimum supported version, and gates on \SI{100}{\percent} function
 coverage in continuous integration. The reader opens evidence \emph{read-only} and,
@@ -448,7 +465,7 @@ anchor.
 \section{Evaluation}\label{sec:eval}
 
 \subsection*{Accuracy: a multi-oracle head-to-head}
-We compare \code{sqlite4n6} against four independent recovery tools---\code{undark}
+We compare \sys against four independent recovery tools---\code{undark}
 (C)~\cite{undark}, \code{fqlite} (Java)~\cite{pawlaszczyk2021fqlite}, \code{bring2lite}
 (Python)~\cite{meng2019bring2lite}, and the SQLite Deleted-Records Parser
 (SQL-DRP, Python)~\cite{degrazia_sqlparse}---each scored against the \emph{same}
@@ -623,14 +640,14 @@ survey~\cite{choi2025survey} on real \code{sqlite3}-engine bytes (a Tier-2
 \code{0F}, where a b-tree rebalance moves a live row onto a freed page; \code{0B}, a
 drop-and-recreate of a same-schema table; and \code{10}, a \code{secure\_delete}
 wipe of the main image leaving residue only in the WAL. On \code{0F},
-\code{sqlite4n6} recovers 33 of 50 with no live false positives, where
+\sys recovers 33 of 50 with no live false positives, where
 \code{bring2lite} reports 13 live rows as deleted; on \code{10}, the WAL-only
 scenario, both WAL-aware tools recover all 20, while the main-image-only tools
 recover none.
 
 \subsection*{Throughput}
 On a generated \SI{100}{\mega\byte} database with 80{,}000 deleted rows
-(single machine, median of five runs), \code{sqlite4n6} streaming JSONL recovers
+(single machine, median of five runs), \sys streaming JSONL recovers
 79{,}904 deleted rows ($R_{\mathrm{e2e}}=0.9988$) with no live false positives in
 \SI{15.6}{\second}. The faster tools do different work: \code{undark} dumps
 177{,}906 rows---live and deleted together, undifferentiated---in

@@ -18,7 +18,6 @@
 # Tools are located the same way the differential harness locates them:
 #   sqlite4n6  target/release/sqlite4n6        (cargo build --release -p sqlite4n6)
 #   undark     tools/undark                    (UNDARK_BIN override)
-#   sqldrp     scripts/run-sqldrp.sh           (Python 3 port)
 #   fqlite     tools/fqlite/run-tap.sh         (FQLITE_JAVA = a JDK w/ JavaFX)
 #   bring2lite scripts/run-bring2lite.sh       (may crash on large DBs; see doc)
 #
@@ -78,7 +77,6 @@ UNDARK="${UNDARK_BIN:-$root/tools/undark}"
   || echo "sqlite4n6: binary missing (cargo build --release -p sqlite4n6)"
 [ -x "$UNDARK" ] && bench "undark -i" "$UNDARK" -i "$DB" \
   || echo "undark: binary missing (see docs/corpus-catalog.md F.1)"
-bench "sqldrp (run-sqldrp.sh)" bash "$here/run-sqldrp.sh" "$DB"
 if [ -n "${FQLITE_JAVA:-}" ] || command -v java >/dev/null 2>&1; then
   bench "fqlite (run-tap.sh)" bash "$root/tools/fqlite/run-tap.sh" "$DB"
 else

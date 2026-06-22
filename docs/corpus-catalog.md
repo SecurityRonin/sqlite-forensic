@@ -177,7 +177,7 @@ methodology in `docs/validation.md`; the head-to-head harness is
 `forensic/tests/nemetz_tool_comparison.rs`; the fixture differential is
 `forensic/tests/oracle_differential.rs`). `tools/` is gitignored — none of the
 tool sources are **committed**; these entries are their provenance record. The
-thin normalizing wrappers in `scripts/` (`run-bring2lite.sh`, `run-sqldrp.sh`)
+thin normalizing wrappers in `scripts/` (`run-bring2lite.sh`, `run-sqlite-dissect.sh`)
 **are** committed and are the stable interface the harness shells out to.
 
 ### §F.1 `undark` (C) — test gate `UNDARK_BIN`
@@ -266,40 +266,27 @@ source emits `SyntaxWarning`s for `is`-with-literal comparisons.
   `col0,col1,col2,…` (the same row shape undark emits), suppressing the live
   `regular-page-parsing/` re-dump. Its `(col1,col2)` identity is at CSV fields 1/2.
 
-### §F.4 SQLite Deleted Records Parser / `sqlparse` (Python 2 → 3) — test gate `SQLDRP_CMD`
+### §F.4 DC3 SQLite Dissect (`sqlite_dissect`, Python) — test gate `SQLITE_DISSECT_CMD`
 
-A printable-**string** carver: it walks every page, and from each leaf-table
-b-tree's unallocated space and freeblock chain it extracts the printable-ASCII
-runs into a flat `Data` field. It is NOT a per-column record parser.
+A record-level carver from the DoD Cyber Crime Center. SQLite carving is off by
+default; with it enabled (`-c -f`) it recovers deleted cells from free blocks and
+freelist pages (and the journal/WAL), exporting per-column CSV rows that the
+wrapper normalizes to column order so the head-to-head's `(col1,col2)` identity is
+at fields 1/2.
 
-- Classification: `VENDORED` (third-party tool, Python-2 ported to 3), confidence
-  `✓` (run on the full 0C/0D/0E head-to-head scope).
-- Tool: SQLite Deleted Records Parser (`sqlparse`) v1.3, Mari DeGrazia. GPLv3.
-- Upstream: <https://github.com/mdegrazia/SQLite-Deleted-Records-Parser>
-- Commit: `4ce67cadc813264a959a71d9f0da5a749dfb4e0f`.
-- Original `sqlparse_v1.3.py` sha256
-  `e60b02e8a9a258109b06bdd32ce9f4a7ff05d879fdf0c069d2ebcbba638f9f16`.
-- Setup recipe (under the gitignored `tools/sqldrp/`):
-  1. `2to3 -w -n sqlparse_v1.3.py` (Python-2 → 3: `print` statements, etc.).
-  2. Magic check: `"SQLite" not in header` → `b"SQLite" not in header` (the
-     16-byte header is `bytes` in Py3).
-  3. `remove_ascii_non_printable`: make it bytes-aware — iterate raw byte values
-     (Py3 `bytes` yields ints, so the original `ord(ch)` would raise), keep
-     printable ASCII + tab, then decode to text.
-- CLI: `python3 sqlparse_v1.3.py -f <db> -o <out.tsv>` → TSV
-  `Type<TAB>Offset<TAB>Length<TAB>Data`.
-- Invocation (the harness gate): `SQLDRP_CMD=scripts/run-sqldrp.sh`, which emits
-  that TSV on stdout. **Measured capability boundary:** the `Data` blob is not a
-  `(col0,col1,col2)` record, so under the head-to-head's exact `(col1,col2)`
-  matcher SQL-DRP exposes no cross-tool identity and recovers 0 answer-key rows
-  (and nothing from the integer tables); this is reported explicitly rather than
-  scored against a confounded key (see `docs/recovery-comparison.md`). Its
-  string-carving value — false-positive avoidance and WAL-vs-main-image substrate —
-  is measured in `docs/competitive-landscape.md`.
-
-> `sqlite_dissect` was also evaluated as an oracle but its free-block carver
-> produced misaligned/garbled columns on these fixtures, so it was rejected as a
-> yardstick; its DC3-authored databases are still used as independent input (§G).
+- Classification: `VENDORED` (third-party tool), confidence `✓` (run on the full
+  0C/0D/0E head-to-head scope).
+- Tool: SQLite Dissect, DoD Cyber Crime Center (DC3); see upstream for license.
+- Upstream: <https://github.com/dod-cyber-crime-center/sqlite-dissect>; install via
+  `pip install sqlite-dissect`.
+- Invocation (the harness gate): `SQLITE_DISSECT_CMD=scripts/run-sqlite-dissect.sh`,
+  which runs `sqlite_dissect <db> -c -f -e csv` and emits one carved record per
+  line. **Measured:** `0C` recall 0.607 / precision 0.689; `0D` 0.895 / 0.857;
+  `0E` recall 0.750 but **633 phantoms + 7 live re-reads** (precision 0.005) — its
+  aggressive freelist carving (marked "under development" in its own help) is a
+  precision contrast to the structural live-row exclusion (see
+  `docs/recovery-comparison.md`). Its DC3-authored test databases are separately
+  used as independent carving input (§G).
 
 ## §G `tests-oracle-corpus/dc3-sqlite-dissect/`  (REAL-ext, not committed)
 
@@ -682,10 +669,11 @@ Nemetz databases under `tests/data/nemetz/` (CC0, §I) have their own md5 manife
 Not committed (provenance only — see §F, §G and the per-directory READMEs):
 `tools/undark`, the fqlite tap under `tools/fqlite/` (source, jars, built classes
 — recipe in `tools/fqlite/README.md`), the `bring2lite` checkout + PyQt5 shim
-under `tools/bring2lite/` (§F.3), the Py3-ported `sqlparse` under `tools/sqldrp/`
-(§F.4), the DC3 corpus under `tests-oracle-corpus/dc3-sqlite-dissect/` (full
+under `tools/bring2lite/` (§F.3), the pip-installed `sqlite_dissect` (DC3, §F.4 —
+no committed source, `pip install sqlite-dissect`), the DC3 corpus under
+`tests-oracle-corpus/dc3-sqlite-dissect/` (full
 sha256/md5 list in `tests-oracle-corpus/README.md`), the env-gated Josh Hickman
 iOS-17 image corpus (`SQLITE_FORENSIC_IOS_CORPUS`, §P), and the ~100 MB throughput
 db (`SQLITE_FORENSIC_PERF_DB`, §M). The committed `scripts/run-bring2lite.sh` /
-`scripts/run-sqldrp.sh` wrappers are the stable harness interface to the gitignored
-tool sources.
+`scripts/run-sqlite-dissect.sh` wrappers are the stable harness interface to the
+gitignored tool sources.

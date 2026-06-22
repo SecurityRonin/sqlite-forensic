@@ -33,8 +33,8 @@ build (1.96), a `gitleaks` secret scan, docs-as-error, and libFuzzer harnesses o
 ### Layer 2 — independent oracles (the substantive validation)
 
 No test we authored is independent of our own assumptions, so each capability is checked
-against a reference we did not write. Seven distinct authors/engines (the SQLite team,
-undark's author, fqlite's author, bring2lite's author, Mari DeGrazia / SQL-DRP, the
+against a reference we did not write. Six distinct authors/engines (the SQLite team,
+undark's author, fqlite's author, bring2lite's author, the
 Nemetz team, the DC3 team) plus the `calamine` reader, across C / Java / Python /
 SQLite-C / Rust. The **Tier** column is the trust axis defined in *Input provenance*
 below: **1** = real third-party ground truth / real-device data; **2** = real-engine
@@ -55,8 +55,8 @@ no independent check:
 | **Freeblock recovery, independent keys** (incl. 2-byte rowid / UTF-8) | **`sqlite-unhide`** (`little-brother/sqlite-unhide`) — nine hand-built DBs each with the tool author's per-case `.txt` answer key (env-gated, home-use, never committed) | the structural-noise invariant + the 2-byte-rowid (UTF-8 `09.db`) freeblock recovery confirmed against a key neither we nor our oracles wrote; this corpus **surfaced two real defects** our own fixtures missed, since fixed | 1 | `sqlite_unhide_corpus.rs` |
 | **Dropped-table schema recovery** | a real `sqlite3`-minted drop fixture (`dropped_table_schema.db`; answer derivable from construction) | `recover_dropped_schemas` recovers a dropped table's name + `CREATE` statement from page-1 residue, never reports a live table; surfaced in `audit` as `SQLITE-DROPPED-SCHEMA-RECOVERED` | 2 | `dropped_schema.rs` |
 | Deleted-record **carving** | `undark` (C), `fqlite` (Java) — independent carvers | inter-tool **concordance** (agreement, page-level-diagnosed — *not* correctness) | 1 | `oracle_differential.rs` (below) |
-| Deleted-record **head-to-head** (carving) | `undark`, `fqlite`, **`bring2lite`** (Python 3), **SQL-DRP / `sqlparse`** (Python 2→3), **DC3 `sqlite_dissect`** (Python) — five independent carvers, each gated (`UNDARK_BIN` / `FQLITE_TAP` / `BRING2LITE_CMD` / `SQLDRP_CMD` / `SQLITE_DISSECT_CMD`), all scored against the same Nemetz answer key | per-tool precision/recall on the **same** `(col1,col2)` matcher; SQL-DRP's string-carver boundary recorded explicitly (0 cross-tool identities, not a confounded score); sqlite_dissect's aggressive carving shown as a precision contrast (633 phantoms + 7 live re-reads on `0E`) | 1 | `nemetz_tool_comparison.rs` · [`recovery-comparison.md`](recovery-comparison.md) |
-| **False-positive benchmark** (B-tree rebalancing, drop+recreate, WAL+secure_delete) | a real-engine **replication** of the 2025 survey's Table-5 construction (Lee, Park, Lee & Choi, *FSI:DI* 55) — **not** the official corpus (not public yet) — scored vs `bring2lite` / SQL-DRP on identical bytes | 0 live-row false positives on the rebalancing scenario where `bring2lite` re-surfaces 13 live rows; FQLite scenario-10 figure is **cited from the paper**, not measured here (its WAL recovery is GUI-coupled) | 2 | `paper_fp_scenarios.rs` · [`competitive-landscape.md`](competitive-landscape.md) |
+| Deleted-record **head-to-head** (carving) | `undark`, `fqlite`, **`bring2lite`** (Python 3), **DC3 `sqlite_dissect`** (Python) — four independent carvers, each gated (`UNDARK_BIN` / `FQLITE_TAP` / `BRING2LITE_CMD` / `SQLITE_DISSECT_CMD`), all scored against the same Nemetz answer key | per-tool precision/recall on the **same** `(col1,col2)` matcher; sqlite_dissect's aggressive carving shown as a precision contrast (633 phantoms + 7 live re-reads on `0E`) | 1 | `nemetz_tool_comparison.rs` · [`recovery-comparison.md`](recovery-comparison.md) |
+| **False-positive benchmark** (B-tree rebalancing, drop+recreate, WAL+secure_delete) | a real-engine **replication** of the 2025 survey's Table-5 construction (Lee, Park, Lee & Choi, *FSI:DI* 55) — **not** the official corpus (not public yet) — scored vs `bring2lite` on identical bytes | 0 live-row false positives on the rebalancing scenario where `bring2lite` re-surfaces 13 live rows; FQLite scenario-10 figure is **cited from the paper**, not measured here (its WAL recovery is GUI-coupled) | 2 | `paper_fp_scenarios.rs` · [`competitive-landscape.md`](competitive-landscape.md) |
 | **Live b-tree read** | `sqlite3 SELECT` — the engine that wrote the file | live rows read **byte-identical** to the canonical engine | 2 | `live_read_matches_sqlite3` |
 | **`.recover` differential** | `sqlite3 .recover` | ours ⊇ `.recover`, 100% content agreement on the overlap | 2 | `our_fixture_agrees_with_sqlite3_recover` |
 | **Rebuilt `.carved.db`** | `sqlite3` (`PRAGMA integrity_check`, `SELECT`) | the pure-Rust writer emits a valid DB an external engine reads identically | 2 | `rebuild_sqlite3_oracle.rs`, `rebuild_tables_oracle.rs` |
@@ -100,8 +100,8 @@ data. Members:
 - **corrupted-header robustness** → the SharifCTF damaged-header db;
 - **no-false-positives** regression → the DC3 corpus;
 - **inter-tool concordance** (`oracle_differential.rs`) → undark / fqlite only
-  (record-level carvers that emit per-column rows; bring2lite, SQL-DRP, and
-  sqlite_dissect are head-to-head comparison oracles, not concordance oracles);
+  (record-level carvers that emit per-column rows; bring2lite and sqlite_dissect
+  are head-to-head comparison oracles, not concordance oracles);
 - **real-device no-panic robustness** → the Josh Hickman iOS-17 images (a robustness sweep,
   NOT a known-answer recall test).
 

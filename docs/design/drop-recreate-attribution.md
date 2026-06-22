@@ -202,7 +202,7 @@ GREEN: implement Detectors A/B + the flag + output routing.
 Nemetz deleted rows (no Nemetz DB is a same-name drop-recreate) — proving Detector
 A/B never fire spuriously and precision is unharmed.
 
-Oracle: the survey's Type-\* framing; `bring2lite`/SQL-DRP emit the residue as
+Oracle: the survey's Type-\* framing; `bring2lite` emits the residue as
 unattributed blobs (no table claim at all), so our distinct `predecessor` label is
 *more* informative than either while staying honest.
 

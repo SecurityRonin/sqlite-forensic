@@ -16,7 +16,6 @@ at the pinned version, under its own license, and apply our patch.
 | **undark** 0.7.1 | `UNDARK_BIN` | [inflex/undark](https://github.com/inflex/undark) | BSD-Revised | `undark/undark.patch`, `undark/SETUP.md` |
 | **fqlite** 4.22 | `FQLITE_TAP` + `FQLITE_JAVA` | [pawlaszczyk/fqlite](https://github.com/pawlaszczyk/fqlite) | see upstream | `fqlite/{SETUP.md, run-tap.sh, fqlite.patch, tap/, stubs/}` |
 | **bring2lite** | `BRING2LITE_CMD` | [bring2lite/bring2lite](https://github.com/bring2lite/bring2lite) | see upstream | `bring2lite/{SETUP.md, bring2lite.patch, shim/}` |
-| **SQL-DRP** `sqlparse` v1.3 | `SQLDRP_CMD` | [mdegrazia/SQLite-Deleted-Records-Parser](https://github.com/mdegrazia/SQLite-Deleted-Records-Parser) | GPLv3 | `sqldrp/{SETUP.md, sqlparse_v1.3.py.patch}` |
 | **sqlite_dissect** (DC3) | `SQLITE_DISSECT_CMD` | [dod-cyber-crime-center/sqlite-dissect](https://github.com/dod-cyber-crime-center/sqlite-dissect) | see upstream | `scripts/run-sqlite-dissect.sh` (install via `pip install sqlite-dissect`) |
 
 The bulky upstream checkouts/builds (`*/checkout/`, `fqlite/{sdk,lib,build}`,
@@ -30,10 +29,9 @@ version/commit, `git apply` (or `patch`) our diff, build. Follow them in any ord
 - [`undark/SETUP.md`](undark/SETUP.md)
 - [`fqlite/SETUP.md`](fqlite/SETUP.md)
 - [`bring2lite/SETUP.md`](bring2lite/SETUP.md)
-- [`sqldrp/SETUP.md`](sqldrp/SETUP.md)
 
-The two Python tools are driven through the committed wrappers
-`scripts/run-bring2lite.sh` and `scripts/run-sqldrp.sh` (the stable interface the
+The Python tools are driven through the committed wrappers
+`scripts/run-bring2lite.sh` and `scripts/run-sqlite-dissect.sh` (the stable interface the
 harness shells out to). fqlite is driven through `fqlite/run-tap.sh`, which runs
 the committed `tap/HeadlessTap.java` against fqlite's carving engine with no GUI.
 
@@ -48,7 +46,7 @@ W=$(pwd)
 UNDARK_BIN="$W/tools/undark/undark" \
 FQLITE_TAP="$W/tools/fqlite/run-tap.sh" FQLITE_JAVA="$(command -v java)" \
 BRING2LITE_CMD="$W/scripts/run-bring2lite.sh" \
-SQLDRP_CMD="$W/scripts/run-sqldrp.sh" \
+SQLITE_DISSECT_CMD="$W/scripts/run-sqlite-dissect.sh" \
 cargo test -p sqlite-forensic --test nemetz_tool_comparison -- --nocapture
 ```
 

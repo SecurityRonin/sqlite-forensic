@@ -4326,7 +4326,9 @@ pub struct JournalPageImage {
 pub struct RollbackJournal {
     header: JournalHeader,
     images: Vec<JournalPageImage>,
-    duplicate_pgno: bool,
+    /// Page numbers that appeared more than once (first occurrence kept), each
+    /// listed once in first-seen order. Empty for a well-formed journal.
+    duplicate_pgnos: Vec<u32>,
 }
 
 /// The journal page checksum (`pager.c` `pager_cksum`): `nonce` plus every-200th
@@ -4493,20 +4495,21 @@ impl RollbackJournal {
     fn from_walk(header: JournalHeader, walked: Vec<JournalPageImage>) -> Self {
         let mut seen = std::collections::BTreeSet::new();
         let mut images = Vec::with_capacity(walked.len());
-        let mut duplicate_pgno = false;
+        let mut duplicate_pgnos: Vec<u32> = Vec::new();
         for img in walked {
             if seen.insert(img.pgno) {
                 images.push(img);
-            } else {
+            } else if !duplicate_pgnos.contains(&img.pgno) {
                 // Keep the FIRST occurrence as the truest pre-transaction image;
-                // flag the duplicate rather than silently absorbing it.
-                duplicate_pgno = true;
+                // record WHICH page repeated (once) rather than a bare flag, so the
+                // anomaly can name the offending page number.
+                duplicate_pgnos.push(img.pgno);
             }
         }
         Self {
             header,
             images,
-            duplicate_pgno,
+            duplicate_pgnos,
         }
     }
 
@@ -4527,7 +4530,15 @@ impl RollbackJournal {
     /// corruption, a savepoint/super-journal artifact, or tampering (design §3).
     #[must_use]
     pub fn has_duplicate_pgno(&self) -> bool {
-        self.duplicate_pgno
+        !self.duplicate_pgnos.is_empty()
+    }
+
+    /// The page numbers that appeared more than once (first occurrence kept), each
+    /// listed once in first-seen order — the offending values behind
+    /// [`Self::has_duplicate_pgno`]. Empty for a well-formed journal.
+    #[must_use]
+    pub fn duplicate_pgnos(&self) -> &[u32] {
+        &self.duplicate_pgnos
     }
 }
 

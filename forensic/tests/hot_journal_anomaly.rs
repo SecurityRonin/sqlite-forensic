@@ -24,8 +24,9 @@
 
 use std::path::{Path, PathBuf};
 
+use forensicnomicon::report::Source;
 use sqlite_core::Database;
-use sqlite_forensic::audit_journal;
+use sqlite_forensic::{audit_journal, audit_journal_findings};
 
 fn journal_dir(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -198,6 +199,50 @@ fn real_hot_journal_appended_duplicate_fires_duplicate_page() {
     assert!(
         codes.contains(&"SQLITE-JOURNAL-DUPLICATE-PAGE"),
         "an appended duplicate real page record raises DUPLICATE-PAGE; got {codes:?}"
+    );
+}
+
+#[test]
+fn real_hot_journal_duplicate_page_finding_names_the_page() {
+    // roadmap §2.2: the DUPLICATE-PAGE finding must surface WHICH page repeated,
+    // not report the anomaly with no evidence. Same construction as above; the
+    // appended record's pgno (its first 4 bytes, BE) is the offending value.
+    let db = Database::open(std::fs::read(journal_dir("hot.db")).unwrap()).expect("open hot.db");
+    let original = std::fs::read(journal_dir("hot.db-journal")).unwrap();
+    let ps = db.header().page_size as usize;
+    let sector = 512usize;
+    let rec_len = 4 + ps + 4;
+    let first_record = original[sector..sector + rec_len].to_vec();
+    let dup_pgno = u32::from_be_bytes([
+        first_record[0],
+        first_record[1],
+        first_record[2],
+        first_record[3],
+    ]);
+    let n_rec = u32::from_be_bytes([original[8], original[9], original[10], original[11]]);
+    let next_slot = sector + (n_rec as usize) * rec_len;
+    let mut journal = original[..next_slot.min(original.len())].to_vec();
+    journal[8..12].copy_from_slice(&(n_rec + 1).to_be_bytes());
+    journal.extend_from_slice(&first_record);
+
+    let source = Source {
+        analyzer: "sqlite-forensic".to_string(),
+        scope: "hot.db".to_string(),
+        version: None,
+    };
+    let findings = audit_journal_findings(&db, &journal, &source);
+    let dup = findings
+        .iter()
+        .find(|f| f.code == "SQLITE-JOURNAL-DUPLICATE-PAGE")
+        .expect("DUPLICATE-PAGE finding present");
+    assert!(
+        !dup.evidence.is_empty(),
+        "DUPLICATE-PAGE must carry the offending page number, not be evidence-less"
+    );
+    assert!(
+        dup.evidence.iter().any(|e| e.value == dup_pgno.to_string()),
+        "evidence must include the duplicated pgno {dup_pgno}: {:?}",
+        dup.evidence
     );
 }
 

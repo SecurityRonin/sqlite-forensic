@@ -717,6 +717,20 @@ pub fn carve_deleted_records(db: &Database, column_count: usize) -> Vec<CarvedRe
     out
 }
 
+/// Every currently-live row's decoded values, across ALL tables, UNCOLLAPSED.
+///
+/// [`Database::live_rows`] keys live-row identity by a global rowid, so two tables
+/// that share a rowid collapse to a single entry — a live row can then vanish from
+/// the exclusion guard and be re-surfaced as deleted (roadmap §1.1). This walks
+/// `live_table_rows()` (every row, per table) so the live-row guard is complete
+/// even under cross-table rowid collisions. Best-effort and panic-free.
+fn live_value_tuples(db: &Database) -> Vec<Vec<Value>> {
+    db.live_table_rows()
+        .into_iter()
+        .flat_map(|t| t.rows.into_iter().map(|r| r.values))
+        .collect()
+}
+
 /// Recover deleted records across **every** free-space class — the full-coverage
 /// carver. Drives, in order:
 ///
@@ -918,47 +932,42 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
     out.retain(|rec| !is_structural_noise(&rec.values));
 
     let live = db.live_rows();
-    // Value-level identity of every live row, for collision-checking records whose
-    // rowid is unknown (freeblock reconstructions have a destroyed rowid, so the
-    // rowid-keyed filter below cannot protect against re-surfacing a live row).
-    // The live set also includes the CURRENT `sqlite_master` rows: a record carved
-    // from a materialized page 1 (the schema table) whose values equal a live
-    // schema entry is that live row re-surfaced, not deleted residue — drop it.
-    // (Value-based, so a genuinely-deleted PRIOR schema version is still recovered.)
-    let live_value_keys: std::collections::HashSet<String> = live
-        .values()
+    // COMPLETE value-level identity of every live row, across ALL tables and
+    // UNCOLLAPSED. `live_rows()` keys by a global rowid, so two tables sharing a
+    // rowid collapse to one entry and a live row can vanish from the guard; build
+    // the guard from every live row (roadmap §1.1) plus the CURRENT `sqlite_master`
+    // rows (a record carved from a materialized page 1 whose values equal a live
+    // schema entry is that live row re-surfaced, not deleted residue — value-based,
+    // so a genuinely-deleted PRIOR schema version is still recovered).
+    let live_values = live_value_tuples(db);
+    let live_value_keys: std::collections::HashSet<String> = live_values
+        .iter()
         .chain(db.live_schema_rows().iter())
         .map(|v| format!("{v:?}"))
         .collect();
     out.retain_mut(|rec| {
-        // Freeblock reconstructions carry an unknown rowid → guard by value: drop
-        // any whose decoded values match a currently-live row (never re-surface a
-        // live row), even though we cannot key it by rowid.
-        if rec.source == RecoverySource::FreeblockReconstructed {
-            return !live_value_keys.contains(&format!("{:?}", rec.values));
+        // Exclusion invariant (EVERY source): a record whose decoded values equal
+        // ANY currently-live row is that live row re-surfaced — never report it as
+        // deleted. This guards the cross-table rowid-collision case the rowid-keyed
+        // branch below cannot, since the global live map collapses shared rowids.
+        if live_value_keys.contains(&format!("{:?}", rec.values)) {
+            return false;
         }
-        // WAL-frame residue is guarded the same way and KEEPS its WalFrame tag:
-        // drop any record whose values match a currently-live row (the WAL-applied
-        // view's live set), so a row that survived the deletion is never
-        // re-surfaced; a genuinely-deleted WAL row has no live match and is kept
-        // with its frame provenance intact (not reclassified to PriorVersion).
-        if rec.source == RecoverySource::WalFrame {
-            return !live_value_keys.contains(&format!("{:?}", rec.values));
+        // Freeblock reconstructions (destroyed rowid) and WAL-frame residue carry no
+        // rowid usable by the branch below; the value guard above already protected
+        // them, so keep them with their source tag intact.
+        if rec.source == RecoverySource::FreeblockReconstructed
+            || rec.source == RecoverySource::WalFrame
+        {
+            return true;
         }
-        match live.get(&rec.rowid) {
-            // rowid not live → an ordinary deleted record (keep, source unchanged).
-            None => true,
-            // Same rowid: a byte-identical copy is a stale rebalance artifact (drop);
-            // differing values are a deleted prior version (keep, reclassified).
-            Some(live_values) => {
-                if &rec.values == live_values {
-                    false
-                } else {
-                    rec.source = RecoverySource::PriorVersion;
-                    true
-                }
-            }
+        // A live rowid with DIFFERING values (exact matches were dropped above) is a
+        // deleted prior version of that row; an absent rowid is an ordinary deletion.
+        // Either way the record is kept — only its classification changes.
+        if live.contains_key(&rec.rowid) {
+            rec.source = RecoverySource::PriorVersion;
         }
+        true
     });
 
     dedup_keep_best(out)
@@ -1130,8 +1139,13 @@ pub fn carve_with_fragments(db: &Database) -> CarveTiers {
 
     // Layer 3: live-row suppression. A fragment whose surviving set matches the
     // corresponding columns of a live row is a stale partial copy of a live row.
-    let live = db.live_rows();
-    fragments.retain(|frag| !live.values().any(|lv| fragment_matches_columns(frag, lv)));
+    // Complete, uncollapsed live set (roadmap §1.1): see `live_value_tuples`.
+    let live_values = live_value_tuples(db);
+    fragments.retain(|frag| {
+        !live_values
+            .iter()
+            .any(|lv| fragment_matches_columns(frag, lv))
+    });
 
     // Layer 2: full-row value suppression. A fragment already covered by a
     // recovered full row in this carve is a duplicate — drop it.
@@ -1247,9 +1261,9 @@ pub fn carve_at_commit(db: &Database, timeline: &WalTimeline, id: CommitId) -> V
     // live set includes the CURRENT `sqlite_master` rows, because a snapshot's
     // materialized page 1 (the schema table) still holds the live schema cell —
     // value-based, so a deleted PRIOR schema version is still recovered.
-    let live = db.live_rows();
-    let live_value_keys: std::collections::HashSet<String> = live
-        .values()
+    // Complete, uncollapsed live set (roadmap §1.1): see `live_value_tuples`.
+    let live_value_keys: std::collections::HashSet<String> = live_value_tuples(db)
+        .iter()
         .chain(db.live_schema_rows().iter())
         .map(|v| format!("{v:?}"))
         .collect();

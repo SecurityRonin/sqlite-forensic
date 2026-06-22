@@ -1013,7 +1013,7 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
         true
     });
 
-    dedup_keep_best(out)
+    dedup_keep_best(out, &db.page_to_table_map())
 }
 
 /// A carved full record is **structural noise** — not an information-bearing
@@ -1312,7 +1312,7 @@ pub fn carve_at_commit(db: &Database, timeline: &WalTimeline, id: CommitId) -> V
         .collect();
     out.retain(|rec| !live_value_keys.contains(&format!("{:?}", rec.values)));
 
-    dedup_keep_best(out)
+    dedup_keep_best(out, &db.page_to_table_map())
 }
 
 /// De-duplicate carved records by content identity, keeping the
@@ -1321,8 +1321,23 @@ pub fn carve_at_commit(db: &Database, timeline: &WalTimeline, id: CommitId) -> V
 /// `Value` carries an `f64` (`Real`) so it is not `Hash`/`Eq`; the identity key
 /// is the record's `rowid` plus a stable `Debug` rendering of its values, which
 /// is sufficient to collapse byte-identical recoveries.
-fn dedup_keep_best(mut records: Vec<CarvedRecord>) -> Vec<CarvedRecord> {
+fn dedup_keep_best(
+    mut records: Vec<CarvedRecord>,
+    page_table: &std::collections::BTreeMap<u32, String>,
+) -> Vec<CarvedRecord> {
     use std::collections::HashSet;
+    let content = |r: &CarvedRecord| format!("{}:{:?}", r.rowid, r.values);
+
+    // Identities (rowid, values) that have at least one record attributed to a
+    // LIVE table. A copy of such an identity carved from a freed/unattributed page
+    // is the SAME deleted row surviving in two places; it is folded into the
+    // attributed copy rather than double-listed (roadmap §1.2).
+    let attributed: HashSet<String> = records
+        .iter()
+        .filter(|r| page_table.contains_key(&r.page))
+        .map(&content)
+        .collect();
+
     let mut seen: HashSet<String> = HashSet::new();
     let mut kept: Vec<CarvedRecord> = Vec::new();
     // Highest confidence first, so the kept copy of each identity is the best one.
@@ -1332,7 +1347,18 @@ fn dedup_keep_best(mut records: Vec<CarvedRecord>) -> Vec<CarvedRecord> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     for rec in records.drain(..) {
-        let key = format!("{}:{:?}", rec.rowid, rec.values);
+        let c = content(&rec);
+        // Table-aware identity (roadmap §1.2): a record from a page a live table
+        // owns is keyed by (table, rowid, values) — the same row recovered from
+        // several free regions of ONE table collapses, but two DIFFERENT live
+        // tables sharing (rowid, values) stay distinct. An unattributed copy of an
+        // identity that IS attributed elsewhere is the same deleted row → fold it
+        // in. Otherwise (no live-table copy at all) keep the plain content identity.
+        let key = match page_table.get(&rec.page) {
+            Some(table) => format!("T:{table}:{c}"),
+            None if attributed.contains(&c) => continue,
+            None => format!("U:{c}"),
+        };
         if seen.insert(key) {
             kept.push(rec);
         }
@@ -2135,7 +2161,7 @@ pub fn row_histories_with_residue(db: &Database) -> Vec<sqlite_core::row_history
         }
     }
     // Collapse byte-identical carves (a row can recur across commits / regions).
-    let records = dedup_keep_best(records);
+    let records = dedup_keep_best(records, &db.page_to_table_map());
 
     // Attribute each carved record to a table. The strongest signal is page
     // linkage: a record carved from a page still owned by a live table's b-tree

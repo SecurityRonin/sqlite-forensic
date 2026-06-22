@@ -226,10 +226,13 @@ in the provenance note).
   `FQLITE_TAP`):
     - clone `pawlaszczyk/fqlite` at commit
       `26922bd9e3cdc60c93b72dfb1fb2f5972a0af6a6`;
-    - null-guard the unguarded `gui.add_table(...)` calls in `Job.java` so
-      `processDB()` runs to completion with `gui == null`;
-    - stub the `rag`/`erm` LLM packages so the build does not pull
-      langchain4j/llama;
+    - **no edits to fqlite's own source are needed**: at this commit every
+      `gui.add_table(...)` call is already behind an `if (gui != null)` guard
+      upstream, so the GUI-null engine path (`Job.run`) runs to completion — the
+      committed `fqlite.patch` is intentionally empty (header/explanation only,
+      no diff hunks);
+    - add six compile-only stubs for the `rag`/`erm` LLM packages so the build
+      links without pulling langchain4j/llama;
     - compile the engine + `tap/HeadlessTap.java` with OpenJDK 25, `--release 21`,
       against **OpenJFX 22.0.2** SDK (`--module-path javafx-sdk-22.0.2/lib
       --add-modules javafx.base,javafx.graphics,javafx.controls`) plus

@@ -311,6 +311,21 @@ its own provenance README (source, NIST/author hashes, licence, ground truth):
   `auto_vacuum=NONE`. Ground truth: NO carved record's values may equal any
   currently-live row of either table.
 
+#### dedup_cross_table/cross_table_identity.db
+
+- **Source:** SYNTHETIC — Python `sqlite3` module (Tier-2; ground truth derivable
+  from the construction). Generator: `dedup_cross_table/gen.py`.
+- **Identity:** two live tables `a` and `b` each holding `(1,'DUP-1')` and
+  `(2,'DUP-2')` (identical rowid+values across tables) plus a distinct keeper row,
+  then both `DELETE` ids 1 and 2. Pins
+  `forensic/tests/dedup_cross_table.rs` (roadmap §1.2): the carver recovers each
+  deleted identity from BOTH tables' in-page residue, so a dedup keyed only on
+  `(rowid, values)` collapses two genuinely-distinct deleted records into one. The
+  table-aware identity keeps all four.
+- **md5:** `3b78c970e13aa5793146ade0aed84cdb` — 12288 bytes.
+- **Notable contents:** `a`/`b` each 1 live row (`KEEP-a`/`KEEP-b`), deleted
+  `(1,'DUP-1')` and `(2,'DUP-2')` in both; `secure_delete=OFF`, `auto_vacuum=NONE`.
+
 #### dropped_table_schema.db
 
 - **Source:** SYNTHETIC — `sqlite3` CLI (Tier-2; ground truth derivable from the

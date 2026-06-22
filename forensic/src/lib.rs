@@ -98,7 +98,13 @@ pub enum AnomalyKind {
     /// mid-write); `SQLite` would roll it back on next open, so the main db may
     /// require rollback. The journal holds the pre-interruption state. (Design §6
     /// item 1 — state the observation; never assert "anti-forensic".)
-    HotJournal,
+    HotJournal {
+        /// Database page count recorded at transaction start (`dbOrigSize`).
+        mx_page: u32,
+        /// Number of pre-transaction page images the journal carries — the scope
+        /// of the interrupted transaction.
+        journaled_pages: u32,
+    },
     /// A committed PERSIST `-journal` (header zeroed, bodies intact) carries
     /// recoverable pre-images. Consistent with a normally-committed transaction
     /// whose deleted/modified rows remain recoverable (design §6 item 2).
@@ -167,7 +173,7 @@ impl AnomalyKind {
             | AnomalyKind::JournalSchemaChange { .. }
             | AnomalyKind::JournalDuplicatePage { .. } => Severity::Medium,
             AnomalyKind::PageCountMismatch { .. }
-            | AnomalyKind::HotJournal
+            | AnomalyKind::HotJournal { .. }
             | AnomalyKind::JournalChecksumMismatch { .. } => Severity::High,
             AnomalyKind::JournalDbSizeDelta { .. } => Severity::Low,
         }
@@ -183,7 +189,7 @@ impl AnomalyKind {
             AnomalyKind::NonEmptyFreelist { .. } => "SQLITE-FREELIST-NONEMPTY",
             AnomalyKind::WalUncheckpointedState { .. } => "SQLITE-WAL-UNCHECKPOINTED",
             AnomalyKind::PageCountMismatch { .. } => "SQLITE-PAGECOUNT-MISMATCH",
-            AnomalyKind::HotJournal => "SQLITE-JOURNAL-HOT",
+            AnomalyKind::HotJournal { .. } => "SQLITE-JOURNAL-HOT",
             AnomalyKind::JournalRecoverable { .. } => "SQLITE-JOURNAL-RECOVERABLE",
             AnomalyKind::JournalChecksumMismatch { .. } => "SQLITE-JOURNAL-CHECKSUM-MISMATCH",
             AnomalyKind::JournalSchemaChange { .. } => "SQLITE-JOURNAL-SCHEMA-CHANGE",
@@ -238,11 +244,13 @@ impl AnomalyKind {
                  length ({file_pages} pages) — consistent with truncation, \
                  carving, or out-of-band modification"
             ),
-            AnomalyKind::HotJournal => "a hot rollback journal (valid header magic) sits beside \
+            AnomalyKind::HotJournal { .. } => {
+                "a hot rollback journal (valid header magic) sits beside \
                  the database — consistent with an interrupted or in-progress write transaction \
                  (crash, power loss, process kill, or acquisition captured mid-write); SQLite \
                  would roll it back on next open, so the main database may require rollback"
-                .to_string(),
+                    .to_string()
+            }
             AnomalyKind::JournalRecoverable { images } => format!(
                 "the rollback journal carries {images} pre-transaction page \
                  image(s) (PERSIST post-commit) — consistent with a committed \
@@ -370,7 +378,7 @@ impl Observation for Anomaly {
             // duplicate corruption, db-size delta) are integrity-of-state.
             AnomalyKind::WalUncheckpointedState { .. }
             | AnomalyKind::PageCountMismatch { .. }
-            | AnomalyKind::HotJournal
+            | AnomalyKind::HotJournal { .. }
             | AnomalyKind::JournalChecksumMismatch { .. }
             | AnomalyKind::JournalDuplicatePage { .. }
             | AnomalyKind::JournalDbSizeDelta { .. } => Category::Integrity,
@@ -512,7 +520,21 @@ impl Observation for Anomaly {
                     }),
                 })
                 .collect(),
-            AnomalyKind::HotJournal => Vec::new(),
+            AnomalyKind::HotJournal {
+                mx_page,
+                journaled_pages,
+            } => vec![
+                Evidence {
+                    field: "db_page_count_at_txn_start".to_string(),
+                    value: mx_page.to_string(),
+                    location: None,
+                },
+                Evidence {
+                    field: "journaled_pages".to_string(),
+                    value: journaled_pages.to_string(),
+                    location: None,
+                },
+            ],
         }
     }
 }
@@ -1598,7 +1620,10 @@ pub fn audit_journal(db: &Database, journal: &[u8]) -> Vec<Anomaly> {
     match parsed.header() {
         JournalHeader::Valid { mx_page, .. } => {
             // A valid-magic header is a hot journal (interrupted/in-progress).
-            out.push(Anomaly::new(AnomalyKind::HotJournal));
+            out.push(Anomaly::new(AnomalyKind::HotJournal {
+                mx_page: *mx_page,
+                journaled_pages: u32::try_from(images.len()).unwrap_or(u32::MAX),
+            }));
 
             // mxPage (db size at txn start) vs the current page count. 0 is the
             // "size unknown" sentinel, so only a non-zero, differing value is a

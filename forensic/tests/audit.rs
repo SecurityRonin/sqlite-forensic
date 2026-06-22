@@ -3,7 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use forensicnomicon::report::{Severity, Source};
+use forensicnomicon::report::{Location, Severity, Source};
 use sqlite_core::Database;
 use sqlite_forensic::{audit, audit_findings, AnomalyKind};
 
@@ -32,6 +32,35 @@ fn nonzero_reserved_space_is_flagged() {
     );
     assert_eq!(anomalies[0].code, "SQLITE-RESERVED-SPACE-NONZERO");
     assert_eq!(anomalies[0].severity, Severity::Low);
+}
+
+#[test]
+fn nonzero_reserved_space_finding_carries_raw_evidence() {
+    // roadmap §2.2: an "unknown/anomalous" finding must surface the offending
+    // value AND where it was found, never report the anomaly with no evidence.
+    let db = Database::open(header_with_reserved(32)).unwrap();
+    let source = Source {
+        analyzer: "sqlite-forensic".to_string(),
+        scope: "x.sqlite".to_string(),
+        version: None,
+    };
+    let findings = audit_findings(&db, &source);
+    assert_eq!(findings.len(), 1);
+    let evidence = &findings[0].evidence;
+    assert!(
+        !evidence.is_empty(),
+        "NonZeroReservedSpace must carry raw evidence (the reserved byte count + header offset)"
+    );
+    assert!(
+        evidence.iter().any(|e| e.value == "32"),
+        "evidence must include the reserved-byte value (32): {evidence:?}"
+    );
+    assert!(
+        evidence
+            .iter()
+            .any(|e| matches!(e.location, Some(Location::ByteOffset(20)))),
+        "evidence must point at header byte offset 20: {evidence:?}"
+    );
 }
 
 #[test]

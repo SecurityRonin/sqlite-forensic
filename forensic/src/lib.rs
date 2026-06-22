@@ -489,9 +489,13 @@ impl Observation for Anomaly {
                     location: None,
                 },
             ],
-            AnomalyKind::NonZeroReservedSpace { .. }
-            | AnomalyKind::HotJournal
-            | AnomalyKind::JournalDuplicatePage => Vec::new(),
+            AnomalyKind::NonZeroReservedSpace { reserved } => vec![Evidence {
+                field: "reserved_bytes_per_page".to_string(),
+                value: reserved.to_string(),
+                // The reserved-space-per-page byte lives at file-header offset 20.
+                location: Some(Location::ByteOffset(20)),
+            }],
+            AnomalyKind::HotJournal | AnomalyKind::JournalDuplicatePage => Vec::new(),
         }
     }
 }

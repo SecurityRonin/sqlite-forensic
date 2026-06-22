@@ -474,42 +474,28 @@ Nemetz answer key with the same two-column identity matcher
 (Table~\ref{tab:headtohead}). Substrate recall ($R_{\mathrm{sub}}$) is computed on
 the rows whose identity still survives in the artifact; end-to-end recall
 ($R_{\mathrm{e2e}}$) is against all originally-deleted rows, including those whose
-identity a later write destroyed; precision counts phantom rows. We drive \code{fqlite} through a headless source-instrumentation tap of its carving
-engine and the two Python tools through normalizing wrappers; every tool is pinned to
-an exact release or commit and every patch, shim, and the tap is committed, so the
-comparison is reproducible from a clean checkout (Table~\ref{tab:tools})~\cite{sqlite4n6}.
+identity a later write destroyed; precision counts phantom rows. We drive \code{fqlite} headlessly through its carving engine (its command-line mode was
+removed at v2.0) and the two Python tools through normalizing wrappers; every tool is
+pinned to an exact release or commit and run \emph{as published}, so the comparison is
+reproducible from a clean checkout (Table~\ref{tab:tools})~\cite{sqlite4n6}.
 
-\paragraph{Exact versions and the \code{fqlite} instrumentation.}
-Table~\ref{tab:tools} pins each tool to a release or commit, states how it was driven,
-and names the committed artifact a reader re-runs it from; the fixtures themselves are
-built with the stock \code{sqlite3} shell (3.45.3). The other tools run essentially as
-published---\code{undark}'s patch is two behavior-preserving build-portability hunks
-(clang/macOS), and \code{bring2lite} needs only a headless Qt import shim and the
-replacement of deprecated \code{is}-literal comparisons; neither alters recovery
-logic---and \code{sqlite\_dissect} is the stock DC3 release run with carving enabled
-(\code{-c -f}). \code{fqlite} alone required engineering, because its command-line mode
-was removed at v2.0: we drive the carving engine directly through a committed, GUI-free
-tap. \code{HeadlessTap} constructs an \code{fqlite.base.Job}, runs \code{Job.run(path)}
-synchronously, and reads the engine's \code{resultlist}---the same structure the GUI
-presents---emitting the recovered deleted rows as CSV without ever opening a JavaFX
-window. It requires \emph{no edits to fqlite's own source}: at the pinned commit
-(\code{26922bd}) every \code{gui.add\_table(...)} call is already behind an
-\code{if (gui != null)} guard upstream, so the GUI-null engine path runs to completion;
-the only build-time additions are six compile-only stubs standing in for fqlite's
-optional LLM-assistant packages so the engine links without langchain4j/llama.cpp. The
-tap builds with OpenJDK~25 (\code{--release 21}) against OpenJFX~22.0.2. The driver
-(\code{tools/fqlite/tap/HeadlessTap.java}), its run wrapper, the stubs, and a full
-reproduction recipe (\code{tools/fqlite/SETUP.md}) are committed for independent
-verification~\cite{sqlite4n6}. \code{fqlite}'s WAL reader, by contrast, is instantiated
-only on a GUI code path, which is why category~\code{10}'s WAL case is cited from the
-original paper rather than re-measured through the tap.
+\paragraph{Exact tool versions.}
+Table~\ref{tab:tools} pins each tool to a release or commit and names the committed
+artifact a reader re-runs it from; the fixtures are built with the stock \code{sqlite3}
+shell (3.45.3). Every tool runs as published---we change \emph{no tool's recovery logic}
+(\code{undark} takes only two behavior-preserving build-portability hunks, \code{bring2lite}
+a headless Qt import shim). \code{fqlite}, whose command-line mode was removed at v2.0, is
+driven through a committed external harness around its carving engine with \emph{no
+modification to fqlite's own source}; its WAL reader is reachable only on a GUI code path,
+so category~\code{10}'s WAL case is cited from the original paper rather than re-measured.
+Per-tool setup recipes are in the artifact for independent verification~\cite{sqlite4n6}.
 
 \begin{table}[t]
 \centering\small
-\caption{Exact versions of the compared tools and how each was driven. Every patch, the
-headless \code{fqlite} tap and its stubs, the Python wrappers/shims, and per-tool setup
-recipes are in the artifact for independent verification~\cite{sqlite4n6}; the fixtures
-are built with \code{sqlite3}~3.45.3.}
+\caption{Exact versions of the compared tools and how each was driven. Patches, the
+headless \code{fqlite} harness, the Python wrappers/shims, and per-tool setup recipes are
+in the artifact for independent verification~\cite{sqlite4n6}; fixtures use
+\code{sqlite3}~3.45.3.}
 \label{tab:tools}
 \setlength{\tabcolsep}{3.5pt}
 \begin{tabular}{@{}llll@{}}
@@ -517,7 +503,7 @@ are built with \code{sqlite3}~3.45.3.}
 Tool & Version / commit & Driven via & Committed artifact \\
 \midrule
 \code{undark}          & 0.7.1                  & native binary          & \code{undark/undark.patch} \\
-\code{fqlite}          & 4.22 (\code{26922bd})  & headless source tap    & \code{fqlite/\{tap,stubs\}} \\
+\code{fqlite}          & 4.22 (\code{26922bd})  & headless engine driver & \code{fqlite/\{tap,stubs\}} \\
 \code{bring2lite}      & commit \code{e876bf2}  & wrapper + PyQt5 shim   & \code{bring2lite/\{patch,shim\}} \\
 \code{sqlite\_dissect} & 1.0.0 (DC3)            & wrapper (\code{-c -f}) & \code{run-sqlite-dissect.sh} \\
 \bottomrule

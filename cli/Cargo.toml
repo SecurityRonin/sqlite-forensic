@@ -3,6 +3,9 @@ name = "sqlite4n6"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Application crate: declare the pinned dev toolchain as MSRV (nothing pins a
+# library dependency against the binary), unlike the published libs' low floor.
+rust-version = "1.96"
 # `authors` is required by cargo-deb (it derives the .deb copyright from it).
 authors = ["Albert Hui <albert@securityronin.com>"]
 readme = "README.md"

@@ -31,12 +31,13 @@ PNG_PATH = HERE / "img" / "recovery-comparison.png"
 # capability boundary, not a recovery failure (see recovery-comparison.md). It is
 # kept in the table and prose, but plotting a metric-artifact 0 misrepresents it.
 TOOL_COLOR = {
-    "ours": "#1b9e8a",        # teal
-    "fqlite": "#e6840f",      # orange
-    "undark": "#d62728",      # red
-    "bring2lite": "#7570b3",  # purple
+    "ours": "#1b9e8a",          # teal
+    "fqlite": "#e6840f",        # orange
+    "undark": "#d62728",        # red
+    "bring2lite": "#7570b3",    # purple
+    "sqlite_dissect": "#8c564b",  # brown
 }
-TOOL_ORDER = ["ours", "fqlite", "undark", "bring2lite"]
+TOOL_ORDER = ["ours", "fqlite", "undark", "bring2lite", "sqlite_dissect"]
 CAT_MARKER = {"0C": "o", "0D": "s", "0E": "^"}
 CAT_ORDER = ["0C", "0D", "0E"]
 

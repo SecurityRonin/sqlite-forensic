@@ -62,6 +62,7 @@
 \definecolor{fqlitec}{HTML}{E6840F}
 \definecolor{undarkc}{HTML}{D62728}
 \definecolor{bring}{HTML}{7570B3}
+\definecolor{dissect}{HTML}{8C564B}
 
 % --- Double-blind toggle -----------------------------------------------------
 % DFRWS review is double-blind. \blindtrue builds the anonymized submission PDF.
@@ -119,9 +120,9 @@ We contribute: (1)~a treatment of SQLite deletion and free-space conventions,
 including an application case study of \zh{微信} (WeChat) message deletion;
 (2)~\sys, an open, \code{forbid(unsafe)} Rust reference implementation;
 and (3)~a multi-oracle evaluation---accuracy, false-positive rate, and
-throughput---against four independent recovery tools (\code{undark}, \code{fqlite},
-\code{bring2lite}, and the SQLite Deleted-Records Parser) on independent third-party
-corpora with published ground truth. In our scoped harness on the in-page deletion
+throughput---against five independent recovery tools (\code{undark}, \code{fqlite},
+\code{bring2lite}, the SQLite Deleted-Records Parser, and DC3's SQLite Dissect) on
+independent third-party corpora with published ground truth. In our scoped harness on the in-page deletion
 category of the Nemetz standardized corpus, our recall is $0.833$ to the
 best-performing competitor's $0.798$ at precision $1.000$, and across the evaluated
 corpus the carver reports no still-live row as deleted. Every figure is reproducible
@@ -465,10 +466,11 @@ anchor.
 \section{Evaluation}\label{sec:eval}
 
 \subsection*{Accuracy: a multi-oracle head-to-head}
-We compare \sys against four independent recovery tools---\code{undark}
+We compare \sys against five independent recovery tools---\code{undark}
 (C)~\cite{undark}, \code{fqlite} (Java)~\cite{pawlaszczyk2021fqlite}, \code{bring2lite}
-(Python)~\cite{meng2019bring2lite}, and the SQLite Deleted-Records Parser
-(SQL-DRP, Python)~\cite{degrazia_sqlparse}---each scored against the \emph{same}
+(Python)~\cite{meng2019bring2lite}, the SQLite Deleted-Records Parser
+(SQL-DRP, Python)~\cite{degrazia_sqlparse}, and DC3's \code{sqlite\_dissect}
+(Python)~\cite{sqlite_dissect_dc3}---each scored against the \emph{same}
 Nemetz answer key with the same two-column identity matcher
 (Table~\ref{tab:headtohead}). Substrate recall ($R_{\mathrm{sub}}$) is computed on
 the rows whose identity still survives in the artifact; end-to-end recall
@@ -491,24 +493,27 @@ wrappers/tap.}
 \toprule
 Cat & Tool & TP & FP & FN & $R_{\mathrm{sub}}$ & $R_{\mathrm{e2e}}$ & Prec. \\
 \midrule
-\multirow{5}{*}{\code{0C}}
+\multirow{6}{*}{\code{0C}}
  & \textbf{ours}   & \textbf{70} & \textbf{0}  & 14 & \textbf{0.833} & \textbf{0.833} & \textbf{1.000} \\
  & fqlite          & 67 & 17 & 17 & 0.798 & 0.798 & 0.798 \\
+ & sqlite\_dissect & 51 & 23 & 33 & 0.607 & 0.607 & 0.689 \\
  & bring2lite      & 40 & 0  & 44 & 0.476 & 0.476 & 1.000 \\
  & undark          & 14 & 10 & 70 & 0.167 & 0.167 & 0.583 \\
  & sql-drp$^\ddagger$ & 0  & 1  & 84 & 0.000 & 0.000 & 0.000 \\
 \midrule
-\multirow{5}{*}{\code{0D}}
+\multirow{6}{*}{\code{0D}}
  & \textbf{ours}   & 19 & 0 & 0 & \textbf{1.000} & 0.422 & \textbf{1.000} \\
  & fqlite          & 20$^\dagger$ & 0 & 0 & 1.000 & 0.444 & 1.000 \\
+ & sqlite\_dissect & 18 & 3 & 2 & 0.895 & 0.400 & 0.857 \\
  & bring2lite      & 7  & 0 & 12 & 0.368 & 0.156 & 1.000 \\
  & undark          & 1  & 10 & 18 & 0.053 & 0.022 & 0.091 \\
  & sql-drp         & 0  & 0 & 19 & 0.000 & 0.000 & --- \\
 \midrule
-\multirow{5}{*}{\code{0E}}
+\multirow{6}{*}{\code{0E}}
  & \textbf{ours}   & \textbf{4} & \textbf{0} & 0 & \textbf{1.000} & \textbf{0.333} & \textbf{1.000} \\
  & undark          & 3 & 6 & 1 & 0.750 & 0.250 & 0.333 \\
  & bring2lite      & 3 & 5 & 1 & 0.750 & 0.250 & 0.375 \\
+ & sqlite\_dissect & 3 & 633 & 1 & 0.750 & 0.250 & 0.005 \\
  & fqlite          & 2 & 6 & 2 & 0.500 & 0.167 & 0.250 \\
  & sql-drp         & 0 & 0 & 4 & 0.000 & 0.000 & --- \\
 \bottomrule
@@ -531,9 +536,12 @@ small overflow substrate (\code{0E}) our carver recovers all four at precision
 $1.000$, including one reassembled overflow chain. End-to-end recall is lower
 (\code{0D} $0.422$, \code{0E} $0.333$) because many originally-deleted rows had their
 identity overwritten---an effect the substrate/e2e split makes explicit. Across the
-evaluated categories our carver reports no still-live row as deleted; \code{undark},
-which dumps live and deleted rows together, reports 56 live rows as deleted on
-\code{0D} alone. Figure~\ref{fig:pr} plots substrate precision and recall against
+evaluated categories our carver reports no still-live row as deleted, whereas
+\code{undark}, which dumps live and deleted rows together, reports 56 live rows as
+deleted on \code{0D} alone, and \code{sqlite\_dissect}, with carving enabled, emits
+633 phantoms and re-reads 7 live rows on \code{0E} (precision $0.005$)---the
+false-positive hazard the exclusion invariant removes. Figure~\ref{fig:pr} plots
+substrate precision and recall against
 constant-$F_1$ contours; Figure~\ref{fig:fscores} breaks out the $F_1$ and
 $F_{0.5}$ scores by category.
 
@@ -565,6 +573,8 @@ $F_{0.5}$ scores by category.
 \addlegendentry{bring2lite}
 \addplot[only marks, mark=diamond*, undarkc] coordinates {(0.167,0.583) (0.053,0.091) (0.75,0.333)};
 \addlegendentry{undark}
+\addplot[only marks, mark=pentagon*, dissect] coordinates {(0.607,0.689) (0.895,0.857) (0.75,0.005)};
+\addlegendentry{sqlite\_dissect}
 \addplot[mark=star, mark size=3.2pt, black] coordinates {(1.0,1.0)};
 \addlegendentry{ideal}
 \end{axis}
@@ -591,6 +601,7 @@ each category.}
 \addplot[fill=fqlitec,draw=white] coordinates {(0C,0.798) (0D,1.000) (0E,0.333)};
 \addplot[fill=bring,draw=white] coordinates {(0C,0.645) (0D,0.538) (0E,0.500)};
 \addplot[fill=undarkc,draw=white] coordinates {(0C,0.259) (0D,0.067) (0E,0.462)};
+\addplot[fill=dissect,draw=white] coordinates {(0C,0.646) (0D,0.876) (0E,0.009)};
 % SQL-DRP omitted: it emits string blobs, not per-column records (see caption + table)
 \end{axis}
 \end{tikzpicture}
@@ -610,6 +621,7 @@ each category.}
 \addplot[fill=fqlitec,draw=white] coordinates {(0C,0.798) (0D,1.000) (0E,0.278)};
 \addplot[fill=bring,draw=white] coordinates {(0C,0.820) (0D,0.745) (0E,0.417)};
 \addplot[fill=undarkc,draw=white] coordinates {(0C,0.389) (0D,0.079) (0E,0.375)};
+\addplot[fill=dissect,draw=white] coordinates {(0C,0.671) (0D,0.864) (0E,0.006)};
 % SQL-DRP omitted: it emits string blobs, not per-column records (see caption + table)
 \end{axis}
 \end{tikzpicture}
@@ -620,7 +632,8 @@ each category.}
   \tikz\fill[ours](0,0)rectangle(1.8mm,1.8mm);~\scriptsize ours\quad
   \tikz\fill[fqlitec](0,0)rectangle(1.8mm,1.8mm);~\scriptsize fqlite\quad
   \tikz\fill[bring](0,0)rectangle(1.8mm,1.8mm);~\scriptsize bring2lite\quad
-  \tikz\fill[undarkc](0,0)rectangle(1.8mm,1.8mm);~\scriptsize undark%
+  \tikz\fill[undarkc](0,0)rectangle(1.8mm,1.8mm);~\scriptsize undark\quad
+  \tikz\fill[dissect](0,0)rectangle(1.8mm,1.8mm);~\scriptsize sqlite\_dissect%
 }
 \caption{$F_1$ and $F_{0.5}$ by category and tool, on substrate recall. SQL-DRP is
 omitted: it emits space-joined string blobs rather than per-column records, so it

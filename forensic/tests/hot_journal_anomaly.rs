@@ -247,6 +247,37 @@ fn real_hot_journal_duplicate_page_finding_names_the_page() {
 }
 
 #[test]
+fn real_hot_journal_finding_carries_scope_evidence() {
+    // roadmap §2.2c: the HOT-JOURNAL finding should surface the interrupted
+    // transaction's scope (db page count at txn start + number of journaled
+    // pre-images), not report the anomaly with no evidence. hot.db's journal
+    // carries 5 page images.
+    let db = Database::open(std::fs::read(journal_dir("hot.db")).unwrap()).expect("open hot.db");
+    let journal = std::fs::read(journal_dir("hot.db-journal")).unwrap();
+    let source = Source {
+        analyzer: "sqlite-forensic".to_string(),
+        scope: "hot.db".to_string(),
+        version: None,
+    };
+    let findings = audit_journal_findings(&db, &journal, &source);
+    let hot = findings
+        .iter()
+        .find(|f| f.code == "SQLITE-JOURNAL-HOT")
+        .expect("HOT-JOURNAL finding present");
+    assert!(
+        !hot.evidence.is_empty(),
+        "HOT-JOURNAL must carry the journal's scope as evidence, not be evidence-less"
+    );
+    assert!(
+        hot.evidence
+            .iter()
+            .any(|e| e.field == "journaled_pages" && e.value == "5"),
+        "evidence must include the journaled-page count (5): {:?}",
+        hot.evidence
+    );
+}
+
+#[test]
 fn real_hot_journal_edited_mxpage_fires_dbsize_delta() {
     // The real journal's mx_page (5) equals the live page count (5) → no natural
     // delta. Edit mx_page (offset 16, NOT checksum-covered) on an owned copy to a

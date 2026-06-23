@@ -30,6 +30,7 @@
 \usepackage{authblk}
 \usepackage{pgfplots}
 \usepackage{tikz}
+\usetikzlibrary{positioning,calc,arrows.meta,fit,backgrounds}
 \usepackage{textcomp}
 \usepackage{adjustbox}
 \usepackage[framemethod=tikz]{mdframed}
@@ -204,12 +205,71 @@ first bytes (the leading payload-length and rowid varints) may be partly
 overwritten by the free-block header that now occupies the gap; the surviving tail
 still carries the record's serial-type array and values.
 
+\begin{figure*}[t]
+\centering
+\adjustbox{max width=\textwidth}{%
+\begin{tikzpicture}[font=\scriptsize,
+  box/.style={draw, minimum height=8mm, align=center, inner sep=3pt},
+  live/.style={box, fill=blue!8},
+  freeb/.style={box, fill=red!12},
+  keep/.style={box, fill=green!14}]
+\node[box, minimum width=12mm, fill=black!6] (hdr) {page\\header};
+\node[box, minimum width=15mm, fill=black!3, right=1mm of hdr] (ptr) {cell pointers\\$\bullet\ \ \bullet$};
+\node[box, minimum width=11mm, fill=black!2, right=1mm of ptr] (gap) {free\\gap};
+\node[live, minimum width=12mm, right=1mm of gap] (cC) {cell C\\(live)};
+\node[freeb, minimum width=26mm, right=1mm of cC] (fb) {free block\\(deleted row B)};
+\node[live, minimum width=12mm, right=1mm of fb] (cA) {cell A\\(live)};
+\node[font=\footnotesize] at ($(hdr.north west)!0.5!(cA.north east)+(0,4mm)$) {b-tree leaf page};
+% anatomy of the free block
+\node[box, minimum width=10mm, fill=red!22, below=11mm of fb.south, anchor=north] (h2) {size};
+\node[box, minimum width=10mm, fill=red!22, left=0mm of h2] (h1) {next};
+\node[box, minimum width=16mm, fill=red!6, right=0mm of h2] (h3) {rowid varint\\(clobbered)};
+\node[keep, minimum width=20mm, right=0mm of h3] (h4) {serial-type array};
+\node[keep, minimum width=18mm, right=0mm of h4] (h5) {column values};
+\draw[-{Latex}, thick] (fb.south) -- (h2.north);
+\node[anchor=west, align=left, right=2mm of h5] {survives until\\reallocated};
+\end{tikzpicture}%
+}%
+\caption{\textbf{Free blocks (categories \code{0C}/\code{0D}).} A deleted row is unlinked
+from the cell-pointer array; with \code{secure\_delete} off its bytes remain as a
+\emph{free block} inside the still-live leaf page. The 4-byte free-block header overwrites
+only the leading payload-length and rowid varints---the serial-type array and column
+values (green) survive in the tail and are reconstructible until the gap is reallocated.}
+\label{fig:freeblock}
+\end{figure*}
+
 \subsection*{Overflow pages}
 A value too large for one page spills onto a chain of \emph{overflow} pages linked
 by a four-byte next-page pointer~\cite{sqlite_fileformat}. A deleted row with a long
 \code{TEXT} or \code{BLOB} column therefore leaves residue spread across several
 pages---recoverable only by following, or reconstructing, the chain through the
 freelist.
+
+\begin{figure*}[t]
+\centering
+\adjustbox{max width=\textwidth}{%
+\begin{tikzpicture}[font=\scriptsize,
+  pg/.style={draw, minimum height=11mm, minimum width=27mm, align=center, inner sep=3pt}]
+\node[pg, fill=blue!8] (leaf) {leaf cell\\\,header $\mid$ local prefix $\mid$ \textbf{ovfl ptr}\,};
+\node[pg, fill=orange!12, right=9mm of leaf] (o1) {overflow page 1\\\,payload $\mid$ \textbf{next ptr}\,};
+\node[pg, fill=orange!12, right=9mm of o1] (o2) {overflow page 2\\\,payload $\mid$ \texttt{0x00000000}\,};
+\draw[-{Latex}, thick] (leaf.east) -- (o1.west);
+\draw[-{Latex}, thick] (o1.east) -- (o2.west);
+\node[below=1.5mm of o2.south, font=\scriptsize] {chain end};
+\node[align=center, below=10mm of o1.south, font=\scriptsize]
+  {On \code{DELETE} (\code{secure\_delete} off) the leaf cell \emph{and} every chain page join the\\
+   freelist; the bytes survive until reused. Recovery follows the first-overflow\\
+   pointer, then each four-byte \textbf{next ptr}, to the \texttt{0} terminator.};
+\end{tikzpicture}%
+}%
+\caption{\textbf{Overflow chains (category \code{0E}).} A value too large for one page spills
+across a linked chain of overflow pages. A deleted long \code{TEXT}/\code{BLOB} leaves
+residue spread over several pages, recoverable only by following the chain through the
+freelist---and lost once \emph{any} chain page is reallocated. (In our corpus most \code{0E}
+bodies were overwritten, so end-to-end \code{0E} recall is $0.333$ despite full substrate
+recall.)}
+\label{fig:overflow}
+\end{figure*}
 
 \subsection*{The rollback journal and the write-ahead log}
 SQLite offers two crash-recovery mechanisms, and each leaves a distinct,
@@ -236,6 +296,37 @@ automatic once the WAL reaches a threshold (1000 pages by default)~\cite{sqlite_
 Until then, the WAL retains the \emph{commit history}: a page version a later commit
 superseded, or a row a later commit deleted, survives in the earlier frames.
 \end{fnote}
+
+\begin{figure*}[t]
+\centering
+\adjustbox{max width=\textwidth}{%
+\begin{tikzpicture}[font=\scriptsize,
+  pg/.style={draw, minimum height=8mm, minimum width=20mm, align=center, inner sep=2pt},
+  fr/.style={draw, minimum height=8mm, minimum width=17mm, align=center, inner sep=2pt}]
+% rollback journal (left): the before-image
+\node[pg, fill=green!13] (jpre) {pre-image\\page v1};
+\node[pg, fill=black!4, below=7mm of jpre] (jmain) {main DB\\page v2};
+\node[font=\footnotesize, above=1mm of jpre.north] {rollback \code{-journal}};
+\draw[-{Latex}] (jmain.north) -- node[right=1pt]{roll back} (jpre.south);
+\node[below=1.5mm of jmain.south, align=center] {\emph{before}: the\\pre-transaction state};
+% write-ahead log (right): appended after-images
+\node[fr, fill=blue!8, right=32mm of jpre] (f1) {frame 1\\v1};
+\node[fr, fill=blue!10, right=1mm of f1] (f2) {frame 2\\v2 $\checkmark$};
+\node[fr, fill=blue!12, right=1mm of f2] (f3) {frame 3\\v3 $\checkmark$};
+\node[font=\footnotesize, above=1mm of f2.north] {\code{-wal} (appended)};
+\node[pg, fill=black!4, below=7mm of f2] (wmain) {main DB (lags)};
+\node[below=1.5mm of wmain.south, align=center] {\emph{after}: commit history; an earlier\\frame holds a row a later commit deleted};
+\draw[{Latex}-{Latex}, thick] (jpre.east) -- node[above, align=center]{temporal\\opposites} (f1.west);
+\end{tikzpicture}%
+}%
+\caption{\textbf{Side files: rollback journal vs.\ WAL.} The two crash-recovery files are
+temporal opposites. The \code{-journal} stores the \emph{before}-image of each page a
+transaction will modify (the pre-transaction state). The \code{-wal} instead \emph{appends}
+new page versions ($\checkmark$ marks a commit frame) and only later checkpoints them back,
+so it preserves a multi-commit \emph{history} in which a row deleted by a later commit
+still survives in an earlier frame.}
+\label{fig:journalwal}
+\end{figure*}
 
 % === §3 Deletion conventions in practice =====================================
 \section{Conventions That Govern Residue}\label{sec:conventions}
@@ -490,7 +581,7 @@ modification to fqlite's own source}; its WAL reader is reachable only on a GUI 
 so category~\code{10}'s WAL case is cited from the original paper rather than re-measured.
 Per-tool setup recipes are in the artifact for independent verification~\cite{sqlite4n6}.
 
-\begin{table}[t]
+\begin{table*}[t]
 \centering\small
 \caption{Exact versions of the compared tools and how each was driven. Patches, the
 headless \code{fqlite} harness, the Python wrappers/shims, and per-tool setup recipes are
@@ -508,7 +599,7 @@ Tool & Version / commit & Driven via & Committed artifact \\
 \code{sqlite\_dissect} & 1.0.0 (DC3)            & wrapper (\code{-c -f}) & \code{run-sqlite-dissect.sh} \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{table*}
 
 \begin{table}[t]
 \centering\small
@@ -698,7 +789,13 @@ corner case---which our multi-oracle evaluation re-confirms tool by tool.
 recover free-block and freelist residue; \code{undark}~\cite{undark} dumps all
 intact records without separating live from deleted; and DC3's
 \code{sqlite\_dissect}~\cite{sqlite_dissect_dc3} parses the database together with
-its journal and WAL. On the application side, Hur \emph{et al.}~\cite{hur2020wechat}
+its journal and WAL. Several further open-source carvers emit per-record output and
+could be scored on the same corpus through our tool-agnostic harness: the Netherlands
+Forensic Institute's \code{xsqlite}~\cite{xsqlite} reconstructs records (with
+truncation metadata) from the main file and WAL; \code{SQLiteRet}~\cite{sqliteret}
+dumps intact deleted rows parsed per-column via the schema; and
+\code{WAL-parser-sqlite}~\cite{walparser} and \code{walitean}~\cite{walitean} target
+WAL residue specifically. On the application side, Hur \emph{et al.}~\cite{hur2020wechat}
 recover deleted WeChat messages from full-text-search index residue, complementary
 to the free-space and WAL recovery treated here.
 

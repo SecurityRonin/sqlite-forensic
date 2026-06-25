@@ -382,9 +382,9 @@ dependencies = [
 
 [[package]]
 name = "forensicnomicon"
-version = "0.5.7"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fd693d3295fa98087980ffcd2d1c9144cca9058c5e6c98a5dd9cceec901adc4"
+checksum = "5ac93239ea6e37ff6f00c54bd204a0a4d9c6ca5f7b0aaeb852f02a899e183830"
 
 [[package]]
 name = "generic-array"
@@ -749,14 +749,14 @@ checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
 name = "sqlite-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "forensicnomicon",
 ]
 
 [[package]]
 name = "sqlite-forensic"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "forensicnomicon",
  "sqlite-core",
@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "sqlite4n6"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "calamine",
  "clap",

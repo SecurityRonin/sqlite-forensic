@@ -764,7 +764,30 @@ wipe of the main image leaving residue only in the WAL. On \code{0F},
 \sys recovers 33 of 50 with no live false positives, where
 \code{bring2lite} reports 13 live rows as deleted; on \code{10}, the WAL-only
 scenario, both WAL-aware tools recover all 20, while the main-image-only tools
-recover none.
+recover none (Table~\ref{tab:fp}).
+
+\begin{table*}[t]
+\centering\small
+\caption{False positives across the three Choi-survey hazard scenarios on identical
+real-engine bytes (a Tier-2 replication of the published construction). ``live FP'' is
+the count of \emph{live} rows a tool reports as deleted---the hazard the survey isolates.
+\code{0B} residue recall and the \code{10} WAL case are shown for context.
+\sys and \code{fqlite} never re-surface a live row; the two freed-page carvers each
+re-surface 13 on \code{0F}.}
+\label{tab:fp}
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{@{}lrrrl@{}}
+\toprule
+Tool & \code{0F} live FP & \code{0F} precision & \code{0B} live FP & \code{10} recall \\
+\midrule
+\sys (ours)            & \textbf{0}  & \textbf{1.000} & 0   & 1.000 \\
+\code{fqlite}          & 0           & 1.000          & 0   & cited (WAL GUI-coupled) \\
+\code{bring2lite}      & \textbf{13} & 0.705          & 0   & 1.000 \\
+\code{sqlite\_dissect} & \textbf{13} & 0.764          & 0   & crashes (\code{secure\_delete} image) \\
+\code{undark}          & 1           & 0.000          & --- & 0.000 \\
+\bottomrule
+\end{tabular}
+\end{table*}
 
 \subsection*{Throughput}
 On a generated \SI{100}{\mega\byte} database with 80{,}000 deleted rows
@@ -806,14 +829,22 @@ Recovery is bounded by the conventions of \S\ref{sec:conventions}: \code{VACUUM}
 \code{secure\_delete} destroy residue, and an allocation that overwrites a freed cell
 ends its recoverability. End-to-end recall on overflow bodies is $0.333$ on \code{0E}
 because most deleted overflow payloads in the corpus were overwritten; the substrate
-recall of $1.000$ separates what survived from what did not. The evaluation is scoped
-to selected Nemetz categories and to surviving-identity substrates, and to ordinary
-rowid tables; competitor precision is measured through our own wrappers and tap, so
-a tool's phantom count reflects its emission policy under our harness, which we
-re-derived for \code{fqlite}. The false-positive scenarios are a replication of the
-Choi survey's construction on real-engine bytes rather than the authors' own files.
-The exclusion invariant covers live-row re-reads, not phantom suppression or
-schema-attribution correctness, which the measured precision reports.
+recall of $1.000$ separates what survived from what did not.
+
+\paragraph{Threats to validity.}
+\emph{Internal.} Competitor precision is measured through our own committed wrappers and
+the \code{fqlite} tap, so a tool's phantom count reflects its emission policy under our
+harness (which we re-derived for \code{fqlite}); the recall figures, by contrast, are
+scored against the published Nemetz answer key.
+\emph{External.} The evaluation is scoped to selected Nemetz categories, to
+surviving-identity substrates, and to ordinary rowid tables (\code{WITHOUT ROWID} tables
+and index b-trees are out of scope), so results may not generalize to app schemas
+dominated by those, nor to databases destroyed by \code{VACUUM}/\code{secure\_delete}.
+\emph{Construct.} The false-positive scenarios are a Tier-2 \emph{replication} of the
+Choi survey's construction on real-engine bytes, not the authors' own files, so they can
+miss quirks of the original corpus; and the exclusion invariant we verify covers live-row
+re-reads, not phantom suppression or schema-attribution correctness---which the measured
+precision, not the invariant, reports.
 
 % === §11 Conclusion ==========================================================
 \section{Conclusion}\label{sec:conclusion}

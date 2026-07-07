@@ -197,6 +197,27 @@ fn carve_auto_detects_wal_sidecar() {
     assert!(out.status.success(), "carve over a WAL db must exit 0");
 }
 
+/// The `timeline` subcommand surfaces the per-rowid version history the engine
+/// already reconstructs from the WAL commit sequence (roadmap §4.1).
+#[test]
+fn timeline_subcommand_renders_row_version_history() {
+    let out = bin()
+        .args(["timeline"])
+        .arg(data_dir().join("wal_places.db"))
+        .output()
+        .expect("run timeline");
+    assert!(
+        out.status.success(),
+        "timeline over a WAL db must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("rowid") && stdout.contains("wal_commit"),
+        "timeline must print a version-history table (rowid + wal_commit columns): {stdout}"
+    );
+}
+
 /// A stream format over a WAL db (`-f csv -o -`) drives the WAL-applied stream
 /// branch — the snapshot (LSN) column path — and emits the carved rows (with the
 /// `snapshot` header) to stdout.

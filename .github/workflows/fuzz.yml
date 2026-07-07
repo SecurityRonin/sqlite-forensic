@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [database_open, carve, audit]
+        target: [database_open, carve, audit, render]
     env:
       # cargo-fuzz builds with the host nightly; its own deps' warnings must not
       # fail the run (mirrors ci.yml's fuzz-check job).

@@ -42,7 +42,7 @@ fn reconstructs_freeblock_clobbered_rows_of_0c_01() {
     let db = Database::open(NEMETZ_0C_01.to_vec()).expect("open 0C-01");
     let page = db.raw_page(2).expect("page 2 in range");
 
-    let recovered = db.reconstruct_freeblock_records(page);
+    let recovered = db.reconstruct_freeblock_records(&page);
 
     // The expected deleted row 20005, recovered in full from the surviving
     // serial tail plus the schema-derived header prefix.

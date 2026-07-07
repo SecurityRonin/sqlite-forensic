@@ -76,6 +76,16 @@ pub enum Error {
     /// page size disagrees with the journal's. WAL and rollback-journal modes are
     /// mutually exclusive timelines and must not be overlaid.
     JournalModeConflict,
+    /// The file could not be opened or read (an I/O failure via
+    /// [`Database::open_path`], not a malformed database). Carries the
+    /// [`std::io::ErrorKind`] (show-the-unrecognized-value).
+    Io(std::io::ErrorKind),
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e.kind())
+    }
 }
 
 /// A freed overflow-page chain could not be followed to a complete, trustworthy
@@ -255,12 +265,159 @@ impl Header {
 /// evidence DBs (tens of MB). A `Read + Seek` / mmap backend is a later
 /// refinement and does not change the parsing logic proven here.
 pub struct Database {
-    bytes: Vec<u8>,
+    /// Page byte source: the whole file in memory ([`Database::open`]) or a
+    /// paged, LRU-cached file reader ([`Database::open_path`], roadmap §3.1).
+    source: ByteSource,
+    /// The 100-byte file header, kept resident so fixed-offset header-field reads
+    /// (page count, freelist count/trunk) never touch the byte source.
+    head: Box<[u8]>,
     header: Header,
     /// Read-only WAL overlay: newest committed page versions from a `-wal`
-    /// sidecar, applied without checkpointing (never mutates `bytes`).
+    /// sidecar, applied without checkpointing (never mutates the main file).
     /// `None` when opened without a WAL.
     wal: Option<WalOverlay>,
+}
+
+/// A page image handed back by the byte source: a slice borrowed from an
+/// in-memory buffer, or a reference-counted page from the paged LRU cache.
+/// Derefs to `[u8]` so callers treat it as a page slice regardless of origin.
+///
+/// A page-*handle* rather than a `with_page(|bytes| …)` closure because the walk
+/// uses `&dyn PageSource` (a generic closure method would make that trait
+/// non-object-safe) and the recursive b-tree descent cannot hold a pinning
+/// closure across its own recursion. The `Shared` variant keeps a cached page
+/// alive while held, so LRU eviction can never dangle it.
+pub enum PageBytes<'a> {
+    /// Borrowed from an in-memory buffer (the `open` / WAL-overlay path).
+    Borrowed(&'a [u8]),
+    /// Shared out of the paged LRU cache (the `open_path` path).
+    Shared(std::rc::Rc<[u8]>),
+}
+
+impl std::ops::Deref for PageBytes<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            PageBytes::Borrowed(s) => s,
+            PageBytes::Shared(r) => r,
+        }
+    }
+}
+
+/// Where a [`Database`]'s page bytes come from.
+enum ByteSource {
+    /// The whole file resident in memory.
+    Mem(Vec<u8>),
+    /// A file read page-by-page through a bounded LRU cache.
+    Paged(Paged),
+}
+
+impl ByteSource {
+    /// Total byte length of the underlying file.
+    fn len(&self) -> usize {
+        match self {
+            ByteSource::Mem(b) => b.len(),
+            ByteSource::Paged(p) => p.len,
+        }
+    }
+
+    /// The 1-based `page`'s bytes, or `None` for page 0 / out of range / an I/O
+    /// error. Bounded and panic-free.
+    fn page(&self, page: u32, page_size: usize) -> Option<PageBytes<'_>> {
+        let start = (page as usize).checked_sub(1)?.checked_mul(page_size)?;
+        let end = start.checked_add(page_size)?;
+        match self {
+            ByteSource::Mem(b) => b.get(start..end).map(PageBytes::Borrowed),
+            ByteSource::Paged(p) if end <= p.len => {
+                p.read_page(start, page_size).map(PageBytes::Shared)
+            }
+            ByteSource::Paged(_) => None,
+        }
+    }
+
+    /// The whole file as one slice when resident in memory; `None` for a paged
+    /// source (which never materializes the whole file). Used only on the
+    /// WAL-overlay path, which is in-memory by construction.
+    fn whole(&self) -> Option<&[u8]> {
+        match self {
+            ByteSource::Mem(b) => Some(b),
+            ByteSource::Paged(_) => None, // cov:unreachable: WAL overlay is in-memory only
+        }
+    }
+}
+
+/// A file read page-by-page through a small LRU cache, so resident memory stays
+/// bounded regardless of file size (roadmap §3.1).
+struct Paged {
+    file: std::cell::RefCell<std::fs::File>,
+    len: usize,
+    cache: std::cell::RefCell<PageCache>,
+}
+
+impl Paged {
+    /// Read `page_size` bytes at `start`, serving from and populating the LRU
+    /// cache. `None` on any I/O error (panic-free).
+    fn read_page(&self, start: usize, page_size: usize) -> Option<std::rc::Rc<[u8]>> {
+        use std::io::{Read, Seek, SeekFrom};
+        if let Some(hit) = self.cache.borrow_mut().get(start) {
+            return Some(hit);
+        }
+        let mut buf = vec![0u8; page_size];
+        {
+            let mut file = self.file.borrow_mut();
+            file.seek(SeekFrom::Start(start as u64)).ok()?;
+            file.read_exact(&mut buf).ok()?;
+        }
+        let rc: std::rc::Rc<[u8]> = std::rc::Rc::from(buf);
+        self.cache.borrow_mut().put(start, std::rc::Rc::clone(&rc));
+        Some(rc)
+    }
+}
+
+/// A tiny bounded LRU of page images keyed by file offset, capping resident
+/// memory to [`PageCache::CAP`] pages so a multi-GB database never loads whole.
+struct PageCache {
+    map: std::collections::HashMap<usize, std::rc::Rc<[u8]>>,
+    order: std::collections::VecDeque<usize>,
+}
+
+impl PageCache {
+    /// Maximum resident pages (`CAP` × `page_size` bytes; 256 pages is about one
+    /// megabyte at a 4-kilobyte page), so a multi-gigabyte database never loads whole.
+    const CAP: usize = 256;
+
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: usize) -> Option<std::rc::Rc<[u8]>> {
+        let hit = self.map.get(&key).map(std::rc::Rc::clone)?;
+        self.touch(key);
+        Some(hit)
+    }
+
+    fn put(&mut self, key: usize, value: std::rc::Rc<[u8]>) {
+        if self.map.insert(key, value).is_some() {
+            self.touch(key);
+        } else {
+            self.order.push_back(key);
+            if self.order.len() > Self::CAP {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.map.remove(&evicted);
+                }
+            }
+        }
+    }
+
+    fn touch(&mut self, key: usize) {
+        if let Some(pos) = self.order.iter().position(|&k| k == key) {
+            self.order.remove(pos);
+            self.order.push_back(key);
+        }
+    }
 }
 
 /// The newest committed version of each WAL page, materialized into owned bytes.
@@ -419,8 +576,46 @@ impl Database {
     /// Parse the file header and validate magic + page size. No WAL overlay.
     pub fn open(bytes: Vec<u8>) -> Result<Self, Error> {
         let header = parse_header(&bytes)?;
+        let head = header_prefix(&bytes);
         Ok(Self {
-            bytes,
+            source: ByteSource::Mem(bytes),
+            head,
+            header,
+            wal: None,
+        })
+    }
+
+    /// Open a database from a filesystem path with a **bounded-memory paged
+    /// read** (roadmap §3.1): pages are streamed on demand through a small LRU
+    /// cache instead of loading the whole file into a `Vec<u8>`, so a multi-GB
+    /// database opens without proportional RAM. Main file only — for the
+    /// WAL-applied view use [`Database::open_with_wal`] (WAL sidecars are small
+    /// and stay in memory).
+    ///
+    /// Read-only and panic-free: an unreadable file or a malformed header is a
+    /// typed [`Error`] ([`Error::Io`] carries the [`std::io::ErrorKind`]); nothing
+    /// is written back.
+    pub fn open_path<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        // Read just the header prefix to parse page size / encoding; the rest of
+        // the file is read page-by-page on demand.
+        let prefix_len = usize::try_from(len)
+            .unwrap_or(usize::MAX)
+            .min(SQLITE_HEADER_SIZE);
+        let mut head = vec![0u8; prefix_len];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut head)?;
+        let header = parse_header(&head)?;
+        let source = ByteSource::Paged(Paged {
+            file: std::cell::RefCell::new(file),
+            len: usize::try_from(len).unwrap_or(usize::MAX),
+            cache: std::cell::RefCell::new(PageCache::new()),
+        });
+        Ok(Self {
+            source,
+            head: head.into(),
             header,
             wal: None,
         })
@@ -438,8 +633,10 @@ impl Database {
     pub fn open_with_wal(bytes: Vec<u8>, wal: &[u8]) -> Result<Self, Error> {
         let header = parse_header(&bytes)?;
         let overlay = WalOverlay::parse(wal, header.page_size)?;
+        let head = header_prefix(&bytes);
         Ok(Self {
-            bytes,
+            source: ByteSource::Mem(bytes),
+            head,
             header,
             wal: overlay,
         })
@@ -538,7 +735,7 @@ impl Database {
     #[must_use]
     pub fn wal_timeline(&self) -> Option<WalTimeline> {
         let raw = self.wal.as_ref()?.raw.as_slice();
-        WalTimeline::parse(&self.bytes, raw, self.header.page_size).ok()
+        WalTimeline::parse(self.source.whole()?, raw, self.header.page_size).ok()
     }
 
     /// Parse a main database + `-wal` sidecar directly into a [`WalTimeline`],
@@ -581,20 +778,20 @@ impl Database {
     /// out-of-band truncation/extension.
     #[must_use]
     pub fn header_page_count(&self) -> u32 {
-        be_u32(&self.bytes, DB_SIZE_IN_PAGES_OFFSET)
+        be_u32(&self.head, DB_SIZE_IN_PAGES_OFFSET)
     }
 
     /// The page count implied by the raw file length (`file_len / page_size`).
     #[must_use]
     pub fn file_page_count(&self) -> u32 {
         let ps = self.header.page_size as usize;
-        u32::try_from(self.bytes.len() / ps).unwrap_or(u32::MAX)
+        u32::try_from(self.source.len() / ps).unwrap_or(u32::MAX)
     }
 
     /// The freelist page **count** recorded in the file header (offset 36).
     #[must_use]
     pub fn freelist_count(&self) -> u32 {
-        be_u32(&self.bytes, FREELIST_COUNT_OFFSET)
+        be_u32(&self.head, FREELIST_COUNT_OFFSET)
     }
 
     /// Walk the freelist trunk/leaf chain and return every free (unallocated)
@@ -638,7 +835,7 @@ impl Database {
     > {
         let mut leaves = std::collections::BTreeSet::new();
         let mut trunks = std::collections::BTreeSet::new();
-        let mut trunk = be_u32(&self.bytes, SQLITE_FREELIST_TRUNK_OFFSET);
+        let mut trunk = be_u32(&self.head, SQLITE_FREELIST_TRUNK_OFFSET);
         let total_pages = self.file_page_count();
         // Each trunk page holds at most (page_size/4 - 2) leaf pointers.
         let max_leaves = (self.header.page_size as usize / 4).saturating_sub(2);
@@ -654,6 +851,7 @@ impl Database {
                 return Err(Error::MalformedFreelist);
             }
             let slice = self.page_slice(trunk)?;
+            let slice = &*slice;
             let next = be_u32(slice, 0);
             let leaf_count = be_u32(slice, 4) as usize;
             if leaf_count > max_leaves {
@@ -721,6 +919,7 @@ impl Database {
                 return Err(ChainBreak); // cycle
             }
             let slice = self.raw_page(page).ok_or(ChainBreak)?;
+            let slice = &*slice;
             let next = be_u32(slice, 0);
             let take = left.min(per_page);
             let chunk = slice.get(4..4 + take).ok_or(ChainBreak)?;
@@ -736,14 +935,11 @@ impl Database {
     /// WAL overlay. Carving wants the on-disk page (where deleted residue lives),
     /// not the WAL-applied view. Returns `None` for page 0 or out-of-range pages.
     #[must_use]
-    pub fn raw_page(&self, page: u32) -> Option<&[u8]> {
+    pub fn raw_page(&self, page: u32) -> Option<PageBytes<'_>> {
         if page == 0 {
             return None;
         }
-        let ps = self.header.page_size as usize;
-        let start = (page as usize - 1).checked_mul(ps)?;
-        let end = start.checked_add(ps)?;
-        self.bytes.get(start..end)
+        self.source.page(page, self.header.page_size as usize)
     }
 
     /// Scan a slice of page bytes for record-shaped table-leaf cells of exactly
@@ -1710,6 +1906,7 @@ impl Database {
         let Ok(slice) = self.page_slice(page) else {
             return; // cov:unreachable: schema rootpages and their children are in range
         };
+        let slice = &*slice; // PageBytes -> &[u8]; body below is source-agnostic
         let hdr_off = if page == 1 { SQLITE_HEADER_SIZE } else { 0 };
         let Some(&page_type) = slice.get(hdr_off) else {
             return; // cov:unreachable: a full page slice always has its header byte
@@ -1749,6 +1946,7 @@ impl Database {
         let Ok(slice) = self.page_slice(page) else {
             return; // cov:unreachable: schema rootpages and their children are in range
         };
+        let slice = &*slice; // PageBytes -> &[u8]; body below is source-agnostic
         let hdr_off = if page == 1 { SQLITE_HEADER_SIZE } else { 0 };
         let Some(&page_type) = slice.get(hdr_off) else {
             return; // cov:unreachable: a full page slice always has its header byte
@@ -1804,6 +2002,7 @@ impl Database {
         let Ok(slice) = self.page_slice(page) else {
             return; // cov:unreachable: schema rootpages and their children are in range
         };
+        let slice = &*slice; // PageBytes -> &[u8]; body below is source-agnostic
         let hdr_off = if page == 1 { SQLITE_HEADER_SIZE } else { 0 };
         let Some(&page_type) = slice.get(hdr_off) else {
             return; // cov:unreachable: a full page slice always has its header byte
@@ -1850,20 +2049,17 @@ impl Database {
     /// page, the overlaid bytes are returned in preference to the main file —
     /// this is what makes a table walk see the WAL-applied view. The main file
     /// is never mutated.
-    fn page_slice(&self, page: u32) -> Result<&[u8], Error> {
+    fn page_slice(&self, page: u32) -> Result<PageBytes<'_>, Error> {
         if page == 0 {
             return Err(Error::PageOutOfRange(0));
         }
         if let Some(wal) = &self.wal {
             if let Some(overlaid) = wal.pages.get(&page) {
-                return Ok(overlaid.as_slice());
+                return Ok(PageBytes::Borrowed(overlaid.as_slice()));
             }
         }
-        let ps = self.header.page_size as usize;
-        let start = (page as usize - 1) * ps;
-        let end = start.checked_add(ps).ok_or(Error::PageOutOfRange(page))?;
-        self.bytes
-            .get(start..end)
+        self.source
+            .page(page, self.header.page_size as usize)
             .ok_or(Error::PageOutOfRange(page))
     }
 }
@@ -1878,7 +2074,7 @@ impl Database {
 /// `SQLITE_HEADER_SIZE` for page 1, 0 otherwise).
 trait PageSource {
     /// The 1-based `page`'s full image, or `None` for page 0 / out of range.
-    fn page(&self, page: u32) -> Option<&[u8]>;
+    fn page(&self, page: u32) -> Option<PageBytes<'_>>;
     /// Usable bytes per page (`page_size` − reserved-space), for the overflow and
     /// local-payload computations.
     fn usable(&self) -> usize;
@@ -1889,7 +2085,7 @@ trait PageSource {
 }
 
 impl PageSource for Database {
-    fn page(&self, page: u32) -> Option<&[u8]> {
+    fn page(&self, page: u32) -> Option<PageBytes<'_>> {
         self.page_slice(page).ok()
     }
     fn usable(&self) -> usize {
@@ -1904,8 +2100,10 @@ impl PageSource for Database {
 }
 
 impl PageSource for CommitSnapshot {
-    fn page(&self, page: u32) -> Option<&[u8]> {
-        self.overlaid.get(&page).map(Vec::as_slice)
+    fn page(&self, page: u32) -> Option<PageBytes<'_>> {
+        self.overlaid
+            .get(&page)
+            .map(|v| PageBytes::Borrowed(v.as_slice()))
     }
     fn usable(&self) -> usize {
         self.usable as usize
@@ -1988,6 +2186,7 @@ fn walk_table_page(
         return Ok(());
     }
     let slice = src.page(page).ok_or(Error::PageOutOfRange(page))?;
+    let slice = &*slice;
 
     // Page 1 carries the 100-byte file header before its b-tree header.
     let hdr_off = if page == 1 { SQLITE_HEADER_SIZE } else { 0 };
@@ -2103,6 +2302,7 @@ fn read_overflow_chain(
             return Err(Error::MalformedOverflow);
         }
         let slice = src.page(page).ok_or(Error::PageOutOfRange(page))?;
+        let slice = &*slice;
         let next = be_u32(slice, 0);
         let take = remaining.min(per_page);
         let chunk = slice.get(4..4 + take).ok_or(Error::TruncatedCell)?;
@@ -4073,6 +4273,13 @@ fn salvage_local_prefix(
 }
 
 /// Parse + validate the 100-byte file header.
+/// The first up-to-100 bytes (the SQLite header region), kept resident so
+/// fixed-offset header-field reads never touch the byte source.
+fn header_prefix(bytes: &[u8]) -> Box<[u8]> {
+    let n = bytes.len().min(SQLITE_HEADER_SIZE);
+    bytes[..n].into()
+}
+
 fn parse_header(bytes: &[u8]) -> Result<Header, Error> {
     let head = bytes.get(..SQLITE_HEADER_SIZE).ok_or(Error::TooShort)?;
     if !head.starts_with(SQLITE_MAGIC) {
@@ -4574,8 +4781,10 @@ pub struct PriorSnapshot {
 }
 
 impl PageSource for PriorSnapshot {
-    fn page(&self, page: u32) -> Option<&[u8]> {
-        self.overlaid.get(&page).map(Vec::as_slice)
+    fn page(&self, page: u32) -> Option<PageBytes<'_>> {
+        self.overlaid
+            .get(&page)
+            .map(|v| PageBytes::Borrowed(v.as_slice()))
     }
     fn usable(&self) -> usize {
         self.usable as usize
@@ -4716,6 +4925,7 @@ fn walk_table_page_with_leaf(
         return Ok(());
     }
     let slice = src.page(page).ok_or(Error::PageOutOfRange(page))?;
+    let slice = &*slice;
     let hdr_off = if page == 1 { SQLITE_HEADER_SIZE } else { 0 };
     let page_type = *slice.get(hdr_off).ok_or(Error::TruncatedCell)?;
     let cell_count = be_u16(slice, hdr_off + 3) as usize;
@@ -4757,6 +4967,29 @@ fn be_u32(buf: &[u8], off: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn page_rc(byte: u8) -> std::rc::Rc<[u8]> {
+        std::rc::Rc::from(vec![byte].into_boxed_slice())
+    }
+
+    #[test]
+    fn page_cache_hits_reorders_and_evicts_past_cap() {
+        let mut cache = PageCache::new();
+        // Fill exactly to CAP, then one more → the oldest (key 0) is evicted.
+        for i in 0..=PageCache::CAP {
+            cache.put(i, page_rc(i as u8));
+        }
+        assert!(cache.get(0).is_none(), "oldest entry evicted once past CAP");
+        assert!(
+            cache.get(PageCache::CAP).is_some(),
+            "the newest entry is retained (get-hit + touch)"
+        );
+        // Re-put an existing key → the already-present branch (touch, no growth).
+        let before = cache.order.len();
+        cache.put(PageCache::CAP, page_rc(0xff));
+        assert_eq!(cache.order.len(), before, "re-put must not grow the order");
+        assert_eq!(cache.get(PageCache::CAP).as_deref(), Some(&[0xff][..]));
+    }
 
     #[test]
     fn varint_single_byte() {
@@ -4864,7 +5097,7 @@ mod tests {
         // Page 8 is an allocated leaf (live ids 181..=200) whose free gap holds
         // deleted-row residue including rowid 237.
         let page = db.raw_page(8).unwrap();
-        let carved = db.carve_free_regions(page, 6);
+        let carved = db.carve_free_regions(&page, 6);
         assert!(carved.iter().any(|c| c.rowid == 237));
         // 0-FP: never a live (id<=200) rowid.
         assert!(carved.iter().all(|c| c.rowid > 200));
@@ -4881,13 +5114,13 @@ mod tests {
         // decodes every cell the page records as allocated, so the live ids appear
         // (unlike carve_free_regions, which excludes them).
         let page = db.raw_page(8).unwrap();
-        let cells = db.carve_leaf_cells(page);
+        let cells = db.carve_leaf_cells(&page);
         assert!(
             cells.iter().any(|c| c.rowid == 181),
             "must read the allocated cells of the leaf"
         );
         // Page 1 is passed whole (starts with the file magic) → header read at 100.
-        let _ = db.carve_leaf_cells(db.raw_page(1).unwrap());
+        let _ = db.carve_leaf_cells(&db.raw_page(1).unwrap());
         // A non-leaf page (interior 0x05) and an empty/too-short slice yield nothing
         // (no panic) — the same defensive arms carve_free_regions guards.
         assert!(db.carve_leaf_cells(&[0x05u8; 4096]).is_empty());
@@ -4900,10 +5133,10 @@ mod tests {
         // Page 1 is passed whole (starts with the file magic) -> the b-tree header
         // is read at offset 100, exercising the page-1 branch.
         let page1 = db.raw_page(1).unwrap();
-        let _ = db.carve_free_regions(page1, 6);
+        let _ = db.carve_free_regions(&page1, 6);
         // With column_count_hint = 0, the inferred path runs over the free regions.
         let page8 = db.raw_page(8).unwrap();
-        let inferred = db.carve_free_regions(page8, 0);
+        let inferred = db.carve_free_regions(&page8, 0);
         assert!(inferred.iter().any(|c| c.rowid == 237));
     }
 
@@ -4931,8 +5164,8 @@ mod tests {
         // A freed leaf page body carves the same rows whether the column count is
         // fixed at 6 or inferred.
         let page = db.raw_page(10).unwrap();
-        let fixed = db.carve_cells(page, 6);
-        let inferred = db.carve_cells_inferred(page);
+        let fixed = db.carve_cells(&page, 6);
+        let inferred = db.carve_cells_inferred(&page);
         assert!(!fixed.is_empty());
         let fixed_ids: std::collections::BTreeSet<i64> = fixed.iter().map(|c| c.rowid).collect();
         let inf_ids: std::collections::BTreeSet<i64> = inferred.iter().map(|c| c.rowid).collect();
@@ -5108,7 +5341,7 @@ mod tests {
     fn reconstruct_freeblock_records_recovers_clobbered_rows() {
         let db = Database::open(NEMETZ_0C_01.to_vec()).unwrap();
         let page = db.raw_page(2).unwrap();
-        let recovered = db.reconstruct_freeblock_records(page);
+        let recovered = db.reconstruct_freeblock_records(&page);
         // Row 20005 is a freeblock-head cell only reconstruction can recover.
         assert!(recovered.iter().any(|c| c.values
             == vec![
@@ -5135,7 +5368,7 @@ mod tests {
     fn reconstruct_freeblock_records_walks_coalesced_cells() {
         let db = Database::open(NEMETZ_0D_07.to_vec()).unwrap();
         let page = db.raw_page(3).unwrap();
-        let recovered = db.reconstruct_freeblock_records(page);
+        let recovered = db.reconstruct_freeblock_records(&page);
         let has = |name: &str, surname: &str| {
             recovered.iter().any(|c| {
                 matches!(c.values.get(1), Some(Value::Text(t)) if t == name)
@@ -5385,7 +5618,7 @@ mod tests {
     fn fragment_salvage_recovers_anja_on_0d01() {
         let db = Database::open(NEMETZ_0D_01.to_vec()).unwrap();
         let page = db.raw_page(2).unwrap();
-        let frags = db.reconstruct_freeblock_fragments(page);
+        let frags = db.reconstruct_freeblock_fragments(&page);
         let f = frags
             .iter()
             .find(|f| {
@@ -5399,7 +5632,7 @@ mod tests {
             .iter()
             .any(|(_, v)| matches!(v, Value::Text(t) if t == "Frank")));
         assert!((f.confidence - 0.2).abs() < f32::EPSILON);
-        let cells = db.reconstruct_freeblock_records(page);
+        let cells = db.reconstruct_freeblock_records(&page);
         assert!(cells.iter().all(|c| !c
             .values
             .iter()
@@ -5818,7 +6051,7 @@ mod tests {
     fn clobbered_spilled_cell_reconstructs_with_unknown_rowid() {
         let db = Database::open(synth_clobbered_spill_db(false)).unwrap();
         let page2 = db.raw_page(2).unwrap();
-        let recovered = db.carve_overflow_template_records(page2);
+        let recovered = db.carve_overflow_template_records(&page2);
         let (cell, chain) = recovered
             .iter()
             .find(|(c, _)| matches!(c.values.get(1), Some(Value::Text(t)) if t == "Zoe"))
@@ -5835,7 +6068,7 @@ mod tests {
         // Chain pointer routed at the freelist TRUNK (page 3) -> rejected.
         let db = Database::open(synth_clobbered_spill_db(true)).unwrap();
         let page2 = db.raw_page(2).unwrap();
-        let recovered = db.carve_overflow_template_records(page2);
+        let recovered = db.carve_overflow_template_records(&page2);
         // A chain routed through the freelist trunk is rejected outright, so the
         // template carve recovers no full row at all (not merely no "Zoe" row).
         assert!(
@@ -5915,7 +6148,7 @@ mod tests {
     fn carve_overflow_records_resolves_gap_spill() {
         let db = Database::open(synth_gap_spill_db(false, 4200, "Nora")).unwrap();
         let page2 = db.raw_page(2).unwrap();
-        let recovered = db.carve_overflow_records(page2);
+        let recovered = db.carve_overflow_records(&page2);
         let (cell, chain) = recovered
             .iter()
             .find(|(c, _)| matches!(c.values.get(1), Some(Value::Text(t)) if t == "Nora"))
@@ -5935,7 +6168,7 @@ mod tests {
         let db = Database::open(synth_gap_spill_db(true, 4200, "Nora")).unwrap();
         let page2 = db.raw_page(2).unwrap();
         // Chain routed at the trunk -> no full row recovered at all.
-        let recovered = db.carve_overflow_records(page2);
+        let recovered = db.carve_overflow_records(&page2);
         assert!(
             recovered.is_empty(),
             "a trunk-routed chain must yield no full overflow row, got {} rows",
@@ -5995,7 +6228,7 @@ mod tests {
         let page2 = db.raw_page(2).unwrap();
         // Decodes mechanically (the leaf assembles exactly), but the strict-UTF-8
         // gate rejects it -> NOT a Tier-1 full row.
-        assert!(db.carve_overflow_records(page2).is_empty());
+        assert!(db.carve_overflow_records(&page2).is_empty());
     }
 
     #[test]
@@ -6003,7 +6236,7 @@ mod tests {
         // Broken chain (trunk) -> the local prefix (id + name) salvages as a fragment.
         let db = Database::open(synth_gap_spill_db(true, 4200, "Nora")).unwrap();
         let page2 = db.raw_page(2).unwrap();
-        let frags = db.carve_overflow_fragments(page2);
+        let frags = db.carve_overflow_fragments(&page2);
         let f = frags
             .iter()
             .find(|f| {
@@ -6023,7 +6256,7 @@ mod tests {
         let ok = Database::open(synth_gap_spill_db(false, 4200, "Nora")).unwrap();
         let ok_page = ok.raw_page(2).unwrap();
         assert!(
-            ok.carve_overflow_fragments(ok_page).is_empty(),
+            ok.carve_overflow_fragments(&ok_page).is_empty(),
             "an intact chain yields a full row, not a fragment"
         );
         // Non-leaf / empty inputs yield nothing.

@@ -45,3 +45,22 @@ fn open_path_reads_identical_pages_to_open() {
     assert!(paged.raw_page(0).is_none());
     assert!(paged.raw_page(mem.page_count() + 1).is_none());
 }
+
+#[test]
+fn open_path_errors_loudly_on_a_missing_file() {
+    let is_io = matches!(
+        Database::open_path("/no/such/path/definitely-absent.db"),
+        Err(sqlite_core::Error::Io(_))
+    );
+    assert!(is_io, "a missing file must surface as Error::Io");
+}
+
+#[test]
+fn open_path_serves_repeated_page_reads_from_cache() {
+    let db = Database::open_path(fixture()).expect("paged open");
+    // Reading the same page twice: the first read populates the cache, the second
+    // is served from it — both must return identical bytes.
+    let first = db.raw_page(2).expect("page 2").to_vec();
+    let second = db.raw_page(2).expect("page 2 again").to_vec();
+    assert_eq!(first, second);
+}

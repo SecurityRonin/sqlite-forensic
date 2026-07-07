@@ -35,6 +35,18 @@ fn nonzero_reserved_space_is_flagged() {
 }
 
 #[test]
+fn nonzero_reserved_space_note_states_recovery_needs_the_key() {
+    // roadmap §2.3: an encrypted/checksum-VFS database's reserved-space finding
+    // must tell the examiner that deleted-record recovery needs the key/VFS, not
+    // just that reserved space is non-standard.
+    let note = AnomalyKind::NonZeroReservedSpace { reserved: 32 }.note();
+    assert!(
+        note.to_lowercase().contains("key"),
+        "reserved-space note must state recovery needs the encryption key: {note}"
+    );
+}
+
+#[test]
 fn nonzero_reserved_space_finding_carries_raw_evidence() {
     // roadmap §2.2: an "unknown/anomalous" finding must surface the offending
     // value AND where it was found, never report the anomaly with no evidence.

@@ -743,7 +743,7 @@ pub fn carve_deleted_records(db: &Database, column_count: usize) -> Vec<CarvedRe
         let Some(page_bytes) = db.raw_page(page) else {
             continue; // cov:unreachable: freelist_pages only yields in-range pages
         };
-        for cell in db.carve_cells(page_bytes, column_count) {
+        for cell in db.carve_cells(&page_bytes, column_count) {
             out.push(CarvedRecord {
                 page,
                 offset: cell.offset,
@@ -813,7 +813,7 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
             } else {
                 RecoverySource::FreelistPage
             };
-            for cell in db.carve_cells_inferred(page_bytes) {
+            for cell in db.carve_cells_inferred(&page_bytes) {
                 out.push(CarvedRecord {
                     page,
                     offset: cell.offset,
@@ -835,7 +835,7 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
         let Some(page_bytes) = db.raw_page(page) else {
             continue; // cov:unreachable: 1..=page_count is in range
         };
-        for cell in db.carve_free_regions(page_bytes, 0) {
+        for cell in db.carve_free_regions(&page_bytes, 0) {
             out.push(CarvedRecord {
                 page,
                 offset: cell.offset,
@@ -853,7 +853,7 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
         // serial tail plus the page's schema template. These carry an unknown
         // (destroyed) rowid, so the value-collision pass below — not the
         // rowid-keyed filter — is what guarantees no live row is re-surfaced.
-        for cell in db.reconstruct_freeblock_records(page_bytes) {
+        for cell in db.reconstruct_freeblock_records(&page_bytes) {
             out.push(CarvedRecord {
                 page,
                 offset: cell.offset,
@@ -872,7 +872,7 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
         // full-row tier (NOT part of the structural 0-FP guarantee — Codex
         // ruling #1); a broken chain (e.g. a trunk-clobbered page) is rejected
         // here and degrades to a Tier-2 fragment elsewhere.
-        for (cell, chain) in db.carve_overflow_records(page_bytes) {
+        for (cell, chain) in db.carve_overflow_records(&page_bytes) {
             let first_page = chain.first().copied().unwrap_or(0);
             out.push(CarvedRecord {
                 page,
@@ -890,7 +890,7 @@ pub fn carve_all_deleted_records(db: &Database) -> Vec<CarvedRecord> {
         // UNPROVEN-BY-CORPUS — synthetic validation only). A spilled cell whose
         // prefix was also freeblock-clobbered: P re-derived from the surviving
         // serial array, chain resolved through freelist leaves, rowid destroyed.
-        for (cell, chain) in db.carve_overflow_template_records(page_bytes) {
+        for (cell, chain) in db.carve_overflow_template_records(&page_bytes) {
             let first_page = chain.first().copied().unwrap_or(0);
             out.push(CarvedRecord {
                 page,
@@ -1151,7 +1151,7 @@ pub fn carve_with_fragments(db: &Database) -> CarveTiers {
         let Some(page_bytes) = db.raw_page(page) else {
             continue; // cov:unreachable: 1..=page_count is in range
         };
-        for frag in db.reconstruct_freeblock_fragments(page_bytes) {
+        for frag in db.reconstruct_freeblock_fragments(&page_bytes) {
             fragments.push(CarvedFragment {
                 page,
                 offset: frag.offset,
@@ -1167,7 +1167,7 @@ pub fn carve_with_fragments(db: &Database) -> CarveTiers {
         // page) still has an intact local prefix; salvage its locally-decodable
         // columns. The chain-resident columns are lost (untrusted), so this is a
         // Tier-2 lead, never a full row.
-        for frag in db.carve_overflow_fragments(page_bytes) {
+        for frag in db.carve_overflow_fragments(&page_bytes) {
             fragments.push(CarvedFragment {
                 page,
                 offset: frag.offset,
@@ -1703,7 +1703,7 @@ pub fn audit_journal(db: &Database, journal: &[u8]) -> Vec<Anomaly> {
             .iter()
             .find(|i| i.pgno == 1)
             .and_then(|i| schema_cookie(&i.bytes)),
-        db.raw_page(1).and_then(schema_cookie),
+        db.raw_page(1).as_deref().and_then(schema_cookie),
     ) {
         if journal_cookie != db_cookie {
             out.push(Anomaly::new(AnomalyKind::JournalSchemaChange {

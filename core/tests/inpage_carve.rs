@@ -33,7 +33,7 @@ fn carves_free_gap_on_allocated_leaf_page() {
     let page = db.raw_page(8).expect("page 8 in range");
 
     // Carve only the unallocated regions of this allocated leaf page.
-    let carved = db.carve_free_regions(page, 6);
+    let carved = db.carve_free_regions(&page, 6);
 
     let rowids: Vec<i64> = carved.iter().map(|c| c.rowid).collect();
     assert!(

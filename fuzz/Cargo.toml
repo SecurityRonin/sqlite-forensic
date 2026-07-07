@@ -21,6 +21,9 @@ path = "../core"
 [dependencies.sqlite-forensic]
 path = "../forensic"
 
+[dependencies.sqlite4n6]
+path = "../cli"
+
 [[bin]]
 name = "database_open"
 path = "fuzz_targets/database_open.rs"
@@ -38,6 +41,13 @@ bench = false
 [[bin]]
 name = "audit"
 path = "fuzz_targets/audit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "render"
+path = "fuzz_targets/render.rs"
 test = false
 doc = false
 bench = false

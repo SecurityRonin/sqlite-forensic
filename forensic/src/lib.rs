@@ -205,7 +205,8 @@ impl AnomalyKind {
             AnomalyKind::NonZeroReservedSpace { reserved } => format!(
                 "file header reserves {reserved} byte(s) per page — non-standard; \
                  consistent with a page-level extension such as encryption \
-                 (SQLCipher/SEE) or a checksum VFS"
+                 (SQLCipher/SEE) or a checksum VFS. Recovering any deleted records \
+                 would require the encryption key or the checksum VFS"
             ),
             AnomalyKind::DeletedRecordRecovered {
                 page,

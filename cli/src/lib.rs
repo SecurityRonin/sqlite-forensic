@@ -1505,6 +1505,40 @@ pub fn view_state_token(state: sqlite_core::row_history::ViewState) -> &'static 
     }
 }
 
+/// Render per-rowid version histories as a tab-separated table (roadmap §4.1): one
+/// line per row version, columns `table / rowid / wal_commit / view_state / values`.
+/// Surfaces the WAL commit-history reconstruction the engine already computes
+/// ([`Database::row_histories`](sqlite_core::Database::row_histories)) on the CLI.
+#[must_use]
+pub fn render_timeline(histories: &[sqlite_core::row_history::TableHistory]) -> Vec<String> {
+    use sqlite_core::row_history::VersionOrigin;
+    let mut out = vec!["table\trowid\twal_commit\tview_state\tvalues".to_string()];
+    for history in histories {
+        for v in &history.versions {
+            let rowid = v.rowid.map_or_else(|| "-".to_string(), |r| r.to_string());
+            let wal_commit = match &v.origin {
+                VersionOrigin::Live => "live".to_string(),
+                VersionOrigin::CarvedResidue => "residue".to_string(),
+                VersionOrigin::Commit(_) => v
+                    .commit_seq
+                    .map_or_else(|| "commit".to_string(), |s| format!("commit#{s}")),
+            };
+            let values = v
+                .values
+                .iter()
+                .map(value_to_cell)
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!(
+                "{}\t{rowid}\t{wal_commit}\t{}\t{values}",
+                history.table,
+                view_state_token(v.view_state),
+            ));
+        }
+    }
+    out
+}
+
 /// Render a [`VersionOrigin`](sqlite_core::row_history::VersionOrigin) as the
 /// `wal_commit` column token, resolving a [`Commit`](sqlite_core::row_history::VersionOrigin::Commit)
 /// to `commit:(salt1,salt2,frame_index)` from its `lsn` (the salt-qualified
@@ -4343,6 +4377,73 @@ mod tests {
             Value::Text("WITHOUT ROWID — not version-tracked".to_string()),
             "annotation note in the first cell"
         );
+    }
+
+    #[test]
+    fn render_timeline_covers_commit_live_and_residue_origins() {
+        let vals = || vec![Value::Integer(7), Value::Text("v".into())];
+        let hist = TableHistory {
+            table: "t".to_string(),
+            columns: vec!["id".to_string(), "v".to_string()],
+            without_rowid: false,
+            versions: vec![
+                // Commit with a logical seq → `commit#0`.
+                version(
+                    Some(1),
+                    vals(),
+                    VersionOrigin::Commit(sample_commit_id()),
+                    Some(0),
+                    ViewState::ValueChangedLater,
+                    false,
+                    false,
+                    false,
+                    false,
+                ),
+                // Commit with no seq → `commit`.
+                version(
+                    Some(1),
+                    vals(),
+                    VersionOrigin::Commit(sample_commit_id()),
+                    None,
+                    ViewState::PresentInFinalView,
+                    false,
+                    false,
+                    false,
+                    false,
+                ),
+                // Live view → `live`.
+                version(
+                    Some(1),
+                    vals(),
+                    VersionOrigin::Live,
+                    None,
+                    ViewState::PresentInFinalView,
+                    false,
+                    false,
+                    false,
+                    false,
+                ),
+                // Carved residue, rowid destroyed → `residue`, rowid `-`.
+                version(
+                    None,
+                    vals(),
+                    VersionOrigin::CarvedResidue,
+                    None,
+                    ViewState::CarvedResidue,
+                    false,
+                    false,
+                    false,
+                    false,
+                ),
+            ],
+        };
+        let lines = render_timeline(&[hist]);
+        assert_eq!(lines[0], "table\trowid\twal_commit\tview_state\tvalues");
+        assert!(lines.iter().any(|l| l.contains("\tcommit#0\t")));
+        assert!(lines.iter().any(|l| l.contains("\tcommit\t")));
+        assert!(lines.iter().any(|l| l.contains("\tlive\t")));
+        assert!(lines.iter().any(|l| l.contains("\tresidue\t")));
+        assert!(lines.iter().any(|l| l.starts_with("t\t-\t")));
     }
 
     #[test]

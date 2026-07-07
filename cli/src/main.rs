@@ -23,8 +23,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use sqlite4n6::{
     carve_output_dest, carve_wal_snapshots, combined_xlsx_bytes, count_blob_cells,
     filter_by_confidence, group_attributed_tables, journal_carved_records, render_audit,
-    render_carve, render_carve_tiered, render_carve_with_snapshot, render_fragments, MinConfidence,
-    OutputDest, OutputFormat, EXCEL_MAX_ROWS,
+    render_carve, render_carve_tiered, render_carve_with_snapshot, render_fragments,
+    render_timeline, MinConfidence, OutputDest, OutputFormat, EXCEL_MAX_ROWS,
 };
 use sqlite_core::rebuild::build_recovered_db_tables;
 use sqlite_core::Database;
@@ -137,6 +137,17 @@ enum Commands {
     Carve(CarveArgs),
     /// Grade forensically-notable anomalies into severity-ranked findings.
     Audit(AuditArgs),
+    /// Reconstruct per-rowid version history from the WAL commit sequence.
+    Timeline(TimelineArgs),
+}
+
+/// `timeline` subcommand: per-rowid version history over the WAL commit sequence.
+#[derive(Parser, Debug)]
+struct TimelineArgs {
+    /// Path to the SQLite database file (opened read-only). A conventional
+    /// `<db>-wal` sidecar is applied automatically when present.
+    #[arg(value_name = "DB")]
+    db: PathBuf,
 }
 
 // Each bool is an independent CLI toggle (`--no-wal`, `--no-fragments`,
@@ -264,6 +275,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Commands::Carve(args) => run_carve(&args),
         Commands::Audit(args) => run_audit(&args),
+        Commands::Timeline(args) => run_timeline(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -811,11 +823,37 @@ fn run_audit(args: &AuditArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn run_timeline(args: &TimelineArgs) -> Result<(), String> {
+    let db = open_db_with_wal(&args.db)?;
+    for line in render_timeline(&db.row_histories()) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Open a database, applying a conventional `<db>-wal` sidecar when it exists so
+/// the version history sees the WAL commit sequence. Read-only; neither file is
+/// mutated (the WAL overlay is applied without checkpointing).
+fn open_db_with_wal(db_path: &Path) -> Result<Database, String> {
+    let mut wal_os = db_path.as_os_str().to_owned();
+    wal_os.push("-wal");
+    let wal_path = PathBuf::from(wal_os);
+    if !wal_path.exists() {
+        return open_db(db_path); // no sidecar: the plain (already-covered) open
+    }
+    let bytes = std::fs::read(db_path)
+        .map_err(|e| format!("cannot read database {}: {e}", db_path.display()))?;
+    let wal = std::fs::read(&wal_path)
+        .map_err(|e| format!("cannot read WAL {}: {e}", wal_path.display()))?;
+    Database::open_with_wal(bytes, &wal)
+        .map_err(|e| format!("cannot parse database {}: {e:?}", db_path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_journal_for, open_db, recover_journal, resolve_journal_path, AuditArgs, CarveArgs,
-        CarvedFragment, Cli, Commands, FormatArg, OutputFormat,
+        audit_journal_for, open_db, recover_journal, resolve_journal_path, run_timeline, AuditArgs,
+        CarveArgs, CarvedFragment, Cli, Commands, FormatArg, OutputFormat, TimelineArgs,
     };
     use clap::Parser;
     use sqlite_core::Value;
@@ -835,17 +873,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn timeline_subcommand_parses_its_db_arg() {
+        let cli = Cli::try_parse_from(["sqlite4n6", "timeline", "x.db"]).expect("argv must parse");
+        match cli.command {
+            Commands::Timeline(a) => assert!(a.db.ends_with("x.db")),
+            _ => panic!("expected a timeline command"),
+        }
+    }
+
+    #[test]
+    fn run_timeline_handles_wal_and_plain_dbs() {
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/data");
+        // WAL branch: the `<db>-wal` sidecar is auto-detected and applied.
+        run_timeline(&TimelineArgs {
+            db: data.join("wal_places.db"),
+        })
+        .expect("timeline over a WAL db");
+        // Non-WAL branch: falls back to a plain read-only open.
+        run_timeline(&TimelineArgs {
+            db: data.join("places.db"),
+        })
+        .expect("timeline over a plain db");
+    }
+
+    #[test]
+    fn open_db_with_wal_surfaces_io_and_parse_errors() {
+        use super::open_db_with_wal;
+        let dir = std::env::temp_dir().join(format!("s4n6_owdw_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // (a) the `-wal` sidecar exists but the database is absent → read-db error.
+        std::fs::write(dir.join("a.db-wal"), b"walbytes").unwrap();
+        assert!(open_db_with_wal(&dir.join("a.db")).is_err());
+
+        // (b) database present but malformed, `-wal` present → open_with_wal parse error.
+        std::fs::write(dir.join("b.db"), b"not a sqlite header").unwrap();
+        std::fs::write(dir.join("b.db-wal"), b"walbytes").unwrap();
+        assert!(open_db_with_wal(&dir.join("b.db")).is_err());
+
+        // (c) database present, `<db>-wal` exists but is a DIRECTORY → read-wal error.
+        std::fs::write(dir.join("c.db"), b"SQLite format 3\0").unwrap();
+        std::fs::create_dir_all(dir.join("c.db-wal")).unwrap();
+        assert!(open_db_with_wal(&dir.join("c.db")).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn carve_args(argv: &[&str]) -> CarveArgs {
         match Cli::try_parse_from(argv).expect("argv must parse").command {
             Commands::Carve(a) => a,
-            Commands::Audit(_) => panic!("expected a carve command"),
+            _ => panic!("expected a carve command"),
         }
     }
 
     fn audit_args(argv: &[&str]) -> AuditArgs {
         match Cli::try_parse_from(argv).expect("argv must parse").command {
             Commands::Audit(a) => a,
-            Commands::Carve(_) => panic!("expected an audit command"),
+            _ => panic!("expected an audit command"),
         }
     }
 

@@ -23,6 +23,7 @@ workspace tests). The completed items are **not** repeated here; git is the arch
 | §2.2 | Anomaly `evidence()` — reserved-space, duplicate-page, hot-journal now carry the value | `96e2f48`→`5fbd60a` |
 | §4.1 | MSRV split — libs `1.80` (CI-verified), CLI `1.96` | `3423bf2` |
 | §3.1 | Bounded-memory paged read (`Database::open_path` + LRU) | `0aef805`→`6e7c84a` |
+| §4.1 | `timeline` subcommand — per-rowid version history over the WAL commit sequence | RED→GREEN this branch |
 
 Everything below is the **remaining P1/P2 backlog**, unchanged.
 
@@ -86,12 +87,6 @@ reach. Caveat (not casual): it needs an isolated boundary crate because the work
 ---
 
 ## 4. Forensic workflow & output
-
-### 4.1 `timeline` subcommand — **P1, M, verified (partial)**
-`core/src/row_history.rs` reconstructs per-rowid version histories across WAL snapshots, and the
-default workbook already renders version-history sheets. The CLI exposes only `Carve`/`Audit`. A
-dedicated `timeline` command (value history for a rowid/table across commit generations, including
-deletion) is useful but not foundational.
 
 ### 4.2 Surface delete+reinsert with identical values — **P1, S, verified (design choice)**
 `row_history.rs:177-180` deliberately collapses a same-value-across-a-gap run ("still the same

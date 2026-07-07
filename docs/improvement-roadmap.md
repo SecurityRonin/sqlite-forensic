@@ -47,22 +47,29 @@ The highest-leverage work is therefore not "more recovery features." It is, in o
 
 ---
 
-## Priority shortlist (do next)
+## Priority shortlist
 
-| # | Item | Why | Effort | Evidence |
+**Status (as of this branch): items 1–5 SHIPPED and merged to `main`; item 6 (§3.1) in
+progress.** Each shipped item landed as strict-TDD RED→GREEN commits with the full gate
+green (100% function coverage, `clippy -D warnings`, rustdoc, workspace tests).
+
+| # | Item | Why | Effort | Status |
 |---|------|-----|:--:|---|
-| 1 | Table-scope live-row identity (close the exclusion-invariant hole) | Core guarantee can break on multi-table field data | M | verified §1.1 |
-| 2 | Add table/source to the dedup key | Distinct deleted rows are being dropped | S | verified §1.2 |
-| 3 | Add raw `evidence()` to anomalies that return none | Violates the tool's own show-the-value rule | S | verified §2.2 |
-| 4 | Reconcile stale comments + paper MSRV claim with the code | Evidence integrity | S | verified §2.1 |
-| 5 | Split MSRV: low floor for the two libs, pin for the CLI | Fleet policy; widens library audience | S | verified §4.1 |
-| 6 | Bounded-memory / streaming read path for multi-GB DBs | Real-world scale ceiling | L | verified §3.1 |
+| 1 | Table-scope live-row identity (close the exclusion-invariant hole) | Core guarantee can break on multi-table field data | M | ✅ shipped §1.1 |
+| 2 | Add table/source to the dedup key | Distinct deleted rows are being dropped | S | ✅ shipped §1.2 |
+| 3 | Add raw `evidence()` to anomalies that return none | Violates the tool's own show-the-value rule | S | ✅ shipped §2.2 |
+| 4 | Reconcile stale comments + paper MSRV claim with the code | Evidence integrity | S | ✅ shipped §2.1 |
+| 5 | Split MSRV: low floor for the two libs, pin for the CLI | Fleet policy; widens library audience | S | ✅ shipped §4.1 |
+| 6 | Bounded-memory / streaming read path for multi-GB DBs | Real-world scale ceiling | L | 🚧 in progress §3.1 |
+
+Everything **below** this shortlist (§1.3–1.4, §3.2–3.4, §4.2–4.3, §5.\*, §6) remains
+**open** — the P1/P2 backlog, unchanged.
 
 ---
 
 ## 1. Row/table identity correctness (the headline)
 
-### 1.1 Live-row identity is keyed by global `rowid`, not `(table, rowid)` — **P0, M, verified**
+### 1.1 Live-row identity is keyed by global `rowid`, not `(table, rowid)` — **P0, M, ✅ SHIPPED**
 `Database::live_rows()` accumulates every user table's rows into one
 `BTreeMap<i64, Vec<Value>>` keyed by `rowid` (`core/src/lib.rs:1338-1357`); `collect_rows`
 shares that map across tables (`core/src/lib.rs:1734`). Because rowid is the only key, two
@@ -90,7 +97,7 @@ the overwritten table's live values are not in it, and it only guards `Freeblock
   is complete for every source. Add a regression fixture with two tables sharing rowids, one
   row surfaced as carvable live residue — the test that is currently missing.
 
-### 1.2 Dedup key omits table/source/page — **P0, S, verified**
+### 1.2 Dedup key omits table/source/page — **P0, S, ✅ SHIPPED**
 Both dedup passes key on `(rowid, values)` only:
 ```rust
 // forensic/src/lib.rs:1278   and   cli/src/lib.rs:316-318
@@ -115,7 +122,7 @@ columns survive there when table-leaf residue is gone).
 
 ## 2. Truth-in-evidence cleanup
 
-### 2.1 Stale capability claims in code, paper, and comments — **P0/P1, S, verified**
+### 2.1 Stale capability claims in code, paper, and comments — **P0/P1, S, ✅ SHIPPED**
 - `core/src/lib.rs:16-17` — "Still out of scope: index b-trees, `WITHOUT ROWID` tables,
   **UTF-16 text**, and **WAL frame-checksum verification**." UTF-16 (`TextEncoding::Utf16Le/Be`,
   `decode_utf16`, `core/src/lib.rs:209-229`) and WAL checksum verification
@@ -130,7 +137,7 @@ columns survive there when table-leaf residue is gone).
   add the field (§4.1) and keep the sentence, or remove the sentence. A paper claim the code
   contradicts is the highest-stakes version of this.
 
-### 2.2 Anomalies that report no raw evidence — **P0, S, verified**
+### 2.2 Anomalies that report no raw evidence — **P0, S, ✅ SHIPPED (all three anomalies)**
 `Observation::evidence()` returns `Vec::new()` for `NonZeroReservedSpace`, `HotJournal`, and
 `JournalDuplicatePage` (`forensic/src/lib.rs:492-494`). The project's own discipline is to
 surface the offending value + offset on every finding. `NonZeroReservedSpace` should carry the
@@ -142,7 +149,7 @@ between "something looks off" and a usable lead.
 
 ## 3. Large-artifact handling & robustness
 
-### 3.1 Whole-file `Vec<u8>` ownership — **P1, L, verified**
+### 3.1 Whole-file `Vec<u8>` ownership — **P1, L, 🚧 IN PROGRESS**
 `Database { bytes: Vec<u8>, … }` (`core/src/lib.rs:257`); the doc-comment concedes it suits
 "tens of MB" and defers a `Read + Seek` / mmap backend. For multi-GB stores this is a hard
 ceiling (and a DoS surface on a crafted huge file). Introduce a paged/mmap-backed byte source
@@ -178,7 +185,7 @@ scope.
 
 ## 4. Library / API & fleet hygiene
 
-### 4.1 Split MSRV: low floor for libs, pin for the CLI — **P1, S, verified**
+### 4.1 Split MSRV: low floor for libs, pin for the CLI — **P1, S, ✅ SHIPPED**
 No crate declares `rust-version` (absent from workspace, `core`, `forensic`, `cli`), and the
 only MSRV CI job tests **1.96** (`.github/workflows/ci.yml:65-70`). Per fleet policy the two
 **published libraries** should declare and CI-verify a **low** MSRV (e.g. 1.75/1.80) — a

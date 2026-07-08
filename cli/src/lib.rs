@@ -404,17 +404,49 @@ fn render_carve_jsonl(records: &[CarvedRecord], risks: &[TableInstanceRisk]) -> 
         .enumerate()
         .map(|(i, rec)| {
             format!(
-                "{{\"page\":{},\"offset\":{},\"rowid\":{},\"recovery_source\":\"{}\",\"confidence\":{:.4},\"table_instance_risk\":{},\"values\":{}}}",
+                "{{\"page\":{},\"offset\":{},\"rowid\":{},\"recovery_source\":\"{}\",\"confidence\":{:.4},\"table_instance_risk\":{}{},\"values\":{}}}",
                 rec.page,
                 rec.offset,
                 rec.rowid,
                 recovery_source_token(rec.source),
                 rec.confidence,
                 table_instance_risk_json(risks, i),
+                method_provenance_json(rec),
                 values_json_array(&rec.values)
             )
         })
         .collect()
+}
+
+/// The recovery-METHOD provenance object(s) for a carved record (§4.4): the
+/// overflow-page chain a row was reassembled from and/or the salt-qualified WAL
+/// frame residue was carved from. Emitted as JSON key/value fragments (each with a
+/// leading comma) ONLY when present — a plain on-disk record carries no empty
+/// keys. Observed bytes / logical coordinates, never a conclusion.
+fn method_provenance_json(rec: &CarvedRecord) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if let Some(ov) = &rec.overflow {
+        let chain = ov
+            .chain
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = write!(
+            out,
+            ",\"overflow\":{{\"first_page\":{},\"chain\":[{chain}]}}",
+            ov.first_page
+        );
+    }
+    if let Some(w) = &rec.wal {
+        let _ = write!(
+            out,
+            ",\"wal\":{{\"frame_index\":{},\"salt1\":{},\"salt2\":{}}}",
+            w.frame_index, w.salt1, w.salt2
+        );
+    }
+    out
 }
 
 // ---- Tier-2 fragment rendering (shown by default; `--no-fragments` opts out) -
@@ -656,7 +688,7 @@ fn render_carve_snapshot_jsonl(
         .enumerate()
         .map(|(i, rec)| {
             format!(
-                "{{\"page\":{},\"offset\":{},\"rowid\":{},\"recovery_source\":\"{}\",\"confidence\":{:.4},\"snapshot\":\"{}\",\"table_instance_risk\":{},\"values\":{}}}",
+                "{{\"page\":{},\"offset\":{},\"rowid\":{},\"recovery_source\":\"{}\",\"confidence\":{:.4},\"snapshot\":\"{}\",\"table_instance_risk\":{}{},\"values\":{}}}",
                 rec.page,
                 rec.offset,
                 rec.rowid,
@@ -664,6 +696,7 @@ fn render_carve_snapshot_jsonl(
                 rec.confidence,
                 json_escape(&snapshot_label(rec)),
                 table_instance_risk_json(risks, i),
+                method_provenance_json(rec),
                 values_json_array(&rec.values)
             )
         })

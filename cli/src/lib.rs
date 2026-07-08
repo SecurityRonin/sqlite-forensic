@@ -2916,6 +2916,51 @@ mod tests {
     }
 
     #[test]
+    fn carve_jsonl_blob_carries_sha256_and_media_type() {
+        // roadmap §4.5: a recovered BLOB is addressable in a case — the JSONL blob
+        // object carries a SHA-256 content hash (always) and a magic-based media
+        // type (when recognized). Here a PNG-signatured blob.
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRblobtail".to_vec();
+        let expect_hash = sqlite_forensic::blob::sha256_hex(&png);
+        let records = vec![rec(
+            5,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Blob(png)],
+        )];
+        let line = &render_carve(&records, &[], OutputFormat::Jsonl, false)[0];
+        assert!(
+            line.contains(&format!("\"sha256\":\"{expect_hash}\"")),
+            "blob must carry its SHA-256 content hash: {line}"
+        );
+        assert!(
+            line.contains("\"media_type\":\"image/png\""),
+            "a PNG-signatured blob must carry its media type: {line}"
+        );
+    }
+
+    #[test]
+    fn carve_jsonl_unknown_blob_has_hash_but_no_media_type() {
+        // An unrecognized blob still gets a hash (addressable) but no media_type
+        // key (never a guessed type).
+        let records = vec![rec(
+            5,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Blob(b"no known magic here".to_vec())],
+        )];
+        let line = &render_carve(&records, &[], OutputFormat::Jsonl, false)[0];
+        assert!(
+            line.contains("\"sha256\":\""),
+            "unknown blob still hashed: {line}"
+        );
+        assert!(
+            !line.contains("media_type"),
+            "an unrecognized blob must not carry a guessed media_type: {line}"
+        );
+    }
+
+    #[test]
     fn count_blob_cells_counts_records_and_fragments() {
         // Two blob cells in the record values + one surviving blob in a fragment =
         // 3; non-blob cells are not counted.

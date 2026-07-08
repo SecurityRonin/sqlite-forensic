@@ -3,7 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use forensicnomicon::report::{Location, Severity, Source};
+use forensicnomicon::report::{Location, Observation, Severity, Source};
 use sqlite_core::Database;
 use sqlite_forensic::{audit, audit_findings, AnomalyKind};
 
@@ -79,6 +79,131 @@ fn nonzero_reserved_space_finding_carries_raw_evidence() {
 fn zero_reserved_space_is_clean() {
     let db = Database::open(header_with_reserved(0)).unwrap();
     assert!(audit(&db).is_empty());
+}
+
+/// A `page_count`-page file (page size 4096) whose page-1 header carries the
+/// freelist trunk head (offset 32) and free-page count (offset 36) set as given.
+/// Extra pages are appended zeroed for the caller to populate. The in-header
+/// db-size field (offset 28) is left 0 so `PageCountMismatch` never fires and the
+/// freelist anomalies are tested in isolation.
+fn db_with_freelist(page_count: u32, head: u32, count: u32) -> Vec<u8> {
+    let ps = 4096usize;
+    let mut b = vec![0u8; ps * page_count as usize];
+    b[..16].copy_from_slice(b"SQLite format 3\0");
+    b[16] = 0x10; // page size 4096 (0x1000), big-endian
+    b[17] = 0x00;
+    b[32..36].copy_from_slice(&head.to_be_bytes());
+    b[36..40].copy_from_slice(&count.to_be_bytes());
+    b
+}
+
+fn src() -> Source {
+    Source {
+        analyzer: "sqlite-forensic".to_string(),
+        scope: "x.sqlite".to_string(),
+        version: None,
+    }
+}
+
+#[test]
+fn freelist_count_inconsistency_is_flagged() {
+    // roadmap §2.1: distrust the header. Offset 36 declares 5 free pages but the
+    // trunk head (offset 32) is 0, so the walked chain yields none — a
+    // tamper/corruption signal the silent NonEmptyFreelist count would hide.
+    let db = Database::open(db_with_freelist(1, 0, 5)).unwrap();
+    let a = audit(&db)
+        .into_iter()
+        .find(|a| a.code == "SQLITE-FREELIST-COUNT-INCONSISTENT")
+        .expect("freelist count/chain inconsistency must be flagged");
+    assert_eq!(a.severity, Severity::High);
+    let lc = a.note.to_lowercase();
+    assert!(
+        lc.contains("tamper") || lc.contains("corrupt"),
+        "note must frame it as tampering/corruption: {}",
+        a.note
+    );
+    let f = a.to_finding(src());
+    assert!(
+        f.evidence.iter().any(|e| e.value == "5"),
+        "evidence must carry the declared count (5): {:?}",
+        f.evidence
+    );
+    assert!(
+        f.evidence
+            .iter()
+            .any(|e| matches!(e.location, Some(Location::ByteOffset(36)))),
+        "evidence must point at the freelist-count header field (offset 36): {:?}",
+        f.evidence
+    );
+}
+
+#[test]
+fn malformed_freelist_chain_is_flagged() {
+    // A trunk head pointing past the file end makes the walk unwalkable; the
+    // header still claims a free page, so surface the inconsistency (walked=None).
+    let db = Database::open(db_with_freelist(1, 99, 1)).unwrap();
+    assert!(
+        audit(&db)
+            .iter()
+            .any(|a| a.code == "SQLITE-FREELIST-COUNT-INCONSISTENT"),
+        "an unwalkable (malformed) freelist chain must be flagged"
+    );
+}
+
+#[test]
+fn zeroed_freed_leaves_flag_residue_destruction() {
+    // roadmap §2.1 secure_delete fingerprint: a valid freelist whose freed LEAF
+    // pages are entirely zero — residue deliberately destroyed. Trunk page 2 lists
+    // leaves 3 and 4, both left zeroed.
+    let mut b = db_with_freelist(4, 2, 3); // head=page 2; 3 free pages (trunk + 2 leaves)
+    let t = 4096; // page 2 begins at byte 4096
+    b[t..t + 4].copy_from_slice(&0u32.to_be_bytes()); // next trunk = 0
+    b[t + 4..t + 8].copy_from_slice(&2u32.to_be_bytes()); // leaf count = 2
+    b[t + 8..t + 12].copy_from_slice(&3u32.to_be_bytes()); // leaf page 3
+    b[t + 12..t + 16].copy_from_slice(&4u32.to_be_bytes()); // leaf page 4
+    let db = Database::open(b).unwrap();
+    let a = audit(&db)
+        .into_iter()
+        .find(|a| a.code == "SQLITE-FREELIST-RESIDUE-ZEROED")
+        .expect("zeroed freed leaves must raise the residue-destruction fingerprint");
+    assert_eq!(a.severity, Severity::Medium);
+    assert!(
+        a.note.to_lowercase().contains("secure_delete"),
+        "note must name secure_delete as a consistent-with cause: {}",
+        a.note
+    );
+    assert!(
+        a.note.to_lowercase().contains("consistent with"),
+        "note must hedge (consistent with), never claim proof: {}",
+        a.note
+    );
+    let f = a.to_finding(src());
+    assert!(
+        f.evidence.iter().any(|e| e.value == "2"),
+        "evidence must carry the zeroed-page count (2): {:?}",
+        f.evidence
+    );
+}
+
+#[test]
+fn freed_leaves_with_residue_raise_no_fingerprint() {
+    // The same freelist but the freed leaves retain residue (non-zero) — an
+    // ordinary secure_delete=OFF delete, NOT a wipe. No fingerprint.
+    let mut b = db_with_freelist(4, 2, 3);
+    let t = 4096;
+    b[t..t + 4].copy_from_slice(&0u32.to_be_bytes());
+    b[t + 4..t + 8].copy_from_slice(&2u32.to_be_bytes());
+    b[t + 8..t + 12].copy_from_slice(&3u32.to_be_bytes());
+    b[t + 12..t + 16].copy_from_slice(&4u32.to_be_bytes());
+    b[4096 * 2 + 10] = 0x41; // residue byte on freed leaf page 3
+    b[4096 * 3 + 10] = 0x42; // residue byte on freed leaf page 4
+    let db = Database::open(b).unwrap();
+    assert!(
+        !audit(&db)
+            .iter()
+            .any(|a| a.code == "SQLITE-FREELIST-RESIDUE-ZEROED"),
+        "freed leaves that retain residue must NOT raise the fingerprint"
+    );
 }
 
 #[test]

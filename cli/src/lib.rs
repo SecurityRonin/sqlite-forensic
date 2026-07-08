@@ -2789,6 +2789,78 @@ mod tests {
     }
 
     #[test]
+    fn carve_jsonl_surfaces_overflow_and_wal_method_provenance() {
+        // roadmap §4.4: the recovery-METHOD provenance an examiner needs — which
+        // overflow pages a row was reassembled from, and which WAL frame residue
+        // was carved from — is carried on the record but was dropped by every
+        // renderer. The structured JSONL output must surface it.
+        use sqlite_forensic::{OverflowProvenance, WalProvenance};
+
+        let overflow_rec = CarvedRecord {
+            page: 3,
+            offset: 128,
+            rowid: 20012,
+            values: vec![Value::Integer(20012)],
+            confidence: 0.7,
+            allocated: false,
+            source: RecoverySource::InPageFreeBlock,
+            wal: None,
+            overflow: Some(OverflowProvenance {
+                first_page: 13,
+                chain: vec![13, 14],
+            }),
+        };
+        let wal_record = CarvedRecord {
+            page: 4,
+            offset: 64,
+            rowid: 7,
+            values: vec![Value::Integer(7)],
+            confidence: 0.8,
+            allocated: false,
+            source: RecoverySource::WalFrame,
+            wal: Some(WalProvenance {
+                frame_index: 7,
+                salt1: 0xDEAD_BEEF,
+                salt2: 0x0BAD_F00D,
+            }),
+            overflow: None,
+        };
+
+        let lines = render_carve(&[overflow_rec, wal_record], &[], OutputFormat::Jsonl, false);
+        // Overflow row: the assembled chain must be present and navigable.
+        assert!(
+            lines[0].contains("\"overflow\"") && lines[0].contains("[13,14]"),
+            "overflow chain provenance must be surfaced: {}",
+            lines[0]
+        );
+        // WAL row: the salt-qualified frame coordinate must be present.
+        assert!(
+            lines[1].contains("\"wal\"")
+                && lines[1].contains("\"frame_index\":7")
+                && lines[1].contains("\"salt1\":"),
+            "WAL frame provenance must be surfaced: {}",
+            lines[1]
+        );
+        // Records with neither must NOT carry an empty provenance key (no noise).
+        let plain = render_carve(
+            &[rec(
+                5,
+                0.9,
+                RecoverySource::FreelistPage,
+                vec![Value::Integer(1)],
+            )],
+            &[],
+            OutputFormat::Jsonl,
+            false,
+        );
+        assert!(
+            !plain[0].contains("\"overflow\"") && !plain[0].contains("\"wal\""),
+            "a plain on-disk record must not carry empty method-provenance keys: {}",
+            plain[0]
+        );
+    }
+
+    #[test]
     fn carve_jsonl_emits_lossless_base64_for_blobs() {
         // A BLOB column must be recoverable from JSONL, not reduced to a
         // "<blob:N bytes>" placeholder: it renders as a self-describing

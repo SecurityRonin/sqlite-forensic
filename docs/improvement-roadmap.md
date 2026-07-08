@@ -39,8 +39,15 @@ A second wave of the **P1/P2 backlog** has since shipped to `main`, same gate
 | §5 | Paper FP comparison table + Threats to Validity | this branch |
 | §5 | One-command reproducibility artifact (`scripts/reproduce.sh`) | this branch |
 | §5 | Property-based differential vs `sqlite3` (no fabrication + exclusion invariant over random construction) | `13cfe3a` |
+| §4.4 | Overflow-chain / WAL-frame method provenance surfaced in the JSONL output | `c4d6f54` |
+| §4.5 | BLOB media-typing + SHA-256 hashing (JSONL) and a CASE/UCO `-f case` bundle export | `471749c` |
+| §3.2 | Python bindings — standalone `python/` pyo3 crate (`carve`/`audit`/`timeline`), maturin-built + pytested | `1cdb307` |
+| §1.4 | Index-b-tree leaf reading foundation (`index_leaf_cells`), tier-2 vs `sqlite3` | `928af77` |
 
-Everything below is the **remaining P1/P2 backlog**.
+The remaining backlog is now small: §1.3 (safe scope done — residual precision-bounded),
+§1.4 follow-ups (index-entry carving / overflow / `WITHOUT ROWID` attribution), and two
+externally-blocked items — §3.1 (`forensicnomicon` constant promotion, needs a published crate
+release) and §5's commercial-tool oracle (needs a licensed GUI tool). Details below.
 
 ---
 
@@ -57,11 +64,13 @@ and the rest need a template-free salvage that would risk the structural **0-fal
 guarantee** this roadmap explicitly protects. Not pursued: chasing corpus-specific recall by
 loosening the precision gates trades the tool's headline property for a few rows on one category.
 
-### 1.4 Index b-trees & `WITHOUT ROWID` tables — **P1, L, verified (open)**
-`core/src/lib.rs:16` lists both as out of scope, and that part is current. `WITHOUT ROWID`
-tables store their data in the index b-tree, so they are invisible to recovery today; they
-appear in real app schemas. Index leaves are also a second substrate for ordinary tables (key
-columns survive there when table-leaf residue is gone).
+### 1.4 Index b-trees & `WITHOUT ROWID` tables — **P1, L, foundation shipped**
+The structural read is landed: `Database::index_leaf_cells` parses live index-b-tree leaf cells
+(type `0x0a`) into decoded key records (validated tier-2 vs `sqlite3`) — the second substrate for
+a table's data and the storage of `WITHOUT ROWID` rows. **Remaining follow-ups** (still open):
+carving DELETED index entries from index-page freeblocks, following index-key overflow chains, and
+schema-driven `WITHOUT ROWID` full-table attribution (mapping index roots → tables in the carve
+output). See the Shipped table.
 
 ---
 
@@ -79,10 +88,8 @@ diagnostics — all shipped; see the Shipped table above.)*
 locally redefined pending promotion to the shared KNOWLEDGE layer. DRY across the fleet; removes
 the local duplicates.
 
-### 3.2 Python bindings (`pyo3`) — **P2, L, proposed**
-Most DFIR scripting is Python. A thin `pyo3` wrapper over `carve`/`audit`/timeline would widen
-reach. Caveat (not casual): it needs an isolated boundary crate because the workspace is
-`unsafe_code = "forbid"` and pyo3's glue is `unsafe`. Scope deliberately.
+*(§3.2 Python bindings — shipped: the standalone `python/` pyo3 crate exposes
+`carve`/`audit`/`timeline`, built + tested end-to-end with maturin. See the Shipped table.)*
 
 ---
 
@@ -91,14 +98,12 @@ reach. Caveat (not casual): it needs an isolated boundary crate because the work
 *(§4.2 delete+reinsert surfacing, §4.3 confidence-band calibration — shipped; see
 the Shipped table above.)*
 
-### 4.4 Court-defensible provenance, uniformly — **P2, M, partly present**
-Records already carry source class and confidence. Make the evidence record uniform across all
-formats: source page, byte offset/range, substrate, method, confidence — framed in the
-expert-witness layers (observed bytes vs forensic inference; never a legal conclusion).
-
-### 4.5 Standards export (CASE/UCO) and blob typing/hashing — **P2, S–L, proposed**
-Optional CASE/UCO JSON-LD export for case-management interop; magic-based type ID + content hash
-(via the fleet's `blazehash`) for every recovered BLOB so media is addressable in a case.
+*(§4.4 uniform provenance — shipped: the overflow-chain / WAL-frame method
+provenance every renderer dropped is now surfaced in the structured JSONL output.
+§4.5 standards export + blob typing/hashing — shipped: magic-based media typing +
+SHA-256 content hashing for recovered BLOBs, surfaced in JSONL and as a CASE/UCO
+`-f case` bundle. Both in the Shipped table. Note: §4.5 uses SHA-256 (the
+court-standard content address) rather than `blazehash` for evidence integrity.)*
 
 ---
 

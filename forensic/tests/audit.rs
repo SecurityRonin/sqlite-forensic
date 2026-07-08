@@ -47,6 +47,53 @@ fn nonzero_reserved_space_note_states_recovery_needs_the_key() {
 }
 
 #[test]
+fn nonzero_reserved_space_names_sqlcipher4_at_80() {
+    // roadmap §2.3: name the SPECIFIC scheme the value matches, not a generic
+    // menu. reserved=80 is the measured SQLCipher 4 default (16-byte IV + 64-byte
+    // HMAC-SHA512), verified against sqlcipher 4.16.
+    let note = AnomalyKind::NonZeroReservedSpace { reserved: 80 }.note();
+    assert!(
+        note.contains("SQLCipher 4"),
+        "reserved=80 note must name SQLCipher 4 specifically: {note}"
+    );
+}
+
+#[test]
+fn nonzero_reserved_space_names_checksum_vfs_at_8() {
+    // The SQLite checksum VFS reserves exactly 8 bytes per page (cksumvfs.html).
+    // At 8 the matched scheme is the checksum VFS — NOT an encryption cipher.
+    let note = AnomalyKind::NonZeroReservedSpace { reserved: 8 }.note();
+    assert!(
+        note.to_lowercase().contains("checksum vfs"),
+        "reserved=8 note must name the checksum VFS: {note}"
+    );
+    assert!(
+        !note.contains("SQLCipher"),
+        "reserved=8 is not SQLCipher; the note must not name it: {note}"
+    );
+}
+
+#[test]
+fn nonzero_reserved_space_unknown_value_is_flagged_unrecognized_with_bytes() {
+    // An unrecognized reservation must be labelled as such AND still surface the
+    // offending value, never a bare "encryption" guess (show-the-value discipline).
+    let note = AnomalyKind::NonZeroReservedSpace { reserved: 7 }.note();
+    assert!(
+        note.contains('7'),
+        "an unrecognized reserved value must still be shown: {note}"
+    );
+    assert!(
+        note.to_lowercase().contains("unrecognized")
+            || note.to_lowercase().contains("does not match"),
+        "an unrecognized value must be labelled unrecognized: {note}"
+    );
+    assert!(
+        !note.contains("SQLCipher") && !note.to_lowercase().contains("checksum vfs"),
+        "an unrecognized value must not be misattributed to a named scheme: {note}"
+    );
+}
+
+#[test]
 fn nonzero_reserved_space_finding_carries_raw_evidence() {
     // roadmap §2.2: an "unknown/anomalous" finding must surface the offending
     // value AND where it was found, never report the anomaly with no evidence.

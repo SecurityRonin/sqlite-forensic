@@ -198,6 +198,110 @@ fn all_matrices() -> Vec<Matrix> {
     out
 }
 
+/// Aggregate precision of carved records whose confidence is >= `threshold`,
+/// pooled over the record-deletion categories (0C/0D/0E) where live-vs-deleted is
+/// well defined. Returns (tp, fp, precision). Precision = TP/(TP+FP); an empty
+/// band is precision 1.0 (nothing claimed, nothing wrong). This is the measured
+/// meaning of a `--min-confidence` band on the evaluation corpus (§4.3).
+fn band_precision(threshold: f32) -> (usize, usize, f64) {
+    let mut tp = 0usize;
+    let mut fp = 0usize;
+    for (nid, category) in manifest().databases() {
+        if !matches!(category.as_str(), "0C" | "0D" | "0E") {
+            continue;
+        }
+        let path = format!(
+            "{}/../tests/data/nemetz/{category}/{nid}.db",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        if !Path::new(&path).exists() {
+            continue;
+        }
+        let db = Database::open(std::fs::read(&path).unwrap()).unwrap();
+
+        let elements = manifest().db(&nid).elements();
+        let mut deleted: BTreeSet<String> = BTreeSet::new();
+        for el in elements {
+            for row in el.deleted() {
+                deleted.insert(normalize_row(row.cells()));
+            }
+        }
+        // Carved records passing the confidence bar, keyed like the answer key.
+        let carved: BTreeSet<String> = carve_all_deleted_records(&db)
+            .iter()
+            .filter(|r| r.confidence >= threshold)
+            .map(|r| carved_key(&r.values))
+            .collect();
+        for k in &carved {
+            if deleted.contains(k) {
+                tp += 1;
+            } else {
+                fp += 1;
+            }
+        }
+    }
+    let precision = if tp + fp == 0 {
+        1.0
+    } else {
+        tp as f64 / (tp + fp) as f64
+    };
+    (tp, fp, precision)
+}
+
+/// Emit the measured precision at each `--min-confidence` band (§4.3), so the
+/// numbers documented in the CLI help / `docs/validation.md` are reproducible.
+#[test]
+fn emit_precision_by_confidence_band() {
+    assert!(!all_matrices().is_empty(), "Nemetz corpus must be vendored");
+    println!(
+        "\n{:<9} {:>9} {:>4} {:>4} {:>9}",
+        "band", "threshold", "TP", "FP", "precision"
+    );
+    for (band, threshold) in [
+        ("info", 0.0f32),
+        ("low", 0.2),
+        ("medium", 0.4),
+        ("high", 0.6),
+        ("critical", 0.8),
+    ] {
+        let (tp, fp, precision) = band_precision(threshold);
+        println!("{band:<9} {threshold:>9.1} {tp:>4} {fp:>4} {precision:>9.3}");
+    }
+}
+
+/// §4.3 calibration contract: pin the MEASURED precision + recall depth of each
+/// `--min-confidence` band on the corpus so the numbers documented in the CLI help
+/// and `docs/validation.md` cannot silently drift. Precision is 1.000 at every
+/// band (the exclusion invariant surfaces no phantom/live row at any confidence),
+/// so the band selects recall depth, not precision: full records at thresholds
+/// 0.4 (110), 0.6 (28), 0.8 (2). A regression that surfaces a false positive at
+/// any band, or drops recall depth, fails here.
+#[test]
+fn confidence_bands_are_calibrated_on_the_corpus() {
+    for (band, threshold, expect_tp) in [
+        ("info", 0.0f32, 110usize),
+        ("low", 0.2, 110),
+        ("medium", 0.4, 110),
+        ("high", 0.6, 28),
+        ("critical", 0.8, 2),
+    ] {
+        let (tp, fp, precision) = band_precision(threshold);
+        assert_eq!(
+            fp, 0,
+            "{band} (>= {threshold}): {fp} false positive(s) — precision regression"
+        );
+        assert!(
+            (precision - 1.0).abs() < 1e-9,
+            "{band}: measured precision {precision} != 1.000"
+        );
+        assert_eq!(
+            tp, expect_tp,
+            "{band} (>= {threshold}): recall depth changed ({tp} vs pinned {expect_tp}) — \
+             update the CLI help + docs/validation.md if this is intentional"
+        );
+    }
+}
+
 /// Emit the full per-DB matrix as a table (visible with `--nocapture`), so the
 /// numbers in `docs/recovery-comparison.md` are reproducible, not hand-written.
 #[test]

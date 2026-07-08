@@ -493,3 +493,30 @@ validation evidence:
   serial array) but has **no instance in this corpus**, so it is validated against a
   **synthetic fixture only** and marked unproven-by-corpus in the code and here. WAL-frame
   resolution of spilled cells is also deferred.
+
+## Confidence-band calibration (`--min-confidence`)
+
+The `--min-confidence` bands are given a **measured** meaning on the evaluation corpus,
+never a general guarantee. Measured over the record-deletion categories (0C deleted
+records, 0D deleted-then-overwritten, 0E deleted overflow), where live-vs-deleted ground
+truth is well defined:
+
+| band (threshold) | full records recovered | false positives | precision |
+|---|---:|---:|---:|
+| `info` (≥ 0.0) | 110 | 0 | 1.000 |
+| `low` (≥ 0.2) | 110 | 0 | 1.000 |
+| `medium` (≥ 0.4) | 110 | 0 | 1.000 |
+| `high` (≥ 0.6) | 28 | 0 | 1.000 |
+| `critical` (≥ 0.8) | 2 | 0 | 1.000 |
+
+The reading: on this corpus **precision is 1.000 at every band** — no phantom or live row
+is surfaced at any confidence — so the band selects **recall depth, not precision**. A
+higher band returns fewer records (110 → 28 → 2), all true positives. This is consistent
+with the structural exclusion invariant, which is confidence-independent.
+
+Reproduce with `cargo test -p sqlite-forensic --test nemetz_metrics
+emit_precision_by_confidence_band -- --nocapture`; the numbers are pinned as a regression
+contract by `confidence_bands_are_calibrated_on_the_corpus` (a false positive at any band,
+or a change in recall depth, fails CI). Scope caveat: this counts full-record identity on
+the record-deletion categories; it is not a claim about Tier-2 fragments (flat 0.2) or the
+dropped-table categories.

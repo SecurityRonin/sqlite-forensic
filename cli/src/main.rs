@@ -187,6 +187,12 @@ struct CarveArgs {
     /// always drops them. This is NOT a safety control: a still-live row is never
     /// reported as deleted regardless of this threshold (that guarantee is
     /// structural and confidence-independent).
+    ///
+    /// Calibration (measured on the Nemetz record-deletion corpus, categories
+    /// 0C/0D/0E — NOT a general guarantee): precision is 1.000 at EVERY band, so
+    /// the band selects recall depth, not precision. Full records recovered:
+    /// 110 at `medium` (>=0.4), 28 at `high` (>=0.6), 2 at `critical` (>=0.8);
+    /// 0 false positives at every band. See docs/validation.md.
     #[arg(long, value_enum, default_value = "info")]
     min_confidence: ConfidenceArg,
 

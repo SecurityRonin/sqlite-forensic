@@ -105,7 +105,19 @@ pub fn value_to_cell(value: &Value) -> String {
 /// `<blob:N bytes>` placeholder, since neither can carry raw binary safely.
 fn value_to_json(value: &Value) -> String {
     match value {
-        Value::Blob(b) => format!("{{\"blob_base64\":\"{}\"}}", base64_encode(b)),
+        Value::Blob(b) => {
+            // Addressable in a case (§4.5): the lossless base64 payload plus a
+            // SHA-256 content hash (always) and a magic-based media type (only when
+            // a signature is recognized — never a guessed type).
+            let media = sqlite_forensic::blob::identify_media_type(b)
+                .map(|m| format!(",\"media_type\":\"{m}\""))
+                .unwrap_or_default();
+            format!(
+                "{{\"blob_base64\":\"{}\",\"sha256\":\"{}\"{media}}}",
+                base64_encode(b),
+                sqlite_forensic::blob::sha256_hex(b)
+            )
+        }
         other => format!("\"{}\"", json_escape(&value_to_cell(other))),
     }
 }
@@ -2906,9 +2918,11 @@ mod tests {
             vec![Value::Blob(b"foobar".to_vec())],
         )];
         let lines = render_carve(&records, &[], OutputFormat::Jsonl, false);
-        // RFC 4648 test vector: base64("foobar") == "Zm9vYmFy".
+        // RFC 4648 test vector: base64("foobar") == "Zm9vYmFy". The blob object is
+        // now enriched with a sha256 (§4.5), so match the base64 field, not the
+        // exact closing of the object.
         assert!(
-            lines[0].contains("\"values\":[{\"blob_base64\":\"Zm9vYmFy\"}]"),
+            lines[0].contains("\"values\":[{\"blob_base64\":\"Zm9vYmFy\""),
             "{}",
             lines[0]
         );

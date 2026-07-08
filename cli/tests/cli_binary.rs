@@ -113,6 +113,34 @@ fn carve_csv_and_jsonl_write_derived_files() {
     }
 }
 
+/// `-f case` writes a CASE/UCO JSON-LD bundle (`<stem>.recovered.case.json`) of the
+/// recovered BLOBs (§4.5): the file exists and carries the JSON-LD envelope.
+#[test]
+fn carve_case_writes_case_uco_bundle() {
+    let dir = Scratch::new("case_export");
+    let db = dir.join("deleted_places.db");
+    std::fs::copy(data_dir().join("deleted_places.db"), &db).unwrap();
+
+    let out = bin()
+        .current_dir(&dir.0)
+        .args(["carve", "deleted_places.db", "-f", "case"])
+        .output()
+        .expect("run carve -f case");
+    assert!(out.status.success(), "carve -f case must exit 0");
+
+    let file = dir.join("deleted_places.recovered.case.json");
+    assert!(file.exists(), "-f case writes <stem>.recovered.case.json");
+    let body = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        body.contains("\"@context\"") && body.contains("\"@graph\""),
+        "the case bundle must be a JSON-LD envelope: {body}"
+    );
+    assert!(
+        body.contains("unifiedcyberontology.org"),
+        "the bundle must reference the UCO ontology: {body}"
+    );
+}
+
 /// `-o -` streams a format to STDOUT (the piping escape): the rendered rows go to
 /// stdout, NO file is written, and NO `wrote …` summary line is printed.
 #[test]

@@ -142,11 +142,24 @@ fn malformed_freelist_chain_is_flagged() {
     // A trunk head pointing past the file end makes the walk unwalkable; the
     // header still claims a free page, so surface the inconsistency (walked=None).
     let db = Database::open(db_with_freelist(1, 99, 1)).unwrap();
+    let a = audit(&db)
+        .into_iter()
+        .find(|a| a.code == "SQLITE-FREELIST-COUNT-INCONSISTENT")
+        .expect("an unwalkable (malformed) freelist chain must be flagged");
     assert!(
-        audit(&db)
+        a.note.to_lowercase().contains("unwalkable"),
+        "note must state the chain was unwalkable: {}",
+        a.note
+    );
+    // The walked-count evidence must read "malformed" when the chain could not be
+    // walked, rather than a bogus number.
+    let f = a.to_finding(src());
+    assert!(
+        f.evidence
             .iter()
-            .any(|a| a.code == "SQLITE-FREELIST-COUNT-INCONSISTENT"),
-        "an unwalkable (malformed) freelist chain must be flagged"
+            .any(|e| e.field == "walked_free_pages" && e.value == "malformed"),
+        "evidence must mark the walked count as malformed: {:?}",
+        f.evidence
     );
 }
 
@@ -204,6 +217,65 @@ fn freed_leaves_with_residue_raise_no_fingerprint() {
             .any(|a| a.code == "SQLITE-FREELIST-RESIDUE-ZEROED"),
         "freed leaves that retain residue must NOT raise the fingerprint"
     );
+}
+
+/// Tier-2 oracle: build the two databases with the real `sqlite3` engine and
+/// confirm the fingerprint fires on `secure_delete=ON` (zeroed freed leaves) and
+/// stays silent on `secure_delete=OFF` (residue retained). Env-gated on a
+/// `sqlite3` binary (PATH or `SQLITE3_BIN`); skips cleanly when absent so CI
+/// without sqlite3 still passes (the deterministic synthetic tests above cover
+/// the code paths).
+#[test]
+fn real_engine_secure_delete_raises_the_fingerprint() {
+    let bin = std::env::var("SQLITE3_BIN").unwrap_or_else(|_| "sqlite3".to_string());
+    let dir = std::env::temp_dir().join("sqlite4n6-secure-delete-oracle");
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("SKIP: cannot create temp dir");
+        return;
+    }
+
+    // Enough rows that DELETE frees whole pages onto the freelist (in-page
+    // freeblocks alone would leave freelist_count=0 and exercise nothing).
+    let script = "PRAGMA page_size=4096; CREATE TABLE t(x TEXT);\n\
+         WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<2000)\n\
+         INSERT INTO t SELECT 'row-'||n||'-'||hex(randomblob(40)) FROM c;\n\
+         DELETE FROM t WHERE rowid>200;";
+
+    let mut fired = std::collections::HashMap::new();
+    for mode in ["OFF", "ON"] {
+        let db_path = dir.join(format!("sd_{mode}.db"));
+        let full = format!("PRAGMA secure_delete={mode}; {script}");
+        let status = std::process::Command::new(&bin)
+            .arg(&db_path)
+            .arg(&full)
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            _ => {
+                eprintln!("SKIP real_engine_secure_delete: no usable sqlite3 (set SQLITE3_BIN)");
+                return;
+            }
+        }
+        let bytes = std::fs::read(&db_path).unwrap();
+        let db = Database::open(bytes).unwrap();
+        let hit = audit(&db)
+            .iter()
+            .any(|a| a.code == "SQLITE-FREELIST-RESIDUE-ZEROED");
+        fired.insert(mode, hit);
+    }
+
+    assert_eq!(
+        fired.get("ON"),
+        Some(&true),
+        "secure_delete=ON must raise the residue-destruction fingerprint"
+    );
+    assert_eq!(
+        fired.get("OFF"),
+        Some(&false),
+        "secure_delete=OFF (residue retained) must NOT raise the fingerprint"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

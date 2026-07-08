@@ -156,6 +156,32 @@ pub enum AnomalyKind {
         /// Current database page count.
         current_pages: u32,
     },
+    /// The free-page count declared in the header (offset 36) disagrees with the
+    /// count obtained by walking the freelist trunk chain — or the chain is
+    /// unwalkable (out-of-range/cyclic trunk pointer). The header field is a
+    /// *claim*; the walk *verifies* it. A mismatch is consistent with freelist
+    /// tampering (a hand-edited count to hide freed pages) or corruption
+    /// (design §2.1 — distrust the header).
+    FreelistCountInconsistent {
+        /// Free-page count declared in the header (offset 36).
+        declared: u32,
+        /// Free-page count obtained by walking the trunk chain, or `None` when
+        /// the chain could not be walked (malformed/cyclic/out-of-range trunk).
+        walked: Option<u32>,
+    },
+    /// Freed freelist *leaf* pages are entirely zero. A leaf page keeps its
+    /// former content byte-for-byte, so an all-zero freed leaf means the deleted
+    /// records it held were overwritten with zeros — residue deliberately
+    /// destroyed. Consistent with `secure_delete=ON` or a manual wipe (design
+    /// §2.1); it is a fingerprint of destruction, never proof of intent.
+    ZeroedFreelistResidue {
+        /// Number of freed leaf pages that are entirely zero.
+        zeroed: u32,
+        /// Total number of freed leaf pages (the denominator).
+        free_leaves: u32,
+        /// The lowest zeroed freed-leaf page number — a pointer to the evidence.
+        first_zeroed: u32,
+    },
 }
 
 impl AnomalyKind {
@@ -171,10 +197,12 @@ impl AnomalyKind {
             | AnomalyKind::WalUncheckpointedState { .. }
             | AnomalyKind::JournalRecoverable { .. }
             | AnomalyKind::JournalSchemaChange { .. }
-            | AnomalyKind::JournalDuplicatePage { .. } => Severity::Medium,
+            | AnomalyKind::JournalDuplicatePage { .. }
+            | AnomalyKind::ZeroedFreelistResidue { .. } => Severity::Medium,
             AnomalyKind::PageCountMismatch { .. }
             | AnomalyKind::HotJournal { .. }
-            | AnomalyKind::JournalChecksumMismatch { .. } => Severity::High,
+            | AnomalyKind::JournalChecksumMismatch { .. }
+            | AnomalyKind::FreelistCountInconsistent { .. } => Severity::High,
             AnomalyKind::JournalDbSizeDelta { .. } => Severity::Low,
         }
     }
@@ -195,6 +223,8 @@ impl AnomalyKind {
             AnomalyKind::JournalSchemaChange { .. } => "SQLITE-JOURNAL-SCHEMA-CHANGE",
             AnomalyKind::JournalDuplicatePage { .. } => "SQLITE-JOURNAL-DUPLICATE-PAGE",
             AnomalyKind::JournalDbSizeDelta { .. } => "SQLITE-JOURNAL-DBSIZE-DELTA",
+            AnomalyKind::FreelistCountInconsistent { .. } => "SQLITE-FREELIST-COUNT-INCONSISTENT",
+            AnomalyKind::ZeroedFreelistResidue { .. } => "SQLITE-FREELIST-RESIDUE-ZEROED",
         }
     }
 
@@ -303,6 +333,28 @@ impl AnomalyKind {
                      database size: {direction}"
                 )
             }
+            AnomalyKind::FreelistCountInconsistent { declared, walked } => match walked {
+                Some(walked) => format!(
+                    "the header declares {declared} free page(s) (offset 36) but walking the \
+                     freelist trunk chain yields {walked} — consistent with freelist tampering \
+                     (an edited count to hide freed pages) or corruption"
+                ),
+                None => format!(
+                    "the header declares {declared} free page(s) (offset 36) but the freelist \
+                     trunk chain is unwalkable (out-of-range or cyclic trunk pointer) — \
+                     consistent with freelist tampering or corruption"
+                ),
+            },
+            AnomalyKind::ZeroedFreelistResidue {
+                zeroed,
+                free_leaves,
+                first_zeroed,
+            } => format!(
+                "{zeroed} of {free_leaves} freed leaf page(s) are entirely zero (first at page \
+                 {first_zeroed}) — a freed leaf keeps its former content, so the deleted records \
+                 they held were overwritten with zeros; consistent with secure_delete=ON or a \
+                 manual wipe"
+            ),
         }
     }
 }
@@ -373,7 +425,10 @@ impl Observation for Anomaly {
             | AnomalyKind::DroppedSchemaRecovered { .. }
             | AnomalyKind::NonEmptyFreelist { .. }
             | AnomalyKind::JournalRecoverable { .. }
-            | AnomalyKind::JournalSchemaChange { .. } => Category::Residue,
+            | AnomalyKind::JournalSchemaChange { .. }
+            // Zeroed freed leaves are a residue (recoverability) finding: the
+            // residue that WOULD be recoverable was destroyed.
+            | AnomalyKind::ZeroedFreelistResidue { .. } => Category::Residue,
             // A WAL-only/uncheckpointed state, a header/file page-count mismatch,
             // and the journal integrity observations (hot journal, checksum /
             // duplicate corruption, db-size delta) are integrity-of-state.
@@ -382,7 +437,9 @@ impl Observation for Anomaly {
             | AnomalyKind::HotJournal { .. }
             | AnomalyKind::JournalChecksumMismatch { .. }
             | AnomalyKind::JournalDuplicatePage { .. }
-            | AnomalyKind::JournalDbSizeDelta { .. } => Category::Integrity,
+            | AnomalyKind::JournalDbSizeDelta { .. }
+            // A header-vs-chain freelist inconsistency is integrity-of-state.
+            | AnomalyKind::FreelistCountInconsistent { .. } => Category::Integrity,
             other => Category::from_code(other.code()),
         }
     }
@@ -534,6 +591,43 @@ impl Observation for Anomaly {
                     field: "journaled_pages".to_string(),
                     value: journaled_pages.to_string(),
                     location: None,
+                },
+            ],
+            AnomalyKind::FreelistCountInconsistent { declared, walked } => vec![
+                Evidence {
+                    field: "declared_free_pages".to_string(),
+                    value: declared.to_string(),
+                    // The free-page count lives at file-header offset 36.
+                    location: Some(Location::ByteOffset(36)),
+                },
+                Evidence {
+                    field: "walked_free_pages".to_string(),
+                    value: walked.map_or_else(|| "malformed".to_string(), |w| w.to_string()),
+                    location: None,
+                },
+            ],
+            AnomalyKind::ZeroedFreelistResidue {
+                zeroed,
+                free_leaves,
+                first_zeroed,
+            } => vec![
+                Evidence {
+                    field: "zeroed_leaf_pages".to_string(),
+                    value: zeroed.to_string(),
+                    location: None,
+                },
+                Evidence {
+                    field: "free_leaf_pages".to_string(),
+                    value: free_leaves.to_string(),
+                    location: None,
+                },
+                Evidence {
+                    field: "first_zeroed_page".to_string(),
+                    value: first_zeroed.to_string(),
+                    location: Some(Location::Other {
+                        space: "sqlite:page".to_string(),
+                        value: u64::from(*first_zeroed),
+                    }),
                 },
             ],
         }
@@ -1564,6 +1658,41 @@ pub fn audit(db: &Database) -> Vec<Anomaly> {
     let free_pages = db.freelist_count();
     if free_pages != 0 {
         out.push(Anomaly::new(AnomalyKind::NonEmptyFreelist { free_pages }));
+    }
+
+    // Freelist structural consistency + residue-destruction fingerprint (§2.1).
+    // The header count at offset 36 is a *claim*; walking the trunk chain verifies
+    // it. Freed *leaf* pages are content-preserving, so an all-zero freed leaf is
+    // the fingerprint of destroyed residue (secure_delete / a wipe).
+    let declared = free_pages;
+    match db.freelist_pages_split() {
+        Ok((leaves, trunks)) => {
+            let walked = u32::try_from(leaves.len() + trunks.len()).unwrap_or(u32::MAX);
+            if declared != walked {
+                out.push(Anomaly::new(AnomalyKind::FreelistCountInconsistent {
+                    declared,
+                    walked: Some(walked),
+                }));
+            }
+            let zeroed: Vec<u32> = leaves
+                .iter()
+                .copied()
+                .filter(|&p| db.raw_page(p).is_some_and(|b| b.iter().all(|&x| x == 0)))
+                .collect();
+            if let Some(&first_zeroed) = zeroed.first() {
+                out.push(Anomaly::new(AnomalyKind::ZeroedFreelistResidue {
+                    zeroed: u32::try_from(zeroed.len()).unwrap_or(u32::MAX),
+                    free_leaves: u32::try_from(leaves.len()).unwrap_or(u32::MAX),
+                    first_zeroed,
+                }));
+            }
+        }
+        // An unwalkable chain (out-of-range / cyclic trunk pointer) is itself the
+        // inconsistency: surface it loud rather than silently ignore the freelist.
+        Err(_) => out.push(Anomaly::new(AnomalyKind::FreelistCountInconsistent {
+            declared,
+            walked: None,
+        })),
     }
 
     if db.wal_applied() {

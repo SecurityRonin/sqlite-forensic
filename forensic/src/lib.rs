@@ -2354,6 +2354,9 @@ pub fn row_histories_with_residue(db: &Database) -> Vec<sqlite_core::row_history
             rowid_reused: false,
             // An inferred (shape-matched) attribution is uncertain by nature.
             attribution_uncertain: is_guessed,
+            // Carved residue is order-unknown; a delete+reinsert gap is a WAL-view
+            // signal only, which a carve cannot witness.
+            reinserted_after_gap: false,
         });
     }
 

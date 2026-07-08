@@ -1529,10 +1529,17 @@ pub fn render_timeline(histories: &[sqlite_core::row_history::TableHistory]) -> 
                 .map(value_to_cell)
                 .collect::<Vec<_>>()
                 .join(", ");
+            // A delete+reinsert of an identical value (§4.2) collapses to one
+            // version but the absence is evidence — surface it as a low-confidence
+            // marker on the view_state cell (the `?` conveys the uncertainty).
+            let state = if v.reinserted_after_gap {
+                format!("{}+reinserted?", view_state_token(v.view_state))
+            } else {
+                view_state_token(v.view_state).to_string()
+            };
             out.push(format!(
-                "{}\t{rowid}\t{wal_commit}\t{}\t{values}",
+                "{}\t{rowid}\t{wal_commit}\t{state}\t{values}",
                 history.table,
-                view_state_token(v.view_state),
             ));
         }
     }
@@ -1917,6 +1924,7 @@ fn fold_journal_into_histories(
                 is_guessed: false,
                 rowid_reused: false,
                 attribution_uncertain: false,
+                reinserted_after_gap: false,
             });
         }
     }
@@ -1935,6 +1943,7 @@ fn fold_journal_into_histories(
                 is_guessed: false,
                 rowid_reused: false,
                 attribution_uncertain: false,
+                reinserted_after_gap: false,
             });
         }
     }
@@ -3058,6 +3067,7 @@ mod tests {
                 is_guessed: false,
                 rowid_reused: false,
                 attribution_uncertain: false,
+                reinserted_after_gap: false,
             }],
         }
     }
@@ -3152,6 +3162,7 @@ mod tests {
                 is_guessed: false,
                 rowid_reused: false,
                 attribution_uncertain: false,
+                reinserted_after_gap: false,
             });
         }
         let before = histories[0].versions.len();
@@ -4317,6 +4328,7 @@ mod tests {
             is_guessed,
             rowid_reused,
             attribution_uncertain,
+            reinserted_after_gap: false,
         }
     }
 
@@ -4444,6 +4456,36 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("\tlive\t")));
         assert!(lines.iter().any(|l| l.contains("\tresidue\t")));
         assert!(lines.iter().any(|l| l.starts_with("t\t-\t")));
+    }
+
+    #[test]
+    fn render_timeline_marks_delete_reinsert_as_low_confidence() {
+        // roadmap §4.2: a version that went absent and reappeared identical carries
+        // reinserted_after_gap; the timeline must surface it as a low-confidence
+        // marker rather than looking like an ordinary present row.
+        let v = RowVersion {
+            rowid: Some(1),
+            values: vec![Value::Text("k".into())],
+            origin: VersionOrigin::Live,
+            commit_seq: None,
+            view_state: ViewState::PresentInFinalView,
+            is_deleted: false,
+            is_guessed: false,
+            rowid_reused: false,
+            attribution_uncertain: false,
+            reinserted_after_gap: true,
+        };
+        let hist = TableHistory {
+            table: "msgs".to_string(),
+            columns: vec!["body".to_string()],
+            without_rowid: false,
+            versions: vec![v],
+        };
+        let lines = render_timeline(&[hist]);
+        assert!(
+            lines.iter().any(|l| l.contains("reinserted")),
+            "the delete+reinsert signal must appear in the timeline: {lines:?}"
+        );
     }
 
     #[test]

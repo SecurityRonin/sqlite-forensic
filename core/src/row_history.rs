@@ -83,6 +83,14 @@ pub struct RowVersion {
     /// Whether this version's attribution is uncertain — its source view was
     /// checksum-invalid residue, or its schema could not be reconstructed.
     pub attribution_uncertain: bool,
+    /// Whether this value went ABSENT from ≥1 intermediate view and then
+    /// reappeared with the IDENTICAL record. Such a run collapses (it is not
+    /// rowid reuse — the same record by evidence), but the absence itself is
+    /// forensic evidence: a delete-then-reinsert of the same value (e.g. a message
+    /// deleted and re-sent). A LOW-CONFIDENCE signal — a transient absence in the
+    /// materialized commit views is indistinguishable from a genuine round-trip,
+    /// so it records what the bytes show, never intent (§4.2).
+    pub reinserted_after_gap: bool,
 }
 
 /// The version history of one user table.
@@ -157,6 +165,9 @@ pub fn build_rowid_versions(rowid: i64, views: &[RowView]) -> Vec<RowVersion> {
         origin: VersionOrigin,
         uncertain: bool,
         gap_before: bool,
+        // The value went absent then reappeared IDENTICAL within this run (§4.2):
+        // collapsed as one record, but the absence is recorded as evidence.
+        reappeared_after_gap: bool,
     }
     let mut runs: Vec<Run> = Vec::new();
     let mut seen_present = false;
@@ -177,7 +188,12 @@ pub fn build_rowid_versions(rowid: i64, views: &[RowView]) -> Vec<RowVersion> {
                 } else if extends && pending_gap {
                     // Same value across a gap: still the same record by evidence —
                     // collapse into the existing run (not a reuse), clearing the
-                    // gap so it is not treated as a delete+reinsert.
+                    // gap so it is not treated as a delete+reinsert. Record the
+                    // absence as a low-confidence evidence bit (§4.2) rather than
+                    // discarding it silently.
+                    if let Some(r) = runs.last_mut() {
+                        r.reappeared_after_gap = true;
+                    }
                 } else {
                     runs.push(Run {
                         values,
@@ -185,6 +201,7 @@ pub fn build_rowid_versions(rowid: i64, views: &[RowView]) -> Vec<RowVersion> {
                         origin: view.origin.clone(),
                         uncertain,
                         gap_before: pending_gap,
+                        reappeared_after_gap: false,
                     });
                 }
                 seen_present = true;
@@ -254,6 +271,7 @@ pub fn build_rowid_versions(rowid: i64, views: &[RowView]) -> Vec<RowVersion> {
                 is_guessed: false,
                 rowid_reused,
                 attribution_uncertain: run.uncertain,
+                reinserted_after_gap: run.reappeared_after_gap,
             }
         })
         .collect()

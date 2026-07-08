@@ -13,7 +13,10 @@
 //! Format constants are consumed from [`forensicnomicon::sqlite`] (the KNOWLEDGE
 //! leaf) where exposed; a few not-yet-promoted offsets (reserved-space 20,
 //! in-header DB-size 28, freelist-count 36) are held locally and flagged for
-//! promotion. Still out of scope: index b-trees and `WITHOUT ROWID` tables.
+//! promotion. Index-b-tree LEAF reading is a foundation
+//! ([`Database::index_leaf_cells`], roadmap §1.4) — the second substrate for a
+//! table's data and the storage of `WITHOUT ROWID` rows; carving DELETED index
+//! entries and following index-key overflow remain follow-ups.
 //! (UTF-16 text decoding and WAL frame-checksum verification are implemented.)
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -1434,6 +1437,66 @@ impl Database {
     pub fn reconstruct_freeblock_fragments(&self, page_bytes: &[u8]) -> Vec<CellFragment> {
         let _ = self;
         reconstruct_freeblock_inner(page_bytes, self.header.text_encoding).1
+    }
+
+    /// Parse the LIVE cells of an index-b-tree **leaf** page (type `0x0a`) into
+    /// their decoded key records (roadmap §1.4 foundation). A regular index on a
+    /// rowid table stores each entry as `(indexed columns…, rowid)`; a
+    /// `WITHOUT ROWID` table stores its whole row here (the row IS the key). This
+    /// is the structural read every later index-carve / `WITHOUT ROWID` recovery
+    /// builds on — the second substrate for a table's data, where key columns
+    /// survive even when the table-leaf residue is gone.
+    ///
+    /// Reads live cells only (via the cell-pointer array); returns empty for any
+    /// non-index-leaf page, so a table page is never mis-read. Bounded and
+    /// panic-free — every read is bounds-checked; a cell whose payload does not
+    /// decode is skipped rather than panicking.
+    ///
+    /// SCOPE (foundation): decodes the LOCAL payload only. An index key large
+    /// enough to spill onto an overflow-page chain is decoded up to its on-page
+    /// bytes (the leading key columns still resolve); full overflow following, and
+    /// carving DELETED index entries from index-page freeblocks, are follow-ups.
+    #[must_use]
+    pub fn index_leaf_cells(&self, page_bytes: &[u8]) -> Vec<Vec<Value>> {
+        let hdr_off = if page_bytes.starts_with(SQLITE_MAGIC) {
+            SQLITE_HEADER_SIZE
+        } else {
+            0
+        };
+        if page_bytes.get(hdr_off) != Some(&0x0a) {
+            return Vec::new(); // only index-b-tree leaf pages carry index cells
+        }
+        let cell_count = be_u16(page_bytes, hdr_off + 3) as usize;
+        let cell_ptr_array = hdr_off + 8; // an index-leaf header is 8 bytes
+        let mut out = Vec::with_capacity(cell_count);
+        for i in 0..cell_count {
+            let ptr_off = cell_ptr_array + i * 2;
+            if ptr_off + 1 >= page_bytes.len() {
+                break;
+            }
+            let cell_off = be_u16(page_bytes, ptr_off) as usize;
+            if cell_off == 0 || cell_off >= page_bytes.len() {
+                continue;
+            }
+            // An index-leaf cell is [payload-length varint][payload][overflow?].
+            let Ok((payload_len, n)) = read_varint(page_bytes, cell_off) else {
+                continue;
+            };
+            let payload_start = cell_off + n;
+            let Ok(payload_len) = usize::try_from(payload_len) else {
+                continue;
+            };
+            let end = payload_start
+                .saturating_add(payload_len)
+                .min(page_bytes.len());
+            let Some(payload) = page_bytes.get(payload_start..end) else {
+                continue;
+            };
+            if let Ok(values) = decode_index_payload(payload, self.header.text_encoding) {
+                out.push(values);
+            }
+        }
+        out
     }
 
     /// The maximal FREE (unallocated) byte ranges of a table-leaf page — the
@@ -4315,6 +4378,27 @@ fn decode_record(
     rowid: i64,
     enc: TextEncoding,
 ) -> Result<Vec<Value>, Error> {
+    // A table-b-tree record: column 0 is the INTEGER PRIMARY KEY alias, so a
+    // serial-0 there reads the rowid rather than NULL.
+    decode_record_inner(payload, enc, Some(rowid))
+}
+
+/// Decode an index-b-tree record payload (roadmap §1.4). Unlike a table record it
+/// has NO `INTEGER PRIMARY KEY` alias — every column is stored literally, so a
+/// serial-0 first column is a genuine NULL key, never a rowid.
+fn decode_index_payload(payload: &[u8], enc: TextEncoding) -> Result<Vec<Value>, Error> {
+    decode_record_inner(payload, enc, None)
+}
+
+/// Decode a SQLite record payload (header + serial array + body) into its column
+/// values. `rowid_alias` supplies the rowid for a table record's column-0
+/// `INTEGER PRIMARY KEY` alias (serial 0 → the rowid); `None` (index records)
+/// leaves a serial-0 column as NULL.
+fn decode_record_inner(
+    payload: &[u8],
+    enc: TextEncoding,
+    rowid_alias: Option<i64>,
+) -> Result<Vec<Value>, Error> {
     let (header_len, n) = read_varint(payload, 0)?;
     let header_len = header_len as usize;
     if header_len > payload.len() {
@@ -4333,11 +4417,10 @@ fn decode_record(
     let mut bpos = header_len;
     for (idx, &serial) in serials.iter().enumerate() {
         let (val, size) = decode_value(payload, bpos, serial, enc)?;
-        let val = if idx == 0 && serial == 0 {
+        let val = match (idx, serial, rowid_alias) {
             // INTEGER PRIMARY KEY alias: NULL in column 0 reads the rowid.
-            Value::Integer(rowid)
-        } else {
-            val
+            (0, 0, Some(rowid)) => Value::Integer(rowid),
+            _ => val,
         };
         values.push(val);
         bpos += size;

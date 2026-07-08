@@ -28,6 +28,8 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod blob;
+
 use forensicnomicon::report::{
     Confidence, Evidence, Finding, Location, Observation, Severity, Source,
 };

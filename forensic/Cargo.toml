@@ -11,6 +11,7 @@ description = "Forensic anomaly auditor for SQLite databases — header-integrit
 [dependencies]
 sqlite-core = { workspace = true }
 forensicnomicon = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

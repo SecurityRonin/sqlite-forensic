@@ -46,10 +46,16 @@ Everything below is the **remaining P1/P2 backlog**.
 
 ## 1. Row/table identity correctness
 
-### 1.3 Coalesced / boundary freeblock recall — **P1, M, verified (open)**
-`forensic/tests/nemetz_metrics.rs:673` pins a conservative floor ("salvage is future work").
-When SQLite coalesces adjacent freeblocks the cell boundaries blur; tightening reconstruction
-here recovers rows currently dropped. Genuinely still open (unlike overflow, which is done).
+### 1.3 Coalesced / boundary freeblock recall — **P1, M, safe scope done; residual precision-bounded**
+Investigated: the general coalesced multi-cell recovery is already implemented (task #66 —
+"iterate template reconstruction across the whole free span"), verified by
+`category_0d_true_positive_floor` and by a direct probe (a real sqlite3 coalesced 42-byte
+freeblock recovers *both* freed rows). The remaining residual — e.g. 4 of 5 fragment-recoverable
+0D rows (`nemetz_metrics.rs`, `NEMETZ_0D_FRAGMENT_TP_FLOOR`) — is bounded by two hard constraints:
+rows surviving **inside live-cell extents** are unrecoverable by the never-scan-live discipline,
+and the rest need a template-free salvage that would risk the structural **0-false-positive
+guarantee** this roadmap explicitly protects. Not pursued: chasing corpus-specific recall by
+loosening the precision gates trades the tool's headline property for a few rows on one category.
 
 ### 1.4 Index b-trees & `WITHOUT ROWID` tables — **P1, L, verified (open)**
 `core/src/lib.rs:16` lists both as out of scope, and that part is current. `WITHOUT ROWID`

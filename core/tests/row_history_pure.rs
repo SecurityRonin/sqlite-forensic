@@ -184,6 +184,44 @@ fn reappearing_with_the_same_value_after_a_gap_is_not_reuse() {
 }
 
 #[test]
+fn same_value_after_a_gap_records_the_absence_as_evidence() {
+    // roadmap §4.2: 'k' @C1, absent @C2, 'k' again @C3 — a delete+reinsert of an
+    // IDENTICAL value. It still collapses (NOT reuse — same record by evidence),
+    // but the absence itself is evidence (a message deleted and re-sent), so the
+    // surviving version records `reinserted_after_gap` as a low-confidence signal.
+    let views = vec![
+        commit_view(1, Some(txt("k"))),
+        commit_view(2, None),
+        commit_view(3, Some(txt("k"))),
+        final_view(Some(txt("k"))),
+    ];
+    let versions = build_rowid_versions(1, &views);
+    assert!(
+        versions.iter().all(|v| !v.rowid_reused),
+        "same value across the gap is still not reuse"
+    );
+    assert!(
+        versions.iter().any(|v| v.reinserted_after_gap),
+        "the collapsed version must record that an absence gap occurred"
+    );
+}
+
+#[test]
+fn plain_unchanged_value_is_not_flagged_reinserted() {
+    // No absence ever occurred, so reinserted_after_gap stays false.
+    let views = vec![
+        commit_view(1, Some(txt("a"))),
+        commit_view(2, Some(txt("a"))),
+        final_view(Some(txt("a"))),
+    ];
+    let versions = build_rowid_versions(1, &views);
+    assert!(
+        versions.iter().all(|v| !v.reinserted_after_gap),
+        "an unbroken value must not be flagged reinserted"
+    );
+}
+
+#[test]
 fn residue_view_marks_attribution_uncertain() {
     // A checksum-invalid (residue) commit contributes its row but flags the
     // version attribution_uncertain.

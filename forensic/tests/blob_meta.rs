@@ -21,6 +21,20 @@ fn identifies_common_media_types_from_magic() {
     assert_eq!(identify_media_type(pdf), Some("application/pdf"));
     assert_eq!(identify_media_type(gzip), Some("application/gzip"));
     assert_eq!(identify_media_type(zip), Some("application/zip"));
+
+    // RIFF containers carry the concrete type at bytes 8..12.
+    let webp = b"RIFF\x24\x00\x00\x00WEBPVP8 ";
+    let wav = b"RIFF\x24\x00\x00\x00WAVEfmt ";
+    assert_eq!(identify_media_type(webp), Some("image/webp"));
+    assert_eq!(identify_media_type(wav), Some("audio/wav"));
+    // ISO base-media: `....ftyp` at offset 4.
+    let mp4 = b"\x00\x00\x00\x18ftypmp42";
+    assert_eq!(identify_media_type(mp4), Some("video/mp4"));
+    // A recovered SQLite database blob (nested db) types too.
+    let sqlite = b"SQLite format 3\x00rest";
+    assert_eq!(identify_media_type(sqlite), Some("application/vnd.sqlite3"));
+    let bmp = b"BM\x8a\x00\x00\x00";
+    assert_eq!(identify_media_type(bmp), Some("image/bmp"));
 }
 
 #[test]

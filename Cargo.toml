@@ -18,6 +18,8 @@ sqlite-core = { version = "0.9.0", path = "core" }
 sqlite-forensic = { version = "0.9.0", path = "forensic" }
 # CLI argument parsing.
 clap = { version = "4", features = ["derive"] }
+# SHA-256 content hashing for recovered BLOBs (RustCrypto — audited, never hand-rolled).
+sha2 = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

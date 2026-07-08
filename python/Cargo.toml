@@ -1,0 +1,23 @@
+[package]
+name = "sqlite4n6-py"
+version = "0.9.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Python bindings (pyo3) for the sqlite-forensic carver/auditor/timeline."
+publish = false
+
+# Standalone workspace: this is the ONE crate that links pyo3's `unsafe` glue, so
+# it lives OUTSIDE the main workspace's `unsafe_code = "forbid"` boundary (roadmap
+# §3.2). maturin builds it in isolation, like the fuzz crate.
+[workspace]
+
+[lib]
+name = "sqlite4n6"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3 → one wheel works across CPython >=3.9; extension-module → don't link
+# libpython at build time (resolved by the host interpreter at import).
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+sqlite-core = { path = "../core" }
+sqlite-forensic = { path = "../forensic" }

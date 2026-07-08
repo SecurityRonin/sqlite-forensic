@@ -1,0 +1,44 @@
+name: Python bindings
+
+# The pyo3 bindings live in a standalone workspace (python/) outside the main
+# tree's `unsafe_code = "forbid"`, so the main ci.yml does not build them. This
+# workflow builds the wheel with maturin and runs the Python integration tests
+# (roadmap §3.2).
+on:
+  push:
+    paths:
+      - "python/**"
+      - "core/**"
+      - "forensic/**"
+      - ".github/workflows/python.yml"
+  pull_request:
+    paths:
+      - "python/**"
+      - "core/**"
+      - "forensic/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bindings:
+    name: Build + test bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+      - name: clippy (bindings)
+        working-directory: python
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Install maturin + pytest
+        run: pip install "maturin>=1,<2" pytest
+      - name: Build + install the extension
+        working-directory: python
+        run: maturin build --release --out dist && pip install dist/*.whl
+      - name: Run the Python tests
+        working-directory: python
+        run: python -m pytest tests/ -q

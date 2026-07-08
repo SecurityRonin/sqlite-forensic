@@ -25,7 +25,22 @@ workspace tests). The completed items are **not** repeated here; git is the arch
 | §3.1 | Bounded-memory paged read (`Database::open_path` + LRU) | `0aef805`→`6e7c84a` |
 | §4.1 | `timeline` subcommand — per-rowid version history over the WAL commit sequence | RED→GREEN this branch |
 
-Everything below is the **remaining P1/P2 backlog**, unchanged.
+A second wave of the **P1/P2 backlog** has since shipped to `main`, same gate
+(strict-TDD RED→GREEN where an implementation changed, 100% function coverage,
+`clippy -D warnings`, rustdoc, workspace tests):
+
+| Backlog item | What | Commits |
+|---|---|---|
+| §2.1 | Anti-forensic freelist fingerprints — count-vs-trunk inconsistency + zeroed-residue (secure_delete), verified vs sqlite 3.45.3 | `265c639` |
+| §2.2 | Output-stage (writer) fuzz target + scheduled campaign | `fuzz.yml` + `render` target |
+| §2.3 | Encrypted-DB diagnostic names the scheme from reserved bytes (SQLCipher 4 = 80, checksum VFS = 8), verified vs SQLCipher 4.16 | `d7dd22c` |
+| §4.2 | Delete+reinsert of an identical value surfaced as a low-confidence event | `753fade` |
+| §4.3 | Corpus-scoped confidence-band calibration (precision 1.000 at every band; bands select recall depth) | `b3f55ae` |
+| §5 | Paper FP comparison table + Threats to Validity | this branch |
+| §5 | One-command reproducibility artifact (`scripts/reproduce.sh`) | this branch |
+| §5 | Property-based differential vs `sqlite3` (no fabrication + exclusion invariant over random construction) | `13cfe3a` |
+
+Everything below is the **remaining P1/P2 backlog**.
 
 ---
 
@@ -46,29 +61,8 @@ columns survive there when table-leaf residue is gone).
 
 ## 2. Large-artifact handling & robustness
 
-### 2.1 Anti-forensic fingerprinting — **P1, M, proposed**
-Promote explicit, evidence-bearing anomalies for residue destruction: `secure_delete`
-fingerprint (zeroed freeblock slack where residue was expected), `VACUUM` fingerprint
-(compacted file, no freelist residue), WAL salt rewind, freelist-count vs trunk inconsistency.
-This converts a silent empty result into "residue was deliberately destroyed, here is the
-evidence" — the forensically meaningful distinction, and the substantive answer to the
-`secure_delete`/WeChat question. Each finding carries the raw value + offset (the show-the-value
-discipline the shipped anomaly-evidence work established).
-
-### 2.2 Output-stage (writer) fuzzing — **P2, M, proposed**
-The three libFuzzer targets cover `Database::open`, the carver, and the auditor (parse side).
-The XLSX/DB/CSV/JSONL writers in `cli/src/lib.rs` run on adversarial carved values (huge blobs,
-NUL, control chars, invalid UTF-16 surrogates). Add a writer-layer fuzz/property target so the
-emit stage is exercised too. (Traversal cycle guards already exist — `core/src/lib.rs` visited-set
-in `collect_rows`, freed-overflow caps — so target the writers, not the walk.)
-
-### 2.3 Encrypted-DB diagnostics — **P2, S, verified (partial)**
-Encryption is *not* silently ignored: a bad magic fails loud (`cli/src/main.rs:282`) and
-`NonZeroReservedSpace` already flags SQLCipher/SEE-style reserved space
-(`forensic/src/lib.rs:43-47,1475`). The improvement is a *clearer* diagnostic — name the likely
-scheme from header heuristics, state that record recovery needs the key, and emit the
-reserved-byte evidence — rather than a generic anomaly. Detection only; decryption stays out of
-scope.
+*(§2.1 anti-forensic fingerprinting, §2.2 writer fuzzing, §2.3 encrypted-DB
+diagnostics — all shipped; see the Shipped table above.)*
 
 ---
 
@@ -88,17 +82,8 @@ reach. Caveat (not casual): it needs an isolated boundary crate because the work
 
 ## 4. Forensic workflow & output
 
-### 4.2 Surface delete+reinsert with identical values — **P1, S, verified (design choice)**
-`row_history.rs:177-180` deliberately collapses a same-value-across-a-gap run ("still the same
-record by evidence"), so a delete-then-reinsert of an identical value is **not** flagged as
-reuse. Defensible, but the WAL proves an absence occurred, and that event has forensic value
-(e.g. a message deleted and re-sent). Consider emitting it as a low-confidence event rather than
-collapsing it silently — absence is evidence.
-
-### 4.3 Confidence calibration (corpus-scoped) — **P1, M, proposed**
-State the empirical precision behind each `--min-confidence` band *as observed on the evaluation
-corpus* (e.g. "high = observed precision ≥ X on corpus C"), never as a general guarantee. Gives
-the examiner a measured meaning for the threshold without overclaiming.
+*(§4.2 delete+reinsert surfacing, §4.3 confidence-band calibration — shipped; see
+the Shipped table above.)*
 
 ### 4.4 Court-defensible provenance, uniformly — **P2, M, partly present**
 Records already carry source class and confidence. Make the evidence record uniform across all
@@ -117,16 +102,9 @@ Optional CASE/UCO JSON-LD export for case-management interop; magic-based type I
   oracle would lift a comparison column to tier-1 (independent author + answer key). Respect
   redistribution/license (do not commit it), drive it headlessly, env-gate it like the existing
   oracles, document provenance.
-- **One-command reproducibility artifact** — P1, M, proposed. A `make reproduce` / pinned
-  container that fetches the oracles at their versions and emits the comparison CSV+PNG
-  deterministically; suits a DFRWS artifact-evaluation submission.
-- **Property-based differential vs `sqlite3`** — P2, M, proposed. Random construct→delete→carve,
-  assert every carved row is derivable from the construction log and no live row is surfaced —
-  directly the cross-table hazard a fixed corpus misses.
-- **Scheduled fuzz campaign + persisted corpus** — P2, S, proposed. CI builds the harnesses;
-  add a cron campaign with a saved corpus (OSS-Fuzz optional).
-- **Paper: add the FP comparison table** (now four tools) and a dedicated **Threats to Validity**
-  section — P1, S–M.
+- *(Shipped: one-command reproducibility artifact `scripts/reproduce.sh`;
+  property-based differential vs `sqlite3`; scheduled fuzz campaign `fuzz.yml`;
+  paper FP comparison table + Threats to Validity — see the Shipped table above.)*
 
 ---
 

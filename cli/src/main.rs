@@ -60,6 +60,10 @@ enum FormatArg {
     Csv,
     /// Carved records as JSONL (`<stem>.carved.jsonl`).
     Jsonl,
+    /// Recovered BLOBs as a CASE/UCO JSON-LD bundle for case-management interop
+    /// (`<stem>.recovered.case.json`) — each blob a content observable with its
+    /// media type and SHA-256 hash.
+    Case,
 }
 
 /// The `audit` output format (stdout rendering only).
@@ -105,6 +109,7 @@ impl FormatArg {
             FormatArg::Table => "carved.txt",
             FormatArg::Csv => "carved.csv",
             FormatArg::Jsonl => "carved.jsonl",
+            FormatArg::Case => "recovered.case.json",
         }
     }
 }
@@ -414,9 +419,24 @@ fn run_carve(args: &CarveArgs) -> Result<(), String> {
     match args.format {
         FormatArg::Xlsx => run_carve_xlsx(args, &dest),
         FormatArg::Db => run_carve_db(args, &dest),
+        FormatArg::Case => run_carve_case(args, &dest),
         // table / csv / jsonl render the same record stream.
         _ => run_carve_stream(args, &dest),
     }
+}
+
+/// `-f case`: carve the full recovered records and emit a CASE/UCO JSON-LD bundle
+/// of every recovered BLOB (each a content observable with its media type and
+/// SHA-256 hash), for case-management interop. Records with no blobs contribute no
+/// observable. Bytes go to the resolved `dest`; this shell only performs the I/O.
+fn run_carve_case(args: &CarveArgs, dest: &OutputDest) -> Result<(), String> {
+    let (_db, records, _fragments) = collect_for_rebuild(args)?;
+    let bundle = sqlite_forensic::case_uco::bundle_for_records(&records);
+    emit_bytes(dest, bundle.as_bytes(), "case bundle")?;
+    if let OutputDest::File(path) = dest {
+        print_carve_summary(records.len(), None, path);
+    }
+    Ok(())
 }
 
 /// `-f xlsx` (the default): carve the full recovered records and emit the combined
@@ -1247,6 +1267,7 @@ mod tests {
             ("table", "carved.txt"),
             ("csv", "carved.csv"),
             ("jsonl", "carved.jsonl"),
+            ("case", "recovered.case.json"),
         ] {
             let args = carve_args(&["sqlite4n6", "carve", "db.sqlite", "-f", flag]);
             assert_eq!(

@@ -325,6 +325,49 @@ fn real_engine_secure_delete_raises_the_fingerprint() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Tier-2 oracle: mint a real `SQLCipher` 4 database with a plaintext header (so
+/// the tool can read offset 20) and confirm the audit opens it and names
+/// `SQLCipher` from the reserved-byte count. Env-gated on a `sqlcipher` binary
+/// (`SQLCIPHER_BIN`, else the Homebrew path); skips cleanly when absent.
+#[test]
+fn real_sqlcipher_database_is_named_from_reserved_bytes() {
+    let bin = std::env::var("SQLCIPHER_BIN")
+        .unwrap_or_else(|_| "/opt/homebrew/bin/sqlcipher".to_string());
+    if !std::path::Path::new(&bin).exists() {
+        eprintln!("SKIP real_sqlcipher: no sqlcipher (set SQLCIPHER_BIN)");
+        return;
+    }
+    let dir = std::env::temp_dir().join("sqlite4n6-sqlcipher-oracle");
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("SKIP: cannot create temp dir");
+        return;
+    }
+    let db_path = dir.join("enc.db");
+    let sql = "PRAGMA key='x'; PRAGMA cipher_plaintext_header_size=32; \
+               PRAGMA page_size=4096; CREATE TABLE t(x); INSERT INTO t VALUES('hi');";
+    let status = std::process::Command::new(&bin)
+        .arg(&db_path)
+        .arg(sql)
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        eprintln!("SKIP real_sqlcipher: sqlcipher run failed");
+        return;
+    }
+    let bytes = std::fs::read(&db_path).unwrap();
+    let db = Database::open(bytes).expect("plaintext-header SQLCipher db must open");
+    let note = audit(&db)
+        .into_iter()
+        .find(|a| a.code == "SQLITE-RESERVED-SPACE-NONZERO")
+        .expect("a SQLCipher database must raise NonZeroReservedSpace")
+        .note;
+    assert!(
+        note.contains("SQLCipher"),
+        "the reserved-space note must name SQLCipher on a real SQLCipher db: {note}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn audit_findings_carry_source_and_code() {
     let db = Database::open(header_with_reserved(32)).unwrap();

@@ -232,12 +232,39 @@ impl AnomalyKind {
     #[must_use]
     pub fn note(&self) -> String {
         match self {
-            AnomalyKind::NonZeroReservedSpace { reserved } => format!(
-                "file header reserves {reserved} byte(s) per page — non-standard; \
-                 consistent with a page-level extension such as encryption \
-                 (SQLCipher/SEE) or a checksum VFS. Recovering any deleted records \
-                 would require the encryption key or the checksum VFS"
-            ),
+            AnomalyKind::NonZeroReservedSpace { reserved } => {
+                // Name the scheme the reserved-byte count matches (values measured
+                // against sqlcipher 4.16 and the checksum-VFS spec, cksumvfs.html);
+                // an unmatched value is labelled unrecognized with the raw bytes
+                // shown, never guessed into a named scheme.
+                let scheme = match reserved {
+                    80 => {
+                        "consistent with SQLCipher 4 (a 16-byte per-page IV plus a \
+                           64-byte HMAC-SHA512)"
+                    }
+                    48 => {
+                        "consistent with SQLCipher 1-3 (a 16-byte per-page IV plus a \
+                           32-byte HMAC-SHA1)"
+                    }
+                    16 => {
+                        "consistent with a 16-byte per-page IV (an AES-CBC cipher with \
+                           per-page HMAC disabled)"
+                    }
+                    8 => {
+                        "consistent with the SQLite checksum VFS (an 8-byte per-page \
+                          checksum)"
+                    }
+                    _ => {
+                        "does not match a known page-level scheme's per-page reservation \
+                          (an unrecognized extension)"
+                    }
+                };
+                format!(
+                    "file header reserves {reserved} byte(s) per page (offset 20) — \
+                     non-standard; {scheme}. Recovering any deleted records would require \
+                     the encryption key (or the corresponding VFS)"
+                )
+            }
             AnomalyKind::DeletedRecordRecovered {
                 page,
                 offset,

@@ -14,6 +14,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -41,13 +42,14 @@ fn temp_path(tag: &str) -> PathBuf {
     p
 }
 
-/// Encode a string as the UTF-16-LE bytes WebKit stores, rendered as a `sqlite3`
-/// `x'..'` BLOB hex literal.
+/// Encode a string as the UTF-16-LE bytes `WebKit` stores, rendered as a
+/// `sqlite3` `x'..'` BLOB hex literal.
 fn utf16le_hex(s: &str) -> String {
-    s.encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    let mut out = String::new();
+    for byte in s.encode_utf16().flat_map(u16::to_le_bytes) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Run `sqlite3 <db> "<sql>"`, asserting success.
@@ -86,10 +88,11 @@ fn item_table_utf16le_blob_values_round_trip() {
          value BLOB NOT NULL ON CONFLICT FAIL);",
     );
     for (k, v) in cases {
-        sql.push_str(&format!(
+        let _ = write!(
+            sql,
             "INSERT INTO ItemTable VALUES('{k}', x'{}');",
             utf16le_hex(v)
-        ));
+        );
     }
 
     let path = temp_path("roundtrip");
@@ -100,7 +103,7 @@ fn item_table_utf16le_blob_values_round_trip() {
     let dumps = db.live_table_rows();
     let item = dumps
         .iter()
-        .find(|d| is_local_storage_item_table(&d.name, &d.column_names))
+        .find(|d| is_local_storage_item_table(&d.name))
         .expect("ItemTable schema recognized");
 
     let mut recovered = std::collections::BTreeMap::new();
@@ -142,14 +145,16 @@ fn item_table_null_value_reads_as_null_not_decoded() {
         return;
     };
 
-    // A NULL value stays a distinct `Value::Null` at the reader boundary, so a
-    // caller never mis-applies the BLOB decode to it (graceful by construction).
+    // A NULL value is never a BLOB at the reader boundary, so the decode is
+    // never mis-applied to it (graceful by construction). SQLite may store the
+    // trailing NULL as `Value::Null` or omit it from the record entirely; both
+    // mean "no BLOB to decode", which is what the caller must be able to rely on.
     let path = temp_path("null");
     run_sql(
         &bin,
         &path,
         "CREATE TABLE ItemTable (key TEXT, value BLOB); \
-         INSERT INTO ItemTable VALUES('present', x'6800690000'); \
+         INSERT INTO ItemTable VALUES('present', x'68006900'); \
          INSERT INTO ItemTable VALUES('missing', NULL);",
     );
 
@@ -158,20 +163,39 @@ fn item_table_null_value_reads_as_null_not_decoded() {
     let dumps = db.live_table_rows();
     let item = dumps
         .iter()
-        .find(|d| is_local_storage_item_table(&d.name, &d.column_names))
+        .find(|d| is_local_storage_item_table(&d.name))
         .expect("ItemTable schema recognized");
 
-    let mut null_seen = false;
+    let mut present_decoded = false;
+    let mut missing_not_blob = false;
     for row in &item.rows {
-        match &row.values[1] {
-            Value::Null => null_seen = true,
-            Value::Blob(b) => {
-                let _ = decode_localstorage_value(b);
+        let key = match &row.values[0] {
+            Value::Text(s) => s.clone(),
+            other => panic!("key column should be TEXT, got {other:?}"),
+        };
+        let value = row.values.get(1);
+        match key.as_str() {
+            "present" => match value {
+                Some(Value::Blob(b)) => {
+                    let decoded = decode_localstorage_value(b);
+                    assert_eq!(decoded.text, "hi");
+                    assert!(!decoded.lossy);
+                    present_decoded = true;
+                }
+                other => panic!("present value should be a BLOB, got {other:?}"),
+            },
+            "missing" => {
+                assert!(
+                    !matches!(value, Some(Value::Blob(_))),
+                    "a NULL value must not surface as a BLOB"
+                );
+                missing_not_blob = true;
             }
-            other => panic!("unexpected value class: {other:?}"),
+            _ => {}
         }
     }
-    assert!(null_seen, "the NULL value must surface as Value::Null");
+    assert!(present_decoded, "the present BLOB value decoded");
+    assert!(missing_not_blob, "the NULL value was not a decodable BLOB");
 
     let _ = std::fs::remove_file(&path);
 }

@@ -282,9 +282,16 @@ fn real_engine_secure_delete_raises_the_fingerprint() {
         return;
     }
 
+    // `auto_vacuum=NONE` is load-bearing: a sqlite3 built with
+    // `SQLITE_DEFAULT_AUTOVACUUM=1` (e.g. the macOS CI runner's engine) reclaims
+    // the DELETE-freed pages and truncates the file, leaving freelist_count=0 and
+    // NO freed leaf pages — so the fingerprint has nothing to fire on and the
+    // oracle's premise fails through no fault of the detector. Forcing auto_vacuum
+    // off keeps the freed-leaf freelist on every conforming build (a no-op on the
+    // builds that already default to off), making the oracle host-independent.
     // Enough rows that DELETE frees whole pages onto the freelist (in-page
     // freeblocks alone would leave freelist_count=0 and exercise nothing).
-    let script = "PRAGMA page_size=4096; CREATE TABLE t(x TEXT);\n\
+    let script = "PRAGMA auto_vacuum=NONE; PRAGMA page_size=4096; CREATE TABLE t(x TEXT);\n\
          WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<2000)\n\
          INSERT INTO t SELECT 'row-'||n||'-'||hex(randomblob(40)) FROM c;\n\
          DELETE FROM t WHERE rowid>200;";

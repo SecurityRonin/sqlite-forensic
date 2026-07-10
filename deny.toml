@@ -7,6 +7,15 @@ exclude = ["sqlite-forensic-fuzz"]
 [advisories]
 version = 2
 yanked = "deny"
+# Time-boxed ignore (added 2026-07; revisit each release). quick-xml <0.41 has
+# two DoS advisories — RUSTSEC-2026-0194 (quadratic duplicate-attribute check)
+# and RUSTSEC-2026-0195 (unbounded namespace-declaration allocation). Both are
+# DoS-only (not RCE/memory-unsafety) and reach the tree ONLY through the
+# dev-dependency `calamine 0.35.0`, which pins `quick-xml = "^0.39"` and cannot
+# resolve to the fixed 0.41.0. calamine 0.35 is the newest release in our range,
+# so no upgrade path exists yet. Drop both IDs once calamine widens its quick-xml
+# requirement to >=0.41 (or a newer calamine we can adopt does).
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
 
 [licenses]
 version = 2

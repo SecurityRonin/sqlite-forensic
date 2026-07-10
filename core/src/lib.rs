@@ -5124,6 +5124,59 @@ mod tests {
     }
 
     #[test]
+    fn localstorage_decodes_known_utf16le_bytes() {
+        // Independent oracle: these UTF-16-LE bytes are derived from the Unicode
+        // code points and the surrogate-pair formula, NOT from Rust's encoder, so
+        // a matching round-trip validates the decoder against the documented
+        // construction (Evidence-Based Rigor tier 2).
+        //   'A' U+0041      -> 41 00
+        //   '中' U+4E2D      -> 2D 4E
+        //   '😀' U+1F600     -> surrogate pair D83D DE00 -> 3D D8 00 DE
+        let bytes = [0x41, 0x00, 0x2D, 0x4E, 0x3D, 0xD8, 0x00, 0xDE];
+        let out = decode_localstorage_value(&bytes);
+        assert_eq!(out.text, "A中😀");
+        assert!(!out.lossy, "a fully-paired BLOB is not lossy");
+    }
+
+    #[test]
+    fn localstorage_empty_blob_is_empty_not_lossy() {
+        let out = decode_localstorage_value(&[]);
+        assert_eq!(out.text, "");
+        assert!(!out.lossy);
+    }
+
+    #[test]
+    fn localstorage_odd_length_blob_is_lossy_not_panic() {
+        // 'A' (41 00) then a lone trailing byte 42 — half a code unit was cut off.
+        let out = decode_localstorage_value(&[0x41, 0x00, 0x42]);
+        assert_eq!(out.text, "A");
+        assert!(out.lossy, "a trailing half code unit is a lossy truncation");
+    }
+
+    #[test]
+    fn localstorage_lone_surrogate_is_replacement_and_lossy() {
+        // High surrogate D83D (LE 3D D8) with no following low surrogate.
+        let out = decode_localstorage_value(&[0x3D, 0xD8]);
+        assert_eq!(out.text, "\u{FFFD}");
+        assert!(out.lossy);
+    }
+
+    #[test]
+    fn item_table_schema_recognized_and_others_rejected() {
+        let cols = vec!["key".to_string(), "value".to_string()];
+        assert!(is_local_storage_item_table("ItemTable", &cols));
+        assert!(!is_local_storage_item_table("moz_places", &cols));
+        assert!(!is_local_storage_item_table(
+            "ItemTable",
+            &["key".to_string()]
+        ));
+        assert!(!is_local_storage_item_table(
+            "ItemTable",
+            &["k".to_string(), "v".to_string()]
+        ));
+    }
+
+    #[test]
     fn decode_value_int_literals() {
         assert_eq!(
             decode_value(&[], 0, 8, TextEncoding::Utf8).unwrap(),

@@ -7,6 +7,13 @@ exclude = ["sqlite-forensic-fuzz"]
 [advisories]
 version = 2
 yanked = "deny"
+# Interim, time-boxed ignore (added 2026-07): quick-xml < 0.41 DoS advisories.
+# Both are DoS-only (quadratic attribute scan / unbounded namespace allocation),
+# not RCE, and reach the tree only via `calamine v0.35.0`, a DEV-dependency of the
+# CLI that pins `quick-xml = "^0.39"` — so the tree cannot bump to >= 0.41 until
+# calamine widens its requirement. No untrusted input is parsed through it in the
+# shipped library/CLI. Drop this ignore once calamine allows quick-xml >= 0.41.
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
 
 [licenses]
 version = 2

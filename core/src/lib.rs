@@ -237,10 +237,80 @@ impl TextEncoding {
     }
 
     fn decode_utf16(bytes: &[u8], conv: fn([u8; 2]) -> u16) -> String {
-        // A trailing odd byte (truncated UTF-16) is dropped by chunks_exact.
-        let units: Vec<u16> = bytes.chunks_exact(2).map(|c| conv([c[0], c[1]])).collect();
-        String::from_utf16_lossy(&units)
+        // The DB-encoding path keeps its lossy-by-default contract: it discards
+        // the flag, so a truncated or corrupt unit still yields U+FFFD as before.
+        // The pairing itself lives in `decode_utf16_units` (DRY — the Local
+        // Storage decode reuses it and keeps the flag).
+        decode_utf16_units(bytes, conv).0
     }
+}
+
+/// Shared UTF-16 → `String` pairing: pairs 2-byte code units via `conv`, resolves
+/// surrogate pairs, and reports whether the decode was **lossy**. A trailing odd
+/// byte (half a code unit) or an unpaired surrogate emits U+FFFD and sets the
+/// flag; it never panics or errors. Endianness is the caller's via `conv`.
+fn decode_utf16_units(bytes: &[u8], conv: fn([u8; 2]) -> u16) -> (String, bool) {
+    // An odd trailing byte is half a code unit — real data was truncated. It is
+    // dropped by `chunks_exact`; the flag records that a byte was lost.
+    let mut lossy = bytes.len() % 2 != 0;
+    let units = bytes.chunks_exact(2).map(|c| conv([c[0], c[1]]));
+    let mut text = String::new();
+    for unit in char::decode_utf16(units) {
+        if let Ok(c) = unit {
+            text.push(c);
+        } else {
+            lossy = true;
+            text.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+    (text, lossy)
+}
+
+/// A WebKit/Chrome Local Storage `ItemTable.value` decoded to text, plus whether
+/// the decode was lossy. `lossy` is a struct field, not a side-channel warning,
+/// so a caller cannot render a lossy value as if it were faithfully recovered
+/// (secure by design).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LocalStorageValue {
+    /// The decoded string; any code unit that could not be decoded is a U+FFFD.
+    pub text: String,
+    /// `true` when at least one input byte/unit could not be decoded cleanly (an
+    /// odd-length BLOB or an unpaired surrogate).
+    pub lossy: bool,
+}
+
+/// Decode a WebKit/Chromium Local Storage `ItemTable.value` BLOB to a `String`.
+///
+/// A `.localstorage` file is a standard `SQLite` database this crate already
+/// reads; the one artifact-specific quirk is that the `value` column is a BLOB
+/// holding the string as raw **UTF-16 little-endian** code units — no BOM, no
+/// type-prefix byte — so a normal dump surfaces it as opaque hex. This turns
+/// such a BLOB back into readable text.
+///
+/// Panic-free and lossy-by-report: an odd-length BLOB (a trailing half code
+/// unit) or an unpaired surrogate yields U+FFFD and sets
+/// [`LocalStorageValue::lossy`] rather than erroring or panicking. An empty BLOB
+/// decodes to the empty string with `lossy == false`.
+#[must_use]
+pub fn decode_localstorage_value(blob: &[u8]) -> LocalStorageValue {
+    let (text, lossy) = decode_utf16_units(blob, u16::from_le_bytes);
+    LocalStorageValue { text, lossy }
+}
+
+/// Recognize the WebKit/Chromium Local Storage `ItemTable(key TEXT, value BLOB)`
+/// table, so a caller knows when [`decode_localstorage_value`] applies to a
+/// dumped table's `value` column.
+///
+/// Keyed on the distinctive table name `ItemTable` — the name WebKit/Chromium
+/// create for Local Storage. The column names are deliberately NOT part of the
+/// test: the real schema declares them with `ON CONFLICT` clauses
+/// (`key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB NOT NULL ON CONFLICT FAIL`)
+/// that a lightweight `CREATE TABLE` parse does not always split cleanly, so a
+/// name match is the robust signal. The row shape (a TEXT key, a BLOB value)
+/// still surfaces positionally in each [`Row`].
+#[must_use]
+pub fn is_local_storage_item_table(table_name: &str) -> bool {
+    table_name == "ItemTable"
 }
 
 /// Parsed 100-byte `SQLite` file header.
@@ -5163,17 +5233,10 @@ mod tests {
 
     #[test]
     fn item_table_schema_recognized_and_others_rejected() {
-        let cols = vec!["key".to_string(), "value".to_string()];
-        assert!(is_local_storage_item_table("ItemTable", &cols));
-        assert!(!is_local_storage_item_table("moz_places", &cols));
-        assert!(!is_local_storage_item_table(
-            "ItemTable",
-            &["key".to_string()]
-        ));
-        assert!(!is_local_storage_item_table(
-            "ItemTable",
-            &["k".to_string(), "v".to_string()]
-        ));
+        assert!(is_local_storage_item_table("ItemTable"));
+        assert!(!is_local_storage_item_table("moz_places"));
+        assert!(!is_local_storage_item_table("itemtable"));
+        assert!(!is_local_storage_item_table(""));
     }
 
     #[test]

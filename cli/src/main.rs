@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use sqlite4n6::blobdecode::{BlobDecoderInterpreter, ChainInterpreter};
 use sqlite4n6::{
     carve_output_dest, carve_wal_snapshots, combined_xlsx_bytes, count_blob_cells,
     filter_by_confidence, group_attributed_tables, journal_carved_records, render_audit,
@@ -29,11 +30,23 @@ use sqlite4n6::{
 };
 use sqlite_core::rebuild::build_recovered_db_tables;
 use sqlite_core::Database;
+use sqlite_forensic::interpret::{BlobInterpreter, LocalStorageInterpreter};
 use sqlite_forensic::{
     attribute_records, audit, audit_journal, carve_all_deleted_records, carve_rollback_journal,
     carve_with_fragments, table_instance_risks_with_sidecar, Anomaly, CarvedFragment, CarvedRecord,
     JournalRecovery,
 };
+
+// The BLOB interpreters applied to JSONL carve output, in priority order: the
+// schema-aware localStorage decoder first (its ItemTable UTF-16 prior), then the
+// general blob-decoder fallback (plist / gzip / JSON / …). Both are stateless ZSTs.
+static LOCALSTORAGE_INTERP: LocalStorageInterpreter = LocalStorageInterpreter;
+static BLOB_DECODER_INTERP: BlobDecoderInterpreter = BlobDecoderInterpreter;
+
+/// The ordered interpreter set for [`ChainInterpreter`], applied to JSONL blobs.
+fn jsonl_blob_interpreters() -> [&'static dyn BlobInterpreter; 2] {
+    [&LOCALSTORAGE_INTERP, &BLOB_DECODER_INTERP]
+}
 
 /// sqlite4n6 — read-only SQLite forensic analysis CLI.
 #[derive(Parser, Debug)]
@@ -737,7 +750,7 @@ fn render_carve_stream(args: &CarveArgs) -> Result<RenderedStream, String> {
                 &records,
                 &tables,
                 &risks,
-                Some(&sqlite_forensic::interpret::LocalStorageInterpreter),
+                Some(&ChainInterpreter(&jsonl_blob_interpreters())),
             )
         } else {
             render_carve_with_snapshot(&records, &risks, fmt, false)
@@ -795,7 +808,7 @@ fn render_carve_stream(args: &CarveArgs) -> Result<RenderedStream, String> {
                 &full,
                 &tables,
                 &risks,
-                Some(&sqlite_forensic::interpret::LocalStorageInterpreter),
+                Some(&ChainInterpreter(&jsonl_blob_interpreters())),
             );
             l.extend(render_fragments(&frags, fmt));
             l

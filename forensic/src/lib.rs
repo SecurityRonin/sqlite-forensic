@@ -30,6 +30,7 @@
 
 pub mod blob;
 pub mod case_uco;
+pub mod interpret;
 
 use forensicnomicon::report::{
     Confidence, Evidence, Finding, Location, Observation, Severity, Source,

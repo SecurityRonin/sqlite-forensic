@@ -9,6 +9,8 @@
 //! only reads the evidence file and emits the rendered output to the resolved
 //! destination.
 
+pub mod blobdecode;
+
 use std::path::{Path, PathBuf};
 
 use sqlite_core::rebuild::{FragmentRow, RebuildRow, RecoveredTable};

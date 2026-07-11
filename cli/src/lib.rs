@@ -2954,6 +2954,53 @@ mod tests {
     }
 
     #[test]
+    fn carve_jsonl_interpreted_blob_carries_interpretation_alongside_raw() {
+        // Seam step 3: a BLOB the interpreter recognises (a localStorage ItemTable
+        // value, raw UTF-16-LE) emits an "interpreted" object ALONGSIDE the
+        // lossless blob_base64 + sha256 — never replacing them (the raw bytes stay
+        // for the pipe). Secure by design: the "lossy" flag rides along.
+        let utf16le: Vec<u8> = "https://ex.test/p"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let records = vec![rec(
+            1,
+            0.9,
+            RecoverySource::FreelistPage,
+            vec![Value::Blob(utf16le.clone())],
+        )];
+        let tables = vec![Some("ItemTable".to_string())];
+        let interp = sqlite_forensic::interpret::LocalStorageInterpreter;
+
+        let line = &render_carve_jsonl_interpreted(&records, &tables, &[], Some(&interp))[0];
+        // The raw, lossless payload is still present.
+        assert!(
+            line.contains("\"blob_base64\":") && line.contains("\"sha256\":"),
+            "raw blob payload must remain: {line}"
+        );
+        // The interpretation is surfaced with its decoded text + metadata.
+        assert!(
+            line.contains("\"interpreted\":{")
+                && line.contains("\"text\":\"https://ex.test/p\"")
+                && line.contains("\"kind\":\"utf-16le\"")
+                && line.contains("\"lossy\":false"),
+            "the interpreted decode must be surfaced alongside the raw blob: {line}"
+        );
+
+        // Without an interpreter, behaviour is identical to plain render (no key).
+        let plain = &render_carve_jsonl_interpreted(&records, &tables, &[], None)[0];
+        assert!(
+            !plain.contains("\"interpreted\":"),
+            "no interpreter → no interpreted key (unchanged): {plain}"
+        );
+        assert_eq!(
+            plain,
+            &render_carve(&records, &[], OutputFormat::Jsonl, false)[0],
+            "None interpreter must match the existing render_carve output exactly"
+        );
+    }
+
+    #[test]
     fn carve_jsonl_unknown_blob_has_hash_but_no_media_type() {
         // An unrecognized blob still gets a hash (addressable) but no media_type
         // key (never a guessed type).

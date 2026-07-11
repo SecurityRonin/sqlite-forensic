@@ -265,10 +265,6 @@ pub fn json_escape(s: &str) -> String {
 /// [`value_to_cell`] as a JSON string (typed JSON is out of scope — the cell text
 /// is the published contract shared with the table/CSV surfaces).
 #[must_use]
-fn values_json_array(values: &[Value]) -> String {
-    values_json_array_interpreted(values, &BlobContext::default(), None)
-}
-
 /// A record's values as a JSON array, threading `ctx` + `interpreter` to each
 /// BLOB (seam step 3). `None` interpreter reproduces [`values_json_array`].
 fn values_json_array_interpreted(
@@ -756,10 +752,27 @@ fn render_carve_snapshot_jsonl(
     records: &[CarvedRecord],
     risks: &[TableInstanceRisk],
 ) -> Vec<String> {
+    render_carve_snapshot_jsonl_interpreted(records, &[], risks, None)
+}
+
+/// The WAL-snapshot JSONL renderer with optional BLOB interpretation (seam step 3).
+/// Mirrors [`render_carve_jsonl_interpreted`] but keeps the `snapshot` (LSN) column.
+/// `interpreter == None` reproduces the plain snapshot JSONL output byte-for-byte.
+#[must_use]
+pub fn render_carve_snapshot_jsonl_interpreted(
+    records: &[CarvedRecord],
+    tables: &[Option<String>],
+    risks: &[TableInstanceRisk],
+    interpreter: Option<&dyn BlobInterpreter>,
+) -> Vec<String> {
     records
         .iter()
         .enumerate()
         .map(|(i, rec)| {
+            let ctx = BlobContext {
+                table: tables.get(i).and_then(Option::as_deref),
+                column: None,
+            };
             format!(
                 "{{\"page\":{},\"offset\":{},\"rowid\":{},\"recovery_source\":\"{}\",\"confidence\":{:.4},\"snapshot\":\"{}\",\"table_instance_risk\":{}{},\"values\":{}}}",
                 rec.page,
@@ -770,8 +783,24 @@ fn render_carve_snapshot_jsonl(
                 json_escape(&snapshot_label(rec)),
                 table_instance_risk_json(risks, i),
                 method_provenance_json(rec),
-                values_json_array(&rec.values)
+                values_json_array_interpreted(&rec.values, &ctx, interpreter)
             )
+        })
+        .collect()
+}
+
+/// The per-record schema context (attributed table name) for JSONL blob
+/// interpretation, aligned with the record slice by index (seam step 3).
+/// [`Attribution::Known`]/[`Attribution::Inferred`] give the table name;
+/// [`Attribution::Unattributed`] is `None` (no interpretation prior).
+#[must_use]
+pub fn tables_from_attrs(attrs: &[Attribution]) -> Vec<Option<String>> {
+    attrs
+        .iter()
+        .map(|a| match a {
+            Attribution::Known(name) => Some(name.clone()),
+            Attribution::Inferred { guess, .. } => Some(guess.clone()),
+            Attribution::Unattributed => None,
         })
         .collect()
 }
@@ -3059,6 +3088,51 @@ mod tests {
             &render_carve(&records, &[], OutputFormat::Jsonl, false)[0],
             "None interpreter must match the existing render_carve output exactly"
         );
+    }
+
+    #[test]
+    fn tables_from_attrs_maps_attribution_to_table_name() {
+        // Seam step-3 wiring: attribution → per-record schema context (table name).
+        let attrs = vec![
+            Attribution::Known("ItemTable".to_string()),
+            Attribution::Inferred {
+                guess: "moz_places".to_string(),
+                ambiguous: false,
+            },
+            Attribution::Unattributed,
+        ];
+        assert_eq!(
+            tables_from_attrs(&attrs),
+            vec![
+                Some("ItemTable".to_string()),
+                Some("moz_places".to_string()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_jsonl_interpreted_surfaces_interpretation() {
+        // The WAL-snapshot JSONL path must ALSO carry blob interpretation.
+        let utf16le: Vec<u8> = "hey".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let records = vec![rec(
+            1,
+            0.9,
+            RecoverySource::WalFrame,
+            vec![Value::Blob(utf16le)],
+        )];
+        let tables = vec![Some("ItemTable".to_string())];
+        let interp = sqlite_forensic::interpret::LocalStorageInterpreter;
+        let line =
+            &render_carve_snapshot_jsonl_interpreted(&records, &tables, &[], Some(&interp))[0];
+        assert!(
+            line.contains("\"snapshot\":") && line.contains("\"interpreted\":{"),
+            "snapshot JSONL must carry both the snapshot column and interpretation: {line}"
+        );
+        assert!(line.contains("\"text\":\"hey\""), "{line}");
+        // None interpreter → identical to the plain snapshot renderer.
+        let plain = &render_carve_snapshot_jsonl_interpreted(&records, &tables, &[], None)[0];
+        assert!(!plain.contains("\"interpreted\":"), "{plain}");
     }
 
     #[test]

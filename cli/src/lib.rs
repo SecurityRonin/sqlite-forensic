@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use sqlite_core::rebuild::{FragmentRow, RebuildRow, RecoveredTable};
 use sqlite_core::{Database, Value, WalTimeline};
+use sqlite_forensic::interpret::{BlobContext, BlobInterpreter};
 use sqlite_forensic::{
     attribute_records, carve_all_deleted_records, carve_at_commit,
     table_instance_risks_with_sidecar, Anomaly, Attribution, CarvedFragment, CarvedRecord,
@@ -103,7 +104,16 @@ pub fn value_to_cell(value: &Value) -> String {
 /// JSON string, and base64 round-trips it exactly; every other type renders as
 /// its JSON-escaped string form (matching [`value_to_cell`]). table/CSV keep the
 /// `<blob:N bytes>` placeholder, since neither can carry raw binary safely.
-fn value_to_json(value: &Value) -> String {
+/// A single carved value as a JSON element, with an optional consumer-supplied
+/// BLOB interpretation (seam step 3). When `interpreter` recognises a BLOB under
+/// the record's schema `ctx`, an `"interpreted"` object is added ALONGSIDE the
+/// lossless `blob_base64` + `sha256` (never replacing them — the raw bytes stay for
+/// the pipe). `interpreter == None` is byte-identical to the pre-seam output.
+fn value_to_json_interpreted(
+    value: &Value,
+    ctx: &BlobContext<'_>,
+    interpreter: Option<&dyn BlobInterpreter>,
+) -> String {
     match value {
         Value::Blob(b) => {
             // Addressable in a case (§4.5): the lossless base64 payload plus a
@@ -112,8 +122,23 @@ fn value_to_json(value: &Value) -> String {
             let media = sqlite_forensic::blob::identify_media_type(b)
                 .map(|m| format!(",\"media_type\":\"{m}\""))
                 .unwrap_or_default();
+            // The interpretation, when a supplied interpreter recognises the bytes
+            // in this schema context. `lossy` rides along so a consumer cannot
+            // present a lossy decode as faithful.
+            let interpreted = interpreter
+                .and_then(|i| i.interpret(b, ctx))
+                .map(|interp| {
+                    format!(
+                        ",\"interpreted\":{{\"text\":\"{}\",\"kind\":\"{}\",\"lossy\":{},\"confidence\":{:.4}}}",
+                        json_escape(&interp.text),
+                        json_escape(&interp.kind),
+                        interp.lossy,
+                        interp.confidence
+                    )
+                })
+                .unwrap_or_default();
             format!(
-                "{{\"blob_base64\":\"{}\",\"sha256\":\"{}\"{media}}}",
+                "{{\"blob_base64\":\"{}\",\"sha256\":\"{}\"{media}{interpreted}}}",
                 base64_encode(b),
                 sqlite_forensic::blob::sha256_hex(b)
             )
@@ -241,7 +266,20 @@ pub fn json_escape(s: &str) -> String {
 /// is the published contract shared with the table/CSV surfaces).
 #[must_use]
 fn values_json_array(values: &[Value]) -> String {
-    let parts: Vec<String> = values.iter().map(value_to_json).collect();
+    values_json_array_interpreted(values, &BlobContext::default(), None)
+}
+
+/// A record's values as a JSON array, threading `ctx` + `interpreter` to each
+/// BLOB (seam step 3). `None` interpreter reproduces [`values_json_array`].
+fn values_json_array_interpreted(
+    values: &[Value],
+    ctx: &BlobContext<'_>,
+    interpreter: Option<&dyn BlobInterpreter>,
+) -> String {
+    let parts: Vec<String> = values
+        .iter()
+        .map(|v| value_to_json_interpreted(v, ctx, interpreter))
+        .collect();
     format!("[{}]", parts.join(","))
 }
 
@@ -411,10 +449,33 @@ fn render_carve_csv(records: &[CarvedRecord]) -> Vec<String> {
 }
 
 fn render_carve_jsonl(records: &[CarvedRecord], risks: &[TableInstanceRisk]) -> Vec<String> {
+    render_carve_jsonl_interpreted(records, &[], risks, None)
+}
+
+/// Render carved records as JSONL, enriching each BLOB with a consumer-supplied
+/// interpretation (seam step 3) when the `interpreter` recognises it under the
+/// record's attributed table (`tables[i]`, the schema context). The interpretation
+/// is added ALONGSIDE the lossless `blob_base64` + `sha256`, never replacing them.
+///
+/// `tables` is aligned with `records` by index; a shorter/empty slice (or a `None`
+/// entry) yields no table context, so the interpreter simply does not fire.
+/// `interpreter == None` reproduces the plain [`render_carve`] JSONL output
+/// byte-for-byte — this seam is non-breaking.
+#[must_use]
+pub fn render_carve_jsonl_interpreted(
+    records: &[CarvedRecord],
+    tables: &[Option<String>],
+    risks: &[TableInstanceRisk],
+    interpreter: Option<&dyn BlobInterpreter>,
+) -> Vec<String> {
     records
         .iter()
         .enumerate()
         .map(|(i, rec)| {
+            let ctx = BlobContext {
+                table: tables.get(i).and_then(Option::as_deref),
+                column: None,
+            };
             format!(
                 "{{\"page\":{},\"offset\":{},\"rowid\":{},\"recovery_source\":\"{}\",\"confidence\":{:.4},\"table_instance_risk\":{}{},\"values\":{}}}",
                 rec.page,
@@ -424,7 +485,7 @@ fn render_carve_jsonl(records: &[CarvedRecord], risks: &[TableInstanceRisk]) -> 
                 rec.confidence,
                 table_instance_risk_json(risks, i),
                 method_provenance_json(rec),
-                values_json_array(&rec.values)
+                values_json_array_interpreted(&rec.values, &ctx, interpreter)
             )
         })
         .collect()

@@ -23,8 +23,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use sqlite4n6::{
     carve_output_dest, carve_wal_snapshots, combined_xlsx_bytes, count_blob_cells,
     filter_by_confidence, group_attributed_tables, journal_carved_records, render_audit,
-    render_carve, render_carve_tiered, render_carve_with_snapshot, render_fragments,
-    render_timeline, MinConfidence, OutputDest, OutputFormat, EXCEL_MAX_ROWS,
+    render_carve, render_carve_jsonl_interpreted, render_carve_snapshot_jsonl_interpreted,
+    render_carve_tiered, render_carve_with_snapshot, render_fragments, render_timeline,
+    tables_from_attrs, MinConfidence, OutputDest, OutputFormat, EXCEL_MAX_ROWS,
 };
 use sqlite_core::rebuild::build_recovered_db_tables;
 use sqlite_core::Database;
@@ -728,8 +729,19 @@ fn render_carve_stream(args: &CarveArgs) -> Result<RenderedStream, String> {
         let risks = table_instance_risks_with_sidecar(&db, &records, &attrs, &prior_schema);
         // `rowid_only` is always false: the bare-rowid format was dropped (multiple
         // versions per rowid + rowid reuse + destroyed rowids made a flat list
-        // misleading); the full record stream is always rendered.
-        let mut lines = render_carve_with_snapshot(&records, &risks, fmt, false);
+        // misleading); the full record stream is always rendered. JSONL decodes
+        // schema-known BLOBs (e.g. localStorage UTF-16) via the built-in interpreter.
+        let mut lines = if fmt == OutputFormat::Jsonl {
+            let tables = tables_from_attrs(&attrs);
+            render_carve_snapshot_jsonl_interpreted(
+                &records,
+                &tables,
+                &risks,
+                Some(&sqlite_forensic::interpret::LocalStorageInterpreter),
+            )
+        } else {
+            render_carve_with_snapshot(&records, &risks, fmt, false)
+        };
         // v1 fragments are sourced from the on-disk image only (no WAL fragment
         // pass yet); render the default section under the WAL-applied view's `db`.
         let frags = if args.no_fragments {
@@ -775,7 +787,19 @@ fn render_carve_stream(args: &CarveArgs) -> Result<RenderedStream, String> {
         let frags = args.select_fragments(frags_raw);
         let frag_slice = (!frags.is_empty()).then_some(frags.as_slice());
         let blob_cells = count_blob_cells(&full, frag_slice);
-        let lines = if frags.is_empty() {
+        let lines = if fmt == OutputFormat::Jsonl {
+            // Decode schema-known BLOBs (e.g. localStorage UTF-16) via the built-in
+            // interpreter; append the fragment section unchanged.
+            let tables = tables_from_attrs(&attrs);
+            let mut l = render_carve_jsonl_interpreted(
+                &full,
+                &tables,
+                &risks,
+                Some(&sqlite_forensic::interpret::LocalStorageInterpreter),
+            );
+            l.extend(render_fragments(&frags, fmt));
+            l
+        } else if frags.is_empty() {
             render_carve(&full, &risks, fmt, false)
         } else {
             render_carve_tiered(&full, &risks, &frags, fmt, false)

@@ -265,10 +265,6 @@ pub fn json_escape(s: &str) -> String {
 /// [`value_to_cell`] as a JSON string (typed JSON is out of scope — the cell text
 /// is the published contract shared with the table/CSV surfaces).
 #[must_use]
-fn values_json_array(values: &[Value]) -> String {
-    values_json_array_interpreted(values, &BlobContext::default(), None)
-}
-
 /// A record's values as a JSON array, threading `ctx` + `interpreter` to each
 /// BLOB (seam step 3). `None` interpreter reproduces [`values_json_array`].
 fn values_json_array_interpreted(
@@ -756,10 +752,27 @@ fn render_carve_snapshot_jsonl(
     records: &[CarvedRecord],
     risks: &[TableInstanceRisk],
 ) -> Vec<String> {
+    render_carve_snapshot_jsonl_interpreted(records, &[], risks, None)
+}
+
+/// The WAL-snapshot JSONL renderer with optional BLOB interpretation (seam step 3).
+/// Mirrors [`render_carve_jsonl_interpreted`] but keeps the `snapshot` (LSN) column.
+/// `interpreter == None` reproduces the plain snapshot JSONL output byte-for-byte.
+#[must_use]
+pub fn render_carve_snapshot_jsonl_interpreted(
+    records: &[CarvedRecord],
+    tables: &[Option<String>],
+    risks: &[TableInstanceRisk],
+    interpreter: Option<&dyn BlobInterpreter>,
+) -> Vec<String> {
     records
         .iter()
         .enumerate()
         .map(|(i, rec)| {
+            let ctx = BlobContext {
+                table: tables.get(i).and_then(Option::as_deref),
+                column: None,
+            };
             format!(
                 "{{\"page\":{},\"offset\":{},\"rowid\":{},\"recovery_source\":\"{}\",\"confidence\":{:.4},\"snapshot\":\"{}\",\"table_instance_risk\":{}{},\"values\":{}}}",
                 rec.page,
@@ -770,8 +783,24 @@ fn render_carve_snapshot_jsonl(
                 json_escape(&snapshot_label(rec)),
                 table_instance_risk_json(risks, i),
                 method_provenance_json(rec),
-                values_json_array(&rec.values)
+                values_json_array_interpreted(&rec.values, &ctx, interpreter)
             )
+        })
+        .collect()
+}
+
+/// The per-record schema context (attributed table name) for JSONL blob
+/// interpretation, aligned with the record slice by index (seam step 3).
+/// [`Attribution::Known`]/[`Attribution::Inferred`] give the table name;
+/// [`Attribution::Unattributed`] is `None` (no interpretation prior).
+#[must_use]
+pub fn tables_from_attrs(attrs: &[Attribution]) -> Vec<Option<String>> {
+    attrs
+        .iter()
+        .map(|a| match a {
+            Attribution::Known(name) => Some(name.clone()),
+            Attribution::Inferred { guess, .. } => Some(guess.clone()),
+            Attribution::Unattributed => None,
         })
         .collect()
 }

@@ -49,16 +49,19 @@ fn sqlite3_query(bin: &str, db: &Path, sql: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Hex encoding of a string's UTF-16-LE bytes — how WebKit Local Storage stores an
+/// Hex encoding of a string's UTF-16-LE bytes — how `WebKit` Local Storage stores an
 /// `ItemTable.value`, for an `x'..'` SQLite blob literal.
 fn utf16le_hex(s: &str) -> String {
+    use std::fmt::Write as _;
     s.encode_utf16()
         .flat_map(u16::to_le_bytes)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
 }
 
-/// End-to-end: `carve -f jsonl` on a WebKit Local Storage database decodes a deleted
+/// End-to-end: `carve -f jsonl` on a `WebKit` Local Storage database decodes a deleted
 /// `ItemTable.value` BLOB (raw UTF-16-LE) into readable text via the built-in
 /// interpreter, surfaced in the `interpreted` field alongside the raw blob. This is
 /// the seam wired all the way through the binary. Env-gated on `sqlite3`.
@@ -70,20 +73,29 @@ fn carve_jsonl_decodes_deleted_localstorage_values() {
     };
     let dir = Scratch::new("localstorage");
     let db = dir.join("origin.localstorage");
-    let deleted_url = "https://secret.example/deleted-page";
+    // Keep every value the same short serial-width class (< ~29 chars → 1-byte
+    // serial) so the freeblock reconstruction template (built from the surviving
+    // live rows) matches the deleted rows' header layout.
+    let deleted_url = "https://x.test/secret";
     let sql = format!(
         "PRAGMA page_size=4096; PRAGMA secure_delete=OFF;\n\
          CREATE TABLE ItemTable (key BLOB, value BLOB);\n\
          INSERT INTO ItemTable VALUES(x'{k1}', x'{v1}');\n\
          INSERT INTO ItemTable VALUES(x'{k2}', x'{v2}');\n\
          INSERT INTO ItemTable VALUES(x'{k3}', x'{v3}');\n\
-         DELETE FROM ItemTable WHERE key = x'{k2}';",
-        k1 = utf16le_hex("alpha"),
-        v1 = utf16le_hex("https://alive.example/one"),
-        k2 = utf16le_hex("beta"),
+         INSERT INTO ItemTable VALUES(x'{k4}', x'{v4}');\n\
+         INSERT INTO ItemTable VALUES(x'{k5}', x'{v5}');\n\
+         DELETE FROM ItemTable WHERE key IN (x'{k2}', x'{k4}');",
+        k1 = utf16le_hex("k1"),
+        v1 = utf16le_hex("https://x.test/one"),
+        k2 = utf16le_hex("k2"),
         v2 = utf16le_hex(deleted_url),
-        k3 = utf16le_hex("gamma"),
-        v3 = utf16le_hex("https://alive.example/three"),
+        k3 = utf16le_hex("k3"),
+        v3 = utf16le_hex("https://x.test/three"),
+        k4 = utf16le_hex("k4"),
+        v4 = utf16le_hex("https://x.test/four"),
+        k5 = utf16le_hex("k5"),
+        v5 = utf16le_hex("https://x.test/five"),
     );
     // Build the fixture (writes to the .localstorage file).
     let _ = sqlite3_query(&sq, &db, &sql);

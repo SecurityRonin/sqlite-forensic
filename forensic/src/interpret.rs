@@ -14,7 +14,7 @@
 //! cannot render a lossy decode as a faithful one — the uncertainty is structural,
 //! not a side-channel warning.
 
-use sqlite_core::Value;
+use sqlite_core::{decode_localstorage_value, is_local_storage_item_table, Value};
 
 /// The schema context a [`BlobInterpreter`] may use as a decoding prior — e.g. a
 /// known table/column ("this column holds UTF-16 Local Storage values") lifts a
@@ -51,6 +51,37 @@ pub trait BlobInterpreter {
     /// Interpret a `BLOB`'s bytes in the given schema context, or `None` when this
     /// interpreter recognises nothing in them.
     fn interpret(&self, bytes: &[u8], ctx: &BlobContext<'_>) -> Option<Interpretation>;
+}
+
+/// Confidence assigned when a BLOB is decoded under a matching schema-name prior
+/// (a `WebKit` Local Storage `ItemTable` column): the context makes UTF-16-LE the
+/// confident reading, not a coincidental structural match.
+const SCHEMA_MATCHED_CONFIDENCE: f32 = 0.95;
+
+/// The built-in, dependency-free [`BlobInterpreter`] for `WebKit`/Chromium Local
+/// Storage. A `.localstorage` `ItemTable.value` BLOB holds its string as raw
+/// UTF-16-LE (no BOM, no type byte); this decodes it — but ONLY when the schema
+/// context identifies the `ItemTable` column, which is the prior that makes the
+/// UTF-16-LE reading confident. An arbitrary BLOB is not this interpreter's job
+/// (that is the general `blob-decoder` adapter); it returns `None`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalStorageInterpreter;
+
+impl BlobInterpreter for LocalStorageInterpreter {
+    fn interpret(&self, bytes: &[u8], ctx: &BlobContext<'_>) -> Option<Interpretation> {
+        // Fire only under the ItemTable schema-name prior — without it there is no
+        // evidence these bytes are UTF-16-LE rather than any other encoding.
+        if !ctx.table.is_some_and(is_local_storage_item_table) {
+            return None;
+        }
+        let decoded = decode_localstorage_value(bytes);
+        Some(Interpretation {
+            text: decoded.text,
+            kind: "utf-16le".to_string(),
+            lossy: decoded.lossy,
+            confidence: SCHEMA_MATCHED_CONFIDENCE,
+        })
+    }
 }
 
 /// Apply `interpreter` to every `BLOB` in `values`, returning `(column_index,

@@ -1,5 +1,5 @@
 //! Step 2 of the blob-interpreter seam: the built-in [`LocalStorageInterpreter`]
-//! (no external deps) that decodes a WebKit Local Storage `ItemTable.value` BLOB —
+//! (no external deps) that decodes a `WebKit` Local Storage `ItemTable.value` BLOB —
 //! raw UTF-16-LE — using the schema-name context as the high-confidence prior.
 //! This is "schema context lifts a structural-Low reading to High" made concrete:
 //! an arbitrary blob is not our job (that's the blob-decoder adapter), but a blob

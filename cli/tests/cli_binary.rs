@@ -49,6 +49,61 @@ fn sqlite3_query(bin: &str, db: &Path, sql: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Hex encoding of a string's UTF-16-LE bytes — how WebKit Local Storage stores an
+/// `ItemTable.value`, for an `x'..'` SQLite blob literal.
+fn utf16le_hex(s: &str) -> String {
+    s.encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// End-to-end: `carve -f jsonl` on a WebKit Local Storage database decodes a deleted
+/// `ItemTable.value` BLOB (raw UTF-16-LE) into readable text via the built-in
+/// interpreter, surfaced in the `interpreted` field alongside the raw blob. This is
+/// the seam wired all the way through the binary. Env-gated on `sqlite3`.
+#[test]
+fn carve_jsonl_decodes_deleted_localstorage_values() {
+    let Some(sq) = sqlite3_bin() else {
+        eprintln!("SKIP carve_jsonl_decodes_deleted_localstorage_values: no sqlite3");
+        return;
+    };
+    let dir = Scratch::new("localstorage");
+    let db = dir.join("origin.localstorage");
+    let deleted_url = "https://secret.example/deleted-page";
+    let sql = format!(
+        "PRAGMA page_size=4096; PRAGMA secure_delete=OFF;\n\
+         CREATE TABLE ItemTable (key BLOB, value BLOB);\n\
+         INSERT INTO ItemTable VALUES(x'{k1}', x'{v1}');\n\
+         INSERT INTO ItemTable VALUES(x'{k2}', x'{v2}');\n\
+         INSERT INTO ItemTable VALUES(x'{k3}', x'{v3}');\n\
+         DELETE FROM ItemTable WHERE key = x'{k2}';",
+        k1 = utf16le_hex("alpha"),
+        v1 = utf16le_hex("https://alive.example/one"),
+        k2 = utf16le_hex("beta"),
+        v2 = utf16le_hex(deleted_url),
+        k3 = utf16le_hex("gamma"),
+        v3 = utf16le_hex("https://alive.example/three"),
+    );
+    // Build the fixture (writes to the .localstorage file).
+    let _ = sqlite3_query(&sq, &db, &sql);
+
+    let out = bin()
+        .args(["carve", db.to_str().unwrap(), "-f", "jsonl", "-o", "-"])
+        .output()
+        .expect("run carve -f jsonl");
+    assert!(out.status.success(), "carve must exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"interpreted\""),
+        "a deleted ItemTable BLOB must be decoded into an interpreted field: {stdout}"
+    );
+    assert!(
+        stdout.contains(deleted_url),
+        "the decoded UTF-16 URL must appear in the interpreted text: {stdout}"
+    );
+}
+
 /// The on-disk fixture that surfaces a Tier-2 fragment by default (id 20004
 /// "Anja"/"Frank" — the same case the forensic crate's fragment tests assert).
 fn fragment_fixture() -> PathBuf {

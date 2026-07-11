@@ -3062,6 +3062,51 @@ mod tests {
     }
 
     #[test]
+    fn tables_from_attrs_maps_attribution_to_table_name() {
+        // Seam step-3 wiring: attribution → per-record schema context (table name).
+        let attrs = vec![
+            Attribution::Known("ItemTable".to_string()),
+            Attribution::Inferred {
+                guess: "moz_places".to_string(),
+                ambiguous: false,
+            },
+            Attribution::Unattributed,
+        ];
+        assert_eq!(
+            tables_from_attrs(&attrs),
+            vec![
+                Some("ItemTable".to_string()),
+                Some("moz_places".to_string()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_jsonl_interpreted_surfaces_interpretation() {
+        // The WAL-snapshot JSONL path must ALSO carry blob interpretation.
+        let utf16le: Vec<u8> = "hey".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let records = vec![rec(
+            1,
+            0.9,
+            RecoverySource::WalFrame,
+            vec![Value::Blob(utf16le)],
+        )];
+        let tables = vec![Some("ItemTable".to_string())];
+        let interp = sqlite_forensic::interpret::LocalStorageInterpreter;
+        let line =
+            &render_carve_snapshot_jsonl_interpreted(&records, &tables, &[], Some(&interp))[0];
+        assert!(
+            line.contains("\"snapshot\":") && line.contains("\"interpreted\":{"),
+            "snapshot JSONL must carry both the snapshot column and interpretation: {line}"
+        );
+        assert!(line.contains("\"text\":\"hey\""), "{line}");
+        // None interpreter → identical to the plain snapshot renderer.
+        let plain = &render_carve_snapshot_jsonl_interpreted(&records, &tables, &[], None)[0];
+        assert!(!plain.contains("\"interpreted\":"), "{plain}");
+    }
+
+    #[test]
     fn carve_jsonl_unknown_blob_has_hash_but_no_media_type() {
         // An unrecognized blob still gets a hash (addressable) but no media_type
         // key (never a guessed type).

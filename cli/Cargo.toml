@@ -20,6 +20,7 @@ name = "sqlite4n6"
 path = "src/main.rs"
 
 [dependencies]
+blob-decoder = "0.1"
 sqlite-core = { workspace = true }
 sqlite-forensic = { workspace = true }
 forensicnomicon = { workspace = true }

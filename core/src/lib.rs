@@ -11,9 +11,9 @@
 //! segment of materializable [`CommitSnapshot`]s for "carve all snapshots".
 //!
 //! Format constants are consumed from [`forensicnomicon::sqlite`] (the KNOWLEDGE
-//! leaf) where exposed; a few not-yet-promoted offsets (reserved-space 20,
-//! in-header DB-size 28, freelist-count 36) are held locally and flagged for
-//! promotion. Index-b-tree LEAF reading is a foundation
+//! leaf), including the page-1 header field offsets (reserved-space 20, in-header
+//! DB-size 28, freelist-count 36, text-encoding 56) promoted there in §3.1.
+//! Index-b-tree LEAF reading is a foundation
 //! ([`Database::index_leaf_cells`], roadmap §1.4) — the second substrate for a
 //! table's data and the storage of `WITHOUT ROWID` rows; carving DELETED index
 //! entries and following index-key overflow remain follow-ups.
@@ -25,30 +25,17 @@ pub mod attribution;
 pub mod rebuild;
 pub mod row_history;
 
+// The page-1 header field offsets are consumed from the KNOWLEDGE leaf
+// (forensicnomicon::sqlite ≥ 1.5.0); the previously-local duplicates were promoted
+// there (roadmap §3.1). Aliased to the historical local names so every use site is
+// unchanged and the names read naturally in context.
 use forensicnomicon::sqlite::{
-    SQLITE_FREELIST_TRUNK_OFFSET, SQLITE_HEADER_SIZE, SQLITE_MAGIC, SQLITE_PAGE_SIZE_OFFSET,
+    SQLITE_DB_SIZE_OFFSET as DB_SIZE_IN_PAGES_OFFSET,
+    SQLITE_FREELIST_COUNT_OFFSET as FREELIST_COUNT_OFFSET, SQLITE_FREELIST_TRUNK_OFFSET,
+    SQLITE_HEADER_SIZE, SQLITE_MAGIC, SQLITE_PAGE_SIZE_OFFSET,
+    SQLITE_RESERVED_SPACE_OFFSET as RESERVED_SPACE_OFFSET,
+    SQLITE_TEXT_ENCODING_OFFSET as TEXT_ENCODING_OFFSET,
 };
-
-/// Byte offset of the 1-byte "reserved space per page" field in the file header
-/// (file-format §1.3.4). forensicnomicon does not yet expose this; WS-E should
-/// promote it into `forensicnomicon::sqlite`.
-const RESERVED_SPACE_OFFSET: usize = 20;
-
-/// Byte offset of the 4-byte big-endian text-encoding field in the file header
-/// (file-format §1.3.1). forensicnomicon does not yet expose this; promote it
-/// into `forensicnomicon::sqlite` alongside [`RESERVED_SPACE_OFFSET`].
-const TEXT_ENCODING_OFFSET: usize = 56;
-
-/// Byte offset of the in-header database size, in pages (file-format §1.3.6).
-/// 4-byte big-endian. Valid only when it equals the change counter at offset 24
-/// (a "size is valid" sentinel); the file-length fallback covers the rest.
-/// forensicnomicon does not yet expose this — promote it in a later pass.
-const DB_SIZE_IN_PAGES_OFFSET: usize = 28;
-
-/// Byte offset of the freelist page **count** in the file header (file-format
-/// §1.3.5). 4-byte big-endian. The trunk pointer lives at
-/// [`SQLITE_FREELIST_TRUNK_OFFSET`] (32); this count is the next field (36).
-const FREELIST_COUNT_OFFSET: usize = 36;
 
 /// Errors that can arise while reading a `SQLite` database, all recoverable —
 /// the reader never panics on malformed input.

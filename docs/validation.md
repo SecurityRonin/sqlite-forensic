@@ -155,7 +155,9 @@ with* independent references, **not proven correct**.
 - **DELETE-mode** (the `-journal` is unlinked) and **TRUNCATE-mode** (it is zeroed) rollback
   journals leave no in-band residue — recovering those is a disk-carving-layer concern, out of
   scope here.
-- **Encrypted databases** (SQLCipher / SEE) are out of scope.
+- **Encrypted databases** (SQLCipher / SEE) are **detected** — the reserved-space anomaly names
+  the likely scheme from the header (80 = SQLCipher 4, 48 = SQLCipher 1–3, 8 = checksum VFS) and
+  states record recovery needs the key — but **decryption is out of scope**.
 - The survey **false-positive benchmark is a replication** of the paper's construction, not the
   official corpus (which is not public yet); and **FQLite scenario-10** (WAL + `secure_delete`)
   is **cited from the paper**, not measured here, because FQLite's WAL recovery is GUI-coupled.

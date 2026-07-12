@@ -111,6 +111,7 @@ Want a queryable database, a different file, or a stream instead? One `-f` choic
 $ sqlite4n6 carve ChatStorage.sqlite -f db              # → ChatStorage.carved.db (queryable)
 $ sqlite4n6 carve ChatStorage.sqlite -f jsonl           # → ChatStorage.carved.jsonl (one JSON object/record)
 $ sqlite4n6 carve ChatStorage.sqlite -f csv             # → ChatStorage.carved.csv
+$ sqlite4n6 carve ChatStorage.sqlite -f case            # → ChatStorage.recovered.case.json (CASE/UCO bundle)
 $ sqlite4n6 carve ChatStorage.sqlite -o /cases/2026-001/case.xlsx  # exact output path (honored verbatim)
 $ sqlite4n6 carve ChatStorage.sqlite -f jsonl -o - | jq # stream to stdout for piping (no summary line)
 $ sqlite4n6 carve ChatStorage.sqlite --min-confidence medium  # drop low-confidence carves
@@ -118,6 +119,8 @@ $ sqlite4n6 audit ChatStorage.sqlite                    # severity-graded anomal
 ```
 
 One output per run — pick the format you need; run again for another. **Blob fidelity differs by format:** `db` (native bytes) and `jsonl` (`blob_base64`) preserve blob *content* losslessly; `csv` and `table` render a blob as a `<blob:N bytes>` placeholder (only the byte count survives), so reach for `db` or `jsonl` when blob content — recovered images, say — must be kept.
+
+**Recovered BLOBs are made addressable.** In the `jsonl` stream every carved BLOB carries a **SHA-256 content hash** (always) and, when a magic signature is recognized, a **`media_type`** (PNG/JPEG/PDF/gzip/zip/…). When the value is a recognized *encoded* payload — a WebKit Local Storage `ItemTable` UTF-16 string, or (via the general [`blob-decoder`](https://crates.io/crates/blob-decoder)) a binary-plist / gzip / JSON / base64 blob — it also carries a decoded **`interpreted`** object (`text` / `kind` / `lossy` / `confidence`), *alongside* the raw base64 so the bytes still round-trip. `-f case` emits a **CASE/UCO JSON-LD bundle** where each recovered BLOB is a `uco-observable:ObservableObject` with its media type + SHA-256 hash, for case-management interop.
 
 **Filter by confidence with `--min-confidence`.** Every carved item carries a confidence set by *how* it was recovered; the flag keeps only items at or above a level (default `info`), trading recall for a cleaner sheet:
 
@@ -148,6 +151,10 @@ Under the hood `sqlite4n6` reads the raw file format itself — freelist pages, 
 | Carve every WAL commit snapshot, LSN-labelled (per-commit timeline) | ✅ | — |
 | Recover the last transaction's deletes **and edits** from the rollback `-journal` (default `DELETE`/`PERSIST` mode) | ✅ | — |
 | Graded, confidence-scored anomaly findings | ✅ | — |
+| Anti-forensic fingerprints (secure_delete residue-zeroing, freelist count/chain tamper) | ✅ | — |
+| Name the encryption/checksum scheme from the header (SQLCipher / SEE / checksum VFS) | ✅ | — |
+| Type + SHA-256-hash recovered BLOBs; decode encoded values (plist/gzip/JSON/UTF-16) | ✅ | — |
+| Export recovered media as a CASE/UCO JSON-LD bundle | ✅ | — |
 | Refuses to ever re-surface a live row as "deleted" | ✅ | n/a |
 | `forbid(unsafe)`, panic-free on hostile input | ✅ | C / FFI |
 
@@ -248,6 +255,16 @@ for schema in recover_dropped_schemas(&db) {
 
 The reader (`sqlite-core`) answers *"what does this file actually contain?"*; the analyzer (`sqlite-forensic`) grades the forensically notable parts and recovers the deleted ones.
 
+**Prefer Python?** The [`python/`](python) crate ships thin [`pyo3`](https://pyo3.rs) bindings — `carve` / `audit` / `timeline` over a database path, returning plain lists of dicts — for the Python-first DFIR workflow:
+
+```python
+import sqlite4n6
+for rec in sqlite4n6.carve("History.db"):
+    print(rec["rowid"], rec["recovery_source"], rec["values"])
+```
+
+Build with `maturin develop` from `python/` (one abi3 wheel works across CPython ≥ 3.9). The pyo3 glue is the one place `unsafe` lives, so it sits in its own crate outside the workspace's `forbid(unsafe)`.
+
 This is one workspace (`sqlite-forensic`): two library crates following the fleet reader/analyzer split, plus the `sqlite4n6` CLI that consumes them.
 
 | Crate | Role | Entry points |
@@ -270,7 +287,9 @@ This is one workspace (`sqlite-forensic`): two library crates following the flee
 | `SQLITE-FREELIST-NONEMPTY` | Low | The database holds free pages — consistent with prior deletions (`DELETE` without `VACUUM`); those pages may retain recoverable rows. |
 | `SQLITE-WAL-UNCHECKPOINTED` | Medium | A `-wal` sidecar carries committed page versions the main file does not reflect — the main file alone under-reports the true state. **Acquire the live `-wal` before the application terminates**: a checkpoint (e.g. on its next clean close) folds the WAL into the main file and discards the uncheckpointed deleted/superseded residue, which the post-checkpoint main file no longer contains. |
 | `SQLITE-PAGECOUNT-MISMATCH` | High | The in-header page count disagrees with the count implied by file length — consistent with truncation, carving, or out-of-band modification. |
-| `SQLITE-RESERVED-SPACE-NONZERO` | Low | The header reserves bytes per page — non-standard; consistent with a page-level extension such as encryption (SQLCipher/SEE) or a checksum VFS. |
+| `SQLITE-RESERVED-SPACE-NONZERO` | Low | The header reserves bytes per page — non-standard; **names the likely scheme from the reserved-byte count** (80 = SQLCipher 4, 48 = SQLCipher 1–3, 8 = checksum VFS), states that record recovery needs the key/VFS, and shows the raw value. Detection only. |
+| `SQLITE-FREELIST-COUNT-INCONSISTENT` | High | The header's free-page count (offset 36) disagrees with the walked trunk chain, or the chain is unwalkable — consistent with freelist tampering (an edited count to hide freed pages) or corruption. |
+| `SQLITE-FREELIST-RESIDUE-ZEROED` | Medium | Freed freelist *leaf* pages are entirely zero — the deleted records they held were overwritten; consistent with `secure_delete=ON` or a manual wipe (an anti-forensic fingerprint, never asserted as intent). |
 | `SQLITE-JOURNAL-HOT` | High | A `-journal` with a valid header sits beside the database — consistent with an interrupted or in-progress write transaction (the main db may require rollback). |
 | `SQLITE-JOURNAL-RECOVERABLE` | Medium | A `PERSIST` rollback journal carries pre-transaction page images — consistent with a committed transaction whose deleted/modified rows remain recoverable. |
 | `SQLITE-JOURNAL-CHECKSUM-MISMATCH` | High | A journal page record failed its page checksum — consistent with corruption, a torn page write, or post-write modification. Names the offending page(s). |
@@ -295,7 +314,7 @@ A carver that *over*-reports is worse than useless on an evidence database — i
 - **Strong in-page recall via freeblock reconstruction — reported honestly.** On the cleanest category (`0C`: records deleted in place, `secure_delete=0`, no overwrite, so **every** deleted row's bytes survive) the carver recovers **70 of the 84** cross-tool-scored rows (recall **0.833**), ahead of `fqlite`'s 0.798. SQLite overwrites a freed cell's first four bytes (payload-length + rowid varints, `header_len`, leading serial) with the freeblock pointer; `reconstruct_freeblock_records` rebuilds each record from its surviving serial-type tail plus a schema template derived from a live cell on the same page, with the destroyed rowid surfaced as unknown. It does so at higher precision than `fqlite` and **0 live-re-reads**.
 - **Overflow-page chains: partial recovery, honestly bounded.** A deleted row whose payload spilled onto a freed overflow chain is reassembled to a full row **only when every chain page survives as a freelist leaf**; a chain page reallocated as the freelist trunk destroys the record, which is then refused from the full tier and surfaces only as a Tier-2 fragment. On the Nemetz `0E` category this reassembles the one byte-perfectly-recoverable spilled chain (verified `assert_eq!` against the answer key, substrate recall **1.000**) for an **end-to-end `0E` recall of 0.333** — a deliberately bounded capability, graded below the in-page tier, never claimed as full overflow recovery.
 - **Secondary checks stay labelled as such.** The undark/fqlite differential ([`docs/validation.md`](docs/validation.md)) is **inter-tool concordance** (the oracles disagree with each other — agreement, not correctness), and the DC3 `sqlite_dissect` corpus is a **no-false-positive regression set** (its `expected_rows` are live content, not a deleted set), never a recall oracle. The 2025 survey false-positive benchmark is a **replication** of the paper's scenario construction (the official corpus is not public yet), and the FQLite scenario-10 number is **cited from the paper**, not measured here (its WAL recovery is GUI-coupled).
-- **Out of scope, stated plainly.** A **same-schema drop+recreate** is undecidable from a single snapshot and from a sidecar (indistinguishable from a benign `VACUUM` page move), so `table_instance_risk` flags only `AUTOINCREMENT` rowid-overflow and unambiguous sidecar schema changes — never the same-schema case. **DELETE-mode** (the `-journal` is unlinked) and **TRUNCATE-mode** (it is zeroed) rollback journals leave no in-band residue (a disk-carving-layer concern). **Encrypted databases** (SQLCipher / SEE) are out of scope. The carver is **structural** (b-tree / freelist / journal layout), so a Boyer-Moore signature scan is inapplicable by design.
+- **Out of scope, stated plainly.** A **same-schema drop+recreate** is undecidable from a single snapshot and from a sidecar (indistinguishable from a benign `VACUUM` page move), so `table_instance_risk` flags only `AUTOINCREMENT` rowid-overflow and unambiguous sidecar schema changes — never the same-schema case. **DELETE-mode** (the `-journal` is unlinked) and **TRUNCATE-mode** (it is zeroed) rollback journals leave no in-band residue (a disk-carving-layer concern). **Encrypted databases** (SQLCipher / SEE) are **detected and named** — the reserved-space anomaly identifies the likely scheme from the header and states that record recovery needs the key — but **decryption stays out of scope**. The carver is **structural** (b-tree / freelist / journal layout), so a Boyer-Moore signature scan is inapplicable by design.
 
 Carved records remain **confidence-graded observations** ("consistent with a deleted row"), never a verdict. The honest summary: a strict precision discipline confirmed against independent ground truth, and a documented in-page recall gap — not a claim of perfect recall or proof of correctness.
 

@@ -43,11 +43,11 @@ A second wave of the **P1/P2 backlog** has since shipped to `main`, same gate
 | §4.5 | BLOB media-typing + SHA-256 hashing (JSONL) and a CASE/UCO `-f case` bundle export | `471749c` |
 | §3.2 | Python bindings — standalone `python/` pyo3 crate (`carve`/`audit`/`timeline`), maturin-built + pytested | `1cdb307` |
 | §1.4 | Index-b-tree leaf reading foundation (`index_leaf_cells`), tier-2 vs `sqlite3` | `928af77` |
+| §3.1 | Promote the four page-1 header offsets to `forensicnomicon::sqlite` (≥ 1.5.0) and consume them; local duplicates removed | `59ecf8b` |
 
 The remaining backlog is now small: §1.3 (safe scope done — residual precision-bounded),
-§1.4 follow-ups (index-entry carving / overflow / `WITHOUT ROWID` attribution), and two
-externally-blocked items — §3.1 (`forensicnomicon` constant promotion, needs a published crate
-release) and §5's commercial-tool oracle (needs a licensed GUI tool). Details below.
+§1.4 follow-ups (index-entry carving / overflow / `WITHOUT ROWID` attribution), and one
+externally-blocked item — §5's commercial-tool oracle (needs a licensed GUI tool). Details below.
 
 ---
 
@@ -83,10 +83,10 @@ diagnostics — all shipped; see the Shipped table above.)*
 
 ## 3. Library / API & fleet hygiene
 
-### 3.1 Promote the `forensicnomicon` constants — **P1, S, verified**
-`core/src/lib.rs` flags the reserved-space offset, text-encoding field, and in-header DB-size as
-locally redefined pending promotion to the shared KNOWLEDGE layer. DRY across the fleet; removes
-the local duplicates.
+*(§3.1 forensicnomicon constants — shipped: the four page-1 header offsets
+(reserved-space 20, in-header DB-size 28, freelist-count 36, text-encoding 56) were
+promoted into `forensicnomicon::sqlite` (≥ 1.5.0) and are now consumed here; the
+local duplicates are gone. See the Shipped table.)*
 
 *(§3.2 Python bindings — shipped: the standalone `python/` pyo3 crate exposes
 `carve`/`audit`/`timeline`, built + tested end-to-end with maturin. See the Shipped table.)*

@@ -45,6 +45,7 @@ A second wave of the **P1/P2 backlog** has since shipped to `main`, same gate
 | §1.4 | Index-b-tree leaf reading foundation (`index_leaf_cells`), tier-2 vs `sqlite3` | `928af77` |
 | §3.1 | Promote the four page-1 header offsets to `forensicnomicon::sqlite` (≥ 1.5.0) and consume them; local duplicates removed | `59ecf8b` |
 | §1.4 | Read live `WITHOUT ROWID` table rows — full index-b-tree walk (`without_rowid_table_rows`), tier-2 vs `sqlite3` | `ff6a575` |
+| §1.4 | Surface `WITHOUT ROWID` live rows in the carve workbook (`TableHistory::without_rowid_rows` → temporal sheet) | `7736af3` |
 
 The remaining backlog is now small: §1.3 (safe scope done — residual precision-bounded),
 §1.4 follow-ups (index-entry carving / overflow / `WITHOUT ROWID` attribution), and one
@@ -66,13 +67,15 @@ guarantee** this roadmap explicitly protects. Not pursued: chasing corpus-specif
 loosening the precision gates trades the tool's headline property for a few rows on one category.
 
 ### 1.4 Index b-trees & `WITHOUT ROWID` tables — **P1, L, partly shipped**
-Two pieces landed: `Database::index_leaf_cells` parses live index-b-tree leaf cells (type `0x0a`),
-and `Database::without_rowid_table_rows` walks each `WITHOUT ROWID` table's whole index b-tree
+Three pieces landed: `Database::index_leaf_cells` parses live index-b-tree leaf cells (type
+`0x0a`); `Database::without_rowid_table_rows` walks each `WITHOUT ROWID` table's whole index b-tree
 (interior `0x02` → leaf `0x0a`, decoding the interior cells' own key records too) to return its
-live rows keyed by table name — both validated tier-2 vs `sqlite3`. So `WITHOUT ROWID` tables, and
-the index as a second data substrate, are now readable. **Remaining follow-ups** (still open):
-surfacing `without_rowid_table_rows` in the CLI/xlsx carve output, carving DELETED index entries
-from index-page freeblocks, and following index-key overflow chains. See the Shipped table.
+live rows keyed by table name; and those rows are now **surfaced in the carve workbook**
+(`TableHistory::without_rowid_rows` → the temporal sheet shows them as present/live rows, replacing
+the bare "not version-tracked" note). All validated tier-2 vs `sqlite3`. So `WITHOUT ROWID` tables
+are read AND shown, and the index is a usable second data substrate. **Remaining follow-ups** (the
+deleted-data half, still open): carving DELETED index entries from index-page freeblocks (recovers
+deleted `WITHOUT ROWID` rows), and following index-key overflow chains. See the Shipped table.
 
 ---
 

@@ -123,6 +123,18 @@ pub struct LiveTableDump {
     pub rows: Vec<Row>,
 }
 
+/// A `WITHOUT ROWID` user table's live rows, produced by
+/// [`Database::without_rowid_table_rows`]. Such a table's data lives entirely in
+/// an index b-tree (there is no rowid), so `rows` holds the decoded index records
+/// in the table's declared column order, in index (primary-key) order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithoutRowidTable {
+    /// Table name from `sqlite_master.name`.
+    pub name: String,
+    /// Every live row's decoded column values, in the table's column order.
+    pub rows: Vec<Vec<Value>>,
+}
+
 /// A record-shaped cell recovered from unallocated / free space by
 /// [`Database::carve_cells`]. Carries the decoded row plus enough provenance for
 /// the analyzer to grade it as a "consistent with a deleted row" observation.
@@ -1536,24 +1548,129 @@ impl Database {
                 continue;
             }
             // An index-leaf cell is [payload-length varint][payload][overflow?].
-            let Ok((payload_len, n)) = read_varint(page_bytes, cell_off) else {
-                continue;
-            };
-            let payload_start = cell_off + n;
-            let Ok(payload_len) = usize::try_from(payload_len) else {
-                continue;
-            };
-            let end = payload_start
-                .saturating_add(payload_len)
-                .min(page_bytes.len());
-            let Some(payload) = page_bytes.get(payload_start..end) else {
-                continue;
-            };
-            if let Ok(values) = decode_index_payload(payload, self.header.text_encoding) {
+            if let Some(values) = self.index_record_at(page_bytes, cell_off) {
                 out.push(values);
             }
         }
         out
+    }
+
+    /// Decode the index record whose `[payload-length varint][payload]` begins at
+    /// `off` within `page_bytes`, or `None` if it does not decode. Shared by the
+    /// leaf read ([`index_leaf_cells`](Self::index_leaf_cells)) and the interior
+    /// walk (whose cells also carry a key record, after the 4-byte child pointer).
+    /// Decodes the LOCAL payload only — a key spilled to an overflow chain is
+    /// decoded up to its on-page bytes (the leading key columns still resolve).
+    fn index_record_at(&self, page_bytes: &[u8], off: usize) -> Option<Vec<Value>> {
+        let (payload_len, n) = read_varint(page_bytes, off).ok()?;
+        let payload_start = off + n;
+        let payload_len = usize::try_from(payload_len).ok()?;
+        let end = payload_start
+            .saturating_add(payload_len)
+            .min(page_bytes.len());
+        let payload = page_bytes.get(payload_start..end)?;
+        decode_index_payload(payload, self.header.text_encoding).ok()
+    }
+
+    /// The live rows of every `WITHOUT ROWID` user table (roadmap §1.4).
+    ///
+    /// A `WITHOUT ROWID` table stores its whole row in an **index b-tree** — there
+    /// is no separate table b-tree and no rowid — so the ordinary
+    /// [`read_table`](Self::read_table) reader (which walks table pages 0x0d/0x05)
+    /// is blind to it. This resolves each such table from `sqlite_master`, walks
+    /// its index b-tree (interior 0x02 → leaf 0x0a), and returns its live rows,
+    /// keyed by table name. Ordinary rowid tables are not returned.
+    ///
+    /// Bounded and panic-free: a malformed/cyclic b-tree stops the walk (visited
+    /// set + page cap) rather than looping; an unreadable schema yields an empty
+    /// result. Rows are the decoded index records, in the table's column order.
+    #[must_use]
+    pub fn without_rowid_table_rows(&self) -> Vec<WithoutRowidTable> {
+        let Ok(schema) = self.read_table(1, 5) else {
+            return Vec::new(); // cov:unreachable: a validly-opened DB has a readable page-1 schema
+        };
+        let mut out = Vec::new();
+        for row in schema {
+            // sqlite_master row: (type, name, tbl_name, rootpage, sql).
+            let is_table = matches!(row.values.first(), Some(Value::Text(t)) if t == "table");
+            if !is_table {
+                continue;
+            }
+            let Some(Value::Text(name)) = row.values.get(1) else {
+                continue; // cov:unreachable: a 'table' schema row has a TEXT name
+            };
+            if name.starts_with("sqlite_") {
+                continue;
+            }
+            let sql = match row.values.get(4) {
+                Some(Value::Text(s)) => s.as_str(),
+                _ => "", // cov:unreachable: a 'table' schema row carries its CREATE TABLE sql
+            };
+            if !without_rowid_sql(sql) {
+                continue; // ordinary rowid table — read_table handles those
+            }
+            let Some(Value::Integer(root)) = row.values.get(3) else {
+                continue; // cov:unreachable: a 'table' schema row has an integer rootpage
+            };
+            let Ok(root) = u32::try_from(*root) else {
+                continue; // cov:unreachable: a real rootpage is a small positive page number
+            };
+            let mut rows = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            self.collect_index_rows(root, &mut rows, &mut seen);
+            out.push(WithoutRowidTable {
+                name: name.clone(),
+                rows,
+            });
+        }
+        out
+    }
+
+    /// Walk the index b-tree rooted at `page`, appending every leaf cell's decoded
+    /// record to `rows`. Interior pages (0x02) recurse through their child pointers
+    /// and rightmost child; leaf pages (0x0a) yield their cells via
+    /// [`index_leaf_cells`](Self::index_leaf_cells). Bounded identically to
+    /// [`collect_rows`](Self::collect_rows): a page is visited at most once and the
+    /// walk is capped, so a crafted cyclic/oversized tree cannot loop.
+    fn collect_index_rows(
+        &self,
+        page: u32,
+        rows: &mut Vec<Vec<Value>>,
+        seen: &mut std::collections::BTreeSet<u32>,
+    ) {
+        if page == 0 || seen.len() > MAX_PAGES_PER_WALK || !seen.insert(page) {
+            return;
+        }
+        let Ok(slice) = self.page_slice(page) else {
+            return; // cov:unreachable: schema rootpages and their children are in range
+        };
+        let slice = &*slice;
+        let hdr_off = if page == 1 { SQLITE_HEADER_SIZE } else { 0 };
+        let Some(&page_type) = slice.get(hdr_off) else {
+            return; // cov:unreachable: a full page slice always has its header byte
+        };
+        match page_type {
+            0x0a => rows.extend(self.index_leaf_cells(slice)),
+            0x02 => {
+                let cell_count = be_u16(slice, hdr_off + 3) as usize;
+                let cell_ptr_array = hdr_off + 12; // an index-interior header is 12 bytes
+                for i in 0..cell_count {
+                    let cell_off = be_u16(slice, cell_ptr_array + i * 2) as usize;
+                    // An interior cell is [4-byte left-child page][key record]. In
+                    // an INDEX b-tree the key IS a real entry (a WITHOUT ROWID row),
+                    // so decode it too — not just the child pointer, unlike a table
+                    // b-tree where interior cells are pure navigation.
+                    let child = be_u32(slice, cell_off);
+                    self.collect_index_rows(child, rows, seen);
+                    if let Some(values) = self.index_record_at(slice, cell_off + 4) {
+                        rows.push(values);
+                    }
+                }
+                let right = be_u32(slice, hdr_off + 8);
+                self.collect_index_rows(right, rows, seen);
+            }
+            _ => {} // cov:unreachable: a WITHOUT ROWID b-tree page is index leaf (0x0a) or interior (0x02)
+        }
     }
 
     /// The maximal FREE (unallocated) byte ranges of a table-leaf page — the

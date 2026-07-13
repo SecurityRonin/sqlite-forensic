@@ -101,12 +101,18 @@ pub struct TableHistory {
     /// The table's column names (real names where the schema parsed, else generic).
     pub columns: Vec<String>,
     /// Whether this is a `WITHOUT ROWID` table — such tables have no rowid and are
-    /// not version-tracked here; `versions` is then empty (presence recorded only).
+    /// not version-tracked here; `versions` is then empty (presence recorded only),
+    /// and the live rows are carried in [`without_rowid_rows`](Self::without_rowid_rows).
     pub without_rowid: bool,
     /// Every row version, sorted by `rowid` (`None` last), then `commit_seq`
     /// ascending, with carved-residue (order-unknown) versions grouped after the
     /// ordered versions of their rowid.
     pub versions: Vec<RowVersion>,
+    /// For a `WITHOUT ROWID` table (§1.4): its live rows read from the index
+    /// b-tree, in the table's column order. Empty for an ordinary table and for a
+    /// `WITHOUT ROWID` table whose rows could not be read. These have no version
+    /// history (the model is rowid-keyed); they are the present live state.
+    pub without_rowid_rows: Vec<Vec<Value>>,
 }
 
 /// One chronological VIEW of a single table: a rowid→values map plus the view's
@@ -296,11 +302,15 @@ pub fn table_history(
     views: &[RowView],
 ) -> TableHistory {
     if without_rowid {
+        // No rowid → no version history. The live rows (from the index b-tree) are
+        // filled in by the caller (see `Database::row_histories`), which has the
+        // reader; the pure builder leaves them empty.
         return TableHistory {
             table,
             columns,
             without_rowid: true,
             versions: Vec::new(),
+            without_rowid_rows: Vec::new(),
         };
     }
     // Every rowid seen across all views, ascending.
@@ -318,6 +328,7 @@ pub fn table_history(
         columns,
         without_rowid: false,
         versions,
+        without_rowid_rows: Vec::new(),
     }
 }
 

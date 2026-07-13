@@ -4728,6 +4728,7 @@ mod tests {
             columns: vec!["k".to_string()],
             without_rowid: true,
             versions: vec![],
+            without_rowid_rows: vec![],
         };
         let (sheet, _) = temporal_sheet(&h, no_lsn, no_risk, EXCEL_MAX_ROWS);
         assert_eq!(sheet.rows.len(), 1, "exactly one annotation row");
@@ -4737,6 +4738,41 @@ mod tests {
             Value::Text("WITHOUT ROWID — not version-tracked".to_string()),
             "annotation note in the first cell"
         );
+    }
+
+    #[test]
+    fn temporal_sheet_without_rowid_renders_its_live_rows() {
+        // §1.4: when a WITHOUT ROWID table's live rows are known, the sheet shows
+        // them (present/live) instead of the bare "not version-tracked" note.
+        let h = TableHistory {
+            table: "kv".to_string(),
+            columns: vec!["k".to_string(), "v".to_string()],
+            without_rowid: true,
+            versions: vec![],
+            without_rowid_rows: vec![
+                vec![Value::Text("alpha".into()), Value::Integer(1)],
+                vec![Value::Text("bravo".into()), Value::Integer(2)],
+            ],
+        };
+        let (sheet, surplus) = temporal_sheet(&h, no_lsn, no_risk, EXCEL_MAX_ROWS);
+        assert_eq!(surplus, 0);
+        assert_eq!(
+            sheet.rows.len(),
+            2,
+            "one data row per live WITHOUT ROWID row"
+        );
+        assert_eq!(sheet.rows[0].cells[0], Value::Text("alpha".into()));
+        assert_eq!(sheet.rows[0].cells[1], Value::Integer(1));
+        // Column layout: the value columns, then the temporal flag columns. The
+        // view_state cell (index = width + 3) reads "present" — a live row.
+        let vs = &sheet.rows[0].cells[h.columns.len() + 3];
+        assert_eq!(
+            *vs,
+            Value::Text("present".to_string()),
+            "live row: {sheet:?}"
+        );
+        // No rowid, not deleted, not a version-history artifact.
+        assert!(!sheet.rows[0].is_deleted);
     }
 
     #[test]

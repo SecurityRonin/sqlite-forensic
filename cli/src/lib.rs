@@ -1791,25 +1791,63 @@ pub fn temporal_sheet(
     let mut columns: Vec<String> = history.columns.clone();
     columns.extend(TEMPORAL_FLAG_COLS.iter().map(|s| (*s).to_string()));
 
-    // WITHOUT ROWID: no rowid to key a history on → a single annotation row. The
-    // note sits in the first cell; the remaining cells are blank.
+    // WITHOUT ROWID: no rowid to key a version history on. When the table's live
+    // rows are known (read from the index b-tree, §1.4), show them as present/live
+    // rows; otherwise emit a single "not version-tracked" annotation row.
     if history.without_rowid {
-        let mut cells = vec![Value::Text(WITHOUT_ROWID_NOTE.to_string())];
-        cells.resize(columns.len(), Value::Null);
-        let rows = vec![TemporalRow {
-            cells,
-            rowid_reused: false,
-            is_guessed: false,
-            is_deleted: false,
-            superseded: false,
-        }];
+        if history.without_rowid_rows.is_empty() {
+            let mut cells = vec![Value::Text(WITHOUT_ROWID_NOTE.to_string())];
+            cells.resize(columns.len(), Value::Null);
+            let rows = vec![TemporalRow {
+                cells,
+                rowid_reused: false,
+                is_guessed: false,
+                is_deleted: false,
+                superseded: false,
+            }];
+            return (
+                TemporalSheet {
+                    name: history.table.clone(),
+                    columns,
+                    rows,
+                },
+                0,
+            );
+        }
+        // Each live row → a present/live data row: value columns, then the temporal
+        // flag columns marking a current row with no rowid and no version history.
+        let mut rows: Vec<TemporalRow> = Vec::new();
+        let mut surplus = 0usize;
+        for values in &history.without_rowid_rows {
+            if rows.len() >= row_cap {
+                surplus += 1;
+                continue;
+            }
+            let mut cells = align_cells(values, width);
+            cells.push(Value::Null); // _rowid (WITHOUT ROWID → none)
+            cells.push(Value::Text("live".to_string())); // wal_commit
+            cells.push(Value::Null); // commit_seq
+            cells.push(Value::Text("present".to_string())); // view_state
+            cells.push(Value::Integer(0)); // is_deleted
+            cells.push(Value::Integer(0)); // is_guessed
+            cells.push(Value::Integer(0)); // rowid_reused
+            cells.push(Value::Integer(0)); // attribution_uncertain
+            cells.push(Value::Null); // _table_instance_risk
+            rows.push(TemporalRow {
+                cells,
+                rowid_reused: false,
+                is_guessed: false,
+                is_deleted: false,
+                superseded: false,
+            });
+        }
         return (
             TemporalSheet {
                 name: history.table.clone(),
                 columns,
                 rows,
             },
-            0,
+            surplus,
         );
     }
 
@@ -3405,6 +3443,7 @@ mod tests {
             table: table.to_string(),
             columns: columns.iter().map(|s| (*s).to_string()).collect(),
             without_rowid: false,
+            without_rowid_rows: vec![],
             versions: vec![RowVersion {
                 rowid: Some(rowid),
                 values,
@@ -4696,6 +4735,7 @@ mod tests {
             table: "t".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
             without_rowid: false,
+            without_rowid_rows: vec![],
             versions: vec![],
         };
         let (sheet, dropped) = temporal_sheet(&h, no_lsn, no_risk, EXCEL_MAX_ROWS);
@@ -4728,6 +4768,7 @@ mod tests {
             columns: vec!["k".to_string()],
             without_rowid: true,
             versions: vec![],
+            without_rowid_rows: vec![],
         };
         let (sheet, _) = temporal_sheet(&h, no_lsn, no_risk, EXCEL_MAX_ROWS);
         assert_eq!(sheet.rows.len(), 1, "exactly one annotation row");
@@ -4740,12 +4781,48 @@ mod tests {
     }
 
     #[test]
+    fn temporal_sheet_without_rowid_renders_its_live_rows() {
+        // §1.4: when a WITHOUT ROWID table's live rows are known, the sheet shows
+        // them (present/live) instead of the bare "not version-tracked" note.
+        let h = TableHistory {
+            table: "kv".to_string(),
+            columns: vec!["k".to_string(), "v".to_string()],
+            without_rowid: true,
+            versions: vec![],
+            without_rowid_rows: vec![
+                vec![Value::Text("alpha".into()), Value::Integer(1)],
+                vec![Value::Text("bravo".into()), Value::Integer(2)],
+            ],
+        };
+        let (sheet, surplus) = temporal_sheet(&h, no_lsn, no_risk, EXCEL_MAX_ROWS);
+        assert_eq!(surplus, 0);
+        assert_eq!(
+            sheet.rows.len(),
+            2,
+            "one data row per live WITHOUT ROWID row"
+        );
+        assert_eq!(sheet.rows[0].cells[0], Value::Text("alpha".into()));
+        assert_eq!(sheet.rows[0].cells[1], Value::Integer(1));
+        // Column layout: the value columns, then the temporal flag columns. The
+        // view_state cell (index = width + 3) reads "present" — a live row.
+        let vs = &sheet.rows[0].cells[h.columns.len() + 3];
+        assert_eq!(
+            *vs,
+            Value::Text("present".to_string()),
+            "live row: {sheet:?}"
+        );
+        // No rowid, not deleted, not a version-history artifact.
+        assert!(!sheet.rows[0].is_deleted);
+    }
+
+    #[test]
     fn render_timeline_covers_commit_live_and_residue_origins() {
         let vals = || vec![Value::Integer(7), Value::Text("v".into())];
         let hist = TableHistory {
             table: "t".to_string(),
             columns: vec!["id".to_string(), "v".to_string()],
             without_rowid: false,
+            without_rowid_rows: vec![],
             versions: vec![
                 // Commit with a logical seq → `commit#0`.
                 version(
@@ -4827,6 +4904,7 @@ mod tests {
             table: "msgs".to_string(),
             columns: vec!["body".to_string()],
             without_rowid: false,
+            without_rowid_rows: vec![],
             versions: vec![v],
         };
         let lines = render_timeline(&[hist]);
@@ -4854,6 +4932,7 @@ mod tests {
             table: "t".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
             without_rowid: false,
+            without_rowid_rows: vec![],
             versions: vec![v],
         };
         let resolve = |_: &sqlite_core::CommitId| {
@@ -4902,6 +4981,7 @@ mod tests {
             table: "t".to_string(),
             columns: vec!["name".to_string()],
             without_rowid: false,
+            without_rowid_rows: vec![],
             versions: vec![v],
         };
         let (sheet, _) = temporal_sheet(&h, no_lsn, no_risk, EXCEL_MAX_ROWS);
@@ -4937,6 +5017,7 @@ mod tests {
             table: "t".to_string(),
             columns: vec!["id".to_string()],
             without_rowid: false,
+            without_rowid_rows: vec![],
             versions: vec![v],
         };
         let (sheet, _) = temporal_sheet(&h, no_lsn, no_risk, EXCEL_MAX_ROWS);
@@ -4966,6 +5047,7 @@ mod tests {
             table: "t".to_string(),
             columns: vec!["id".to_string()],
             without_rowid: false,
+            without_rowid_rows: vec![],
             versions,
         };
         let (sheet, dropped) = temporal_sheet(&h, no_lsn, no_risk, 2);

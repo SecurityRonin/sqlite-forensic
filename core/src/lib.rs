@@ -1907,6 +1907,9 @@ impl Database {
         // read from the live schema (a WITHOUT ROWID table has no rowid history).
         let live_dumps = self.live_table_rows();
         let without_rowid = self.live_without_rowid_map();
+        // WITHOUT ROWID tables' live rows (index-b-tree read); folded into each
+        // matching history below (§1.4).
+        let wr_rows = self.without_rowid_table_rows();
 
         // Per table, build the chronological views: each WAL commit snapshot (in
         // epoch order, commit_seq = per-epoch ordinal) then the final live view.
@@ -1970,12 +1973,16 @@ impl Database {
                 rows: live_rows,
             });
 
-            histories.push(row_history::table_history(
-                dump.name,
-                dump.column_names,
-                wr,
-                &views,
-            ));
+            let mut history = row_history::table_history(dump.name, dump.column_names, wr, &views);
+            // A WITHOUT ROWID table has no rowid version history, but its live rows
+            // live in the index b-tree (§1.4) — read them so the carve output shows
+            // the table's data, not just a "not version-tracked" note.
+            if wr {
+                if let Some(t) = wr_rows.iter().find(|t| t.name == history.table) {
+                    history.without_rowid_rows.clone_from(&t.rows);
+                }
+            }
+            histories.push(history);
         }
         histories
     }

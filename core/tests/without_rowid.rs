@@ -126,6 +126,26 @@ fn parses_a_handbuilt_without_rowid_table() {
     assert_eq!(tables[0].rows, vec![vec![Value::Integer(42)]]);
 }
 
+#[test]
+fn row_histories_carries_without_rowid_live_rows() {
+    // §1.4 surfacing: row_histories folds each WITHOUT ROWID table's live rows into
+    // its TableHistory.without_rowid_rows (non-gated, so CI without sqlite3 covers
+    // the fold branch).
+    let db = build_handbuilt_without_rowid();
+    let wr = db
+        .row_histories()
+        .into_iter()
+        .find(|h| h.table == "wr")
+        .expect("the WITHOUT ROWID table appears in row_histories");
+    assert!(wr.without_rowid, "flagged WITHOUT ROWID");
+    assert!(wr.versions.is_empty(), "no rowid version history");
+    assert_eq!(
+        wr.without_rowid_rows,
+        vec![vec![Value::Integer(42)]],
+        "its live rows are carried"
+    );
+}
+
 // Silence unused-import warnings when the env gate skips the oracle tests.
 #[allow(dead_code)]
 fn _uses(_: &Path) {}

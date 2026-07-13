@@ -44,6 +44,7 @@ A second wave of the **P1/P2 backlog** has since shipped to `main`, same gate
 | §3.2 | Python bindings — standalone `python/` pyo3 crate (`carve`/`audit`/`timeline`), maturin-built + pytested | `1cdb307` |
 | §1.4 | Index-b-tree leaf reading foundation (`index_leaf_cells`), tier-2 vs `sqlite3` | `928af77` |
 | §3.1 | Promote the four page-1 header offsets to `forensicnomicon::sqlite` (≥ 1.5.0) and consume them; local duplicates removed | `59ecf8b` |
+| §1.4 | Read live `WITHOUT ROWID` table rows — full index-b-tree walk (`without_rowid_table_rows`), tier-2 vs `sqlite3` | `ff6a575` |
 
 The remaining backlog is now small: §1.3 (safe scope done — residual precision-bounded),
 §1.4 follow-ups (index-entry carving / overflow / `WITHOUT ROWID` attribution), and one
@@ -64,13 +65,14 @@ and the rest need a template-free salvage that would risk the structural **0-fal
 guarantee** this roadmap explicitly protects. Not pursued: chasing corpus-specific recall by
 loosening the precision gates trades the tool's headline property for a few rows on one category.
 
-### 1.4 Index b-trees & `WITHOUT ROWID` tables — **P1, L, foundation shipped**
-The structural read is landed: `Database::index_leaf_cells` parses live index-b-tree leaf cells
-(type `0x0a`) into decoded key records (validated tier-2 vs `sqlite3`) — the second substrate for
-a table's data and the storage of `WITHOUT ROWID` rows. **Remaining follow-ups** (still open):
-carving DELETED index entries from index-page freeblocks, following index-key overflow chains, and
-schema-driven `WITHOUT ROWID` full-table attribution (mapping index roots → tables in the carve
-output). See the Shipped table.
+### 1.4 Index b-trees & `WITHOUT ROWID` tables — **P1, L, partly shipped**
+Two pieces landed: `Database::index_leaf_cells` parses live index-b-tree leaf cells (type `0x0a`),
+and `Database::without_rowid_table_rows` walks each `WITHOUT ROWID` table's whole index b-tree
+(interior `0x02` → leaf `0x0a`, decoding the interior cells' own key records too) to return its
+live rows keyed by table name — both validated tier-2 vs `sqlite3`. So `WITHOUT ROWID` tables, and
+the index as a second data substrate, are now readable. **Remaining follow-ups** (still open):
+surfacing `without_rowid_table_rows` in the CLI/xlsx carve output, carving DELETED index entries
+from index-page freeblocks, and following index-key overflow chains. See the Shipped table.
 
 ---
 

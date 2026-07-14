@@ -3,10 +3,11 @@
 Native, read-only, panic-free SQLite file-format reader for forensics.
 
 `sqlite-core` parses the raw SQLite database file format directly — header,
-pages, cells, overflow chains, the freelist, and an uncheckpointed `-wal`
-overlay — without linking the SQLite engine. It never writes the evidence file
-or its sidecars, and it is built to survive hostile input: malformed, truncated,
-and corrupted databases return typed errors instead of panicking.
+pages, cells, overflow chains, the freelist, index b-trees (including
+`WITHOUT ROWID` tables, whose rows live in the index), and an uncheckpointed
+`-wal` overlay — without linking the SQLite engine. It never writes the evidence
+file or its sidecars, and it is built to survive hostile input: malformed,
+truncated, and corrupted databases return typed errors instead of panicking.
 
 It is the raw decode layer consumed by [`sqlite-forensic`](../forensic) (the
 anomaly auditor and deleted-record carver) and the `sqlite4n6` CLI.

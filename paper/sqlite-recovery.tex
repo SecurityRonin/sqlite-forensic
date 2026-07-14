@@ -187,9 +187,11 @@ third-party corpora with published ground truth
 The SQLite database file is a sequence of fixed-size \emph{pages}~\cite{sqlite_fileformat}.
 An ordinary rowid table is a b-tree whose leaf pages hold \emph{cells}, one per
 row; each cell is a varint-prefixed record of serial-typed values keyed by an
-integer \code{rowid}. (We scope recovery and evaluation to ordinary rowid tables;
-\code{WITHOUT ROWID} tables store records in index b-trees and are out of scope
-here.) Recovery hinges on what happens to a cell's bytes once the row is no longer
+integer \code{rowid}. (We scope deleted-record \emph{recovery} and evaluation to
+ordinary rowid tables. \code{WITHOUT ROWID} tables store records in index b-trees;
+the tool reads their live rows but does not carve \emph{deleted} index entries---an
+index-free-block reconstruction we bound as future work, \S\ref{sec:discussion}.)
+Recovery hinges on what happens to a cell's bytes once the row is no longer
 reachable from the b-tree.
 
 \subsection*{Free blocks and the freelist}
@@ -831,15 +833,23 @@ ends its recoverability. End-to-end recall on overflow bodies is $0.333$ on \cod
 because most deleted overflow payloads in the corpus were overwritten; the substrate
 recall of $1.000$ separates what survived from what did not.
 
+\code{WITHOUT ROWID} tables---whose rows live in an index b-tree rather than a table
+b-tree---are read (their live rows are decoded from the index leaves), but recovering
+their \emph{deleted} rows is future work: a deleted index cell loses its leading bytes to
+the free-block header, destroying the serial array that delimits its columns, so recovery
+needs a template reconstruction and, for a short primary key, faces an information-theoretic
+limit on the column split---the honest yield is a fragment on wider tables, not a full row.
+
 \paragraph{Threats to validity.}
 \emph{Internal.} Competitor precision is measured through our own committed wrappers and
 the \code{fqlite} tap, so a tool's phantom count reflects its emission policy under our
 harness (which we re-derived for \code{fqlite}); the recall figures, by contrast, are
 scored against the published Nemetz answer key.
 \emph{External.} The evaluation is scoped to selected Nemetz categories, to
-surviving-identity substrates, and to ordinary rowid tables (\code{WITHOUT ROWID} tables
-and index b-trees are out of scope), so results may not generalize to app schemas
-dominated by those, nor to databases destroyed by \code{VACUUM}/\code{secure\_delete}.
+surviving-identity substrates, and to ordinary rowid tables (deleted-record recovery from
+\code{WITHOUT ROWID} tables and index b-trees is future work, above), so results may not
+generalize to app schemas dominated by those, nor to databases destroyed by
+\code{VACUUM}/\code{secure\_delete}.
 \emph{Construct.} The false-positive scenarios are a Tier-2 \emph{replication} of the
 Choi survey's construction on real-engine bytes, not the authors' own files, so they can
 miss quirks of the original corpus; and the exclusion invariant we verify covers live-row

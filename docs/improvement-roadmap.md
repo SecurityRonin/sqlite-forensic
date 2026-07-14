@@ -47,9 +47,11 @@ A second wave of the **P1/P2 backlog** has since shipped to `main`, same gate
 | §1.4 | Read live `WITHOUT ROWID` table rows — full index-b-tree walk (`without_rowid_table_rows`), tier-2 vs `sqlite3` | `ff6a575` |
 | §1.4 | Surface `WITHOUT ROWID` live rows in the carve workbook (`TableHistory::without_rowid_rows` → temporal sheet) | `7736af3` |
 
-The remaining backlog is now small: §1.3 (safe scope done — residual precision-bounded),
-§1.4 follow-ups (index-entry carving / overflow / `WITHOUT ROWID` attribution), and one
-externally-blocked item — §5's commercial-tool oracle (needs a licensed GUI tool). Details below.
+The remaining backlog is now small, and what's left is deliberate: §1.3 (safe scope done —
+residual precision-bounded), §1.4's deleted-index-entry carving + overflow (the live-data half
+shipped; the deleted half is §1.3-class precision-bounded with an information-theoretic limit on
+small keys — deferred, not a clean slice), and one externally-blocked item — §5's commercial-tool
+oracle (needs a licensed GUI tool). Details below.
 
 ---
 
@@ -66,16 +68,29 @@ and the rest need a template-free salvage that would risk the structural **0-fal
 guarantee** this roadmap explicitly protects. Not pursued: chasing corpus-specific recall by
 loosening the precision gates trades the tool's headline property for a few rows on one category.
 
-### 1.4 Index b-trees & `WITHOUT ROWID` tables — **P1, L, partly shipped**
-Three pieces landed: `Database::index_leaf_cells` parses live index-b-tree leaf cells (type
-`0x0a`); `Database::without_rowid_table_rows` walks each `WITHOUT ROWID` table's whole index b-tree
-(interior `0x02` → leaf `0x0a`, decoding the interior cells' own key records too) to return its
-live rows keyed by table name; and those rows are now **surfaced in the carve workbook**
-(`TableHistory::without_rowid_rows` → the temporal sheet shows them as present/live rows, replacing
-the bare "not version-tracked" note). All validated tier-2 vs `sqlite3`. So `WITHOUT ROWID` tables
-are read AND shown, and the index is a usable second data substrate. **Remaining follow-ups** (the
-deleted-data half, still open): carving DELETED index entries from index-page freeblocks (recovers
-deleted `WITHOUT ROWID` rows), and following index-key overflow chains. See the Shipped table.
+### 1.4 Index b-trees & `WITHOUT ROWID` tables — **P1, L, live-data half shipped; deleted-data deferred**
+**Shipped — the live-data half.** Three pieces landed: `Database::index_leaf_cells` parses live
+index-b-tree leaf cells (type `0x0a`); `Database::without_rowid_table_rows` walks each
+`WITHOUT ROWID` table's whole index b-tree (interior `0x02` → leaf `0x0a`, decoding the interior
+cells' own key records too) to return its live rows keyed by table name; and those rows are now
+**surfaced in the carve workbook** (`TableHistory::without_rowid_rows` → the temporal sheet shows
+them as present/live rows, replacing the bare "not version-tracked" note). All validated tier-2 vs
+`sqlite3`. So `WITHOUT ROWID` tables are read AND shown, and the index is a usable second data
+substrate.
+
+**Deferred — carving DELETED index entries** is `§1.3`-class (precision-bounded), not a clean
+slice. Byte-level investigation (real `sqlite3`, `secure_delete=OFF`): a deleted index cell loses
+its **leading 4 bytes** to the freeblock header — the `[payload-len][header-len][serial-array]`
+prefix — for a lone deletion *and* every cell of a coalesced run alike. The record *body* survives
+but the *serial array* that delimits its columns is destroyed, so recovery needs the full
+template-reconstruction machinery (re-derive the header from a same-page template + exact-tiling
+validation) — the same large, precision-delicate engine `§1.3` flags as the precision-risk zone.
+And there is a genuine **information-theoretic limit**: for a small pure-TEXT key (e.g. a 2-column
+key table) the column split is unrecoverable from the page alone (`dddDEL-ddd` could split many
+ways; nothing disambiguates it). The honest achievable yield is Tier-2 *fragments* on 3+ column
+tables where trailing serials survive — deliberately not pursued here rather than ship a fragile,
+fixture-gaming carver that violates the precision discipline. **Also open:** following index-key
+overflow chains. See the Shipped table.
 
 ---
 

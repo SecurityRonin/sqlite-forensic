@@ -94,7 +94,7 @@ By default `carve` writes a **combined review workbook** — `<name>.recovered.x
 
 Rows are tinted by a five-level precedence so the state reads at a glance: **current = no fill, superseded (changed-later) = blue, deleted / carved = red, guessed (shape-inferred) = yellow, rowid-reused = purple** (a reused rowid — delete-then-reinsert — overrides the others, since the two versions may be different entities). Residue attributed to no live table, and partial fragments, stay in their own `recovered_unattributed` / `recovered_fragments` tabs. **Image BLOBs — live, historical, or carved — are shown as in-cell thumbnails** (PNG/JPEG/GIF/BMP/WebP/TIFF); a video BLOB shows a typed `video/<ext> · <size>` placeholder (first-frame extraction is deferred). A sheet exceeding Excel's 1,048,576-row limit is truncated with a warning naming the table and dropped count.
 
-The version history covers **only the uncheckpointed WAL window** (the `-wal` present at capture) plus free-space residue; once a checkpoint folds the WAL into the main file, that prior-version evidence is gone. **WITHOUT ROWID tables have no rowid to track**, so their sheet carries a single "WITHOUT ROWID — not version-tracked" note instead of versions. Every version is an observation — a value the rowid is *consistent with having held at that commit* — never a wall-clock claim.
+The version history covers **only the uncheckpointed WAL window** (the `-wal` present at capture) plus free-space residue; once a checkpoint folds the WAL into the main file, that prior-version evidence is gone. **WITHOUT ROWID tables** store their whole row in an index b-tree with no rowid, so they carry no rowid *version* history — but their **live rows are now read from that index b-tree and shown** on the sheet as present/current rows (rather than only a placeholder note). Every version is an observation — a value the rowid is *consistent with having held at that commit* — never a wall-clock claim.
 
 Need a queryable database instead? Choose `-f db` to write `<name>.carved.db` (or `-o <FILE>` for an exact path) — the raw carved records as a SQLite file, **attributed back to their source table in three honest tiers** — observed fact, forensic inference, and unknown — each in its own table, all carrying the provenance columns (`_page`, `_offset`, `_rowid`, `_source`, `_confidence`) and the carved cells in their **native types** (a recovered `BLOB` is stored byte-for-byte):
 
@@ -138,6 +138,7 @@ Under the hood `sqlite4n6` reads the raw file format itself — freelist pages, 
 | | sqlite-forensic | rusqlite / `sqlite3` |
 |---|:-:|:-:|
 | Read live rows | ✅ | ✅ |
+| Read `WITHOUT ROWID` table rows (data stored in the index b-tree) | ✅ | ✅ |
 | Read-only on the evidence file | ✅ | ✅ (with care) |
 | Recover deleted rows from freelist pages | ✅ | — |
 | Recover deleted rows from in-page free blocks | ✅ | — |
@@ -269,7 +270,7 @@ This is one workspace (`sqlite-forensic`): two library crates following the flee
 
 | Crate | Role | Entry points |
 |---|---|---|
-| [`sqlite-core`](core) | The raw, read-only, panic-free file-format reader: header parse, b-tree walk, freelist + overflow chains, a read-only WAL overlay that maps onto the canonical `forensicnomicon::history` temporal cohort, a rollback-journal parser + prior-state snapshot, plus a small pure-Rust writer (`rebuild`) that materializes recovered rows into a fresh database. | `Database::open`, `Database::open_with_wal`, `freelist_pages`, `read_table`, `carve_free_regions`, `live_rowids`, `wal_timeline`, `Database::rollback_prior`, `RollbackJournal::parse`, `rebuild::build_recovered_db` |
+| [`sqlite-core`](core) | The raw, read-only, panic-free file-format reader: header parse, b-tree walk, freelist + overflow chains, a read-only WAL overlay that maps onto the canonical `forensicnomicon::history` temporal cohort, a rollback-journal parser + prior-state snapshot, plus a small pure-Rust writer (`rebuild`) that materializes recovered rows into a fresh database. | `Database::open`, `Database::open_with_wal`, `freelist_pages`, `read_table`, `without_rowid_table_rows`, `index_leaf_cells`, `carve_free_regions`, `live_rowids`, `wal_timeline`, `Database::rollback_prior`, `RollbackJournal::parse`, `rebuild::build_recovered_db` |
 | [`sqlite-forensic`](forensic) | The anomaly auditor + deleted-record carver: grades observations into `forensicnomicon::report::Finding`s and recovers deleted rows (free space, WAL frames, and the rollback journal). Depends on `sqlite-core`. | `audit`, `audit_findings`, `audit_journal`, `carve_all_deleted_records`, `carve_with_fragments`, `carve_rollback_journal`, `recover_dropped_schemas` |
 
 `sqlite-forensic` accepts an in-memory `Database` (built from `&[u8]`) — it is medium-agnostic and has no dependency on any image format or container layer. Findings flow into the shared `forensicnomicon::report` model, so a SQLite database's anomalies aggregate uniformly with the partition / container / filesystem layers in a triage report.

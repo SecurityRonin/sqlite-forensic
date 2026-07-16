@@ -923,14 +923,14 @@ checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 
 [[package]]
 name = "sqlite-core"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "forensicnomicon",
 ]
 
 [[package]]
 name = "sqlite-forensic"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "forensicnomicon",
  "sha2",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "sqlite4n6"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "blob-decoder",
  "calamine",

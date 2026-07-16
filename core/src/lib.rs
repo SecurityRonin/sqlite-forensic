@@ -4351,7 +4351,9 @@ fn try_carve_cell_at(
     // — a strong self-consistency check that rejects coincidental matches.
     let mut body_len = 0usize;
     for &s in &serials {
-        body_len += serial_body_len(s)?;
+        // Checked: a serial from free-space bytes can declare a body length near
+        // usize::MAX; summing must reject (None) on overflow, never panic/wrap.
+        body_len = body_len.checked_add(serial_body_len(s)?)?;
     }
     if header_len + body_len != payload_len {
         return None;
@@ -4443,7 +4445,9 @@ fn try_carve_spilled_cell_at(
     // Length closure over the DECLARED payload: header + body must equal P.
     let mut body_len = 0usize;
     for &s in &serials {
-        body_len += serial_body_len(s)?;
+        // Checked: a serial from free-space bytes can declare a body length near
+        // usize::MAX; summing must reject (None) on overflow, never panic/wrap.
+        body_len = body_len.checked_add(serial_body_len(s)?)?;
     }
     if header_len + body_len != payload_len {
         return None;
@@ -5234,6 +5238,42 @@ mod tests {
 
     fn page_rc(byte: u8) -> std::rc::Rc<[u8]> {
         std::rc::Rc::from(vec![byte].into_boxed_slice())
+    }
+
+    /// Encode `v` as a 9-byte SQLite varint (round-trips through `read_varint`).
+    fn varint9(v: u64) -> [u8; 9] {
+        let mut out = [0u8; 9];
+        let top56 = v >> 8;
+        for (i, b) in out.iter_mut().take(8).enumerate() {
+            *b = (((top56 >> (7 * (7 - i))) & 0x7f) as u8) | 0x80;
+        }
+        out[8] = (v & 0xff) as u8;
+        out
+    }
+
+    #[test]
+    fn inferred_carve_does_not_overflow_on_huge_serials() {
+        // A record whose serial array declares column body lengths summing past
+        // usize::MAX must be REJECTED, never panic (debug) or wrap (release). Real
+        // free-space bytes (Belkasoft corpus) hit this; here we craft it minimally:
+        // five maximal (i64::MAX) serials, each a text/blob length ~(i64::MAX-12)/2.
+        let big = varint9(i64::MAX as u64); // serial_body_len ~4.6e18; five overflow usize
+        let n_serials = 5usize;
+        let header_len = 1 + n_serials * 9; // 1-byte header_len varint + 5 serials
+        let payload_len = header_len; // reach the body-sum loop before any body exists
+        let mut buf = Vec::new();
+        buf.push(payload_len as u8); // payload_len varint (small, 1 byte)
+        buf.push(1u8); // rowid varint = 1 (positive)
+        buf.push(header_len as u8); // header_len varint (1 byte, < 128)
+        for _ in 0..n_serials {
+            buf.extend_from_slice(&big);
+        }
+        // Must return None (rejected), and above all must not panic/overflow.
+        let got = try_carve_cell_at(&buf, 0, None, TextEncoding::Utf8);
+        assert!(
+            got.is_none(),
+            "a body-length-overflowing record must be rejected"
+        );
     }
 
     #[test]

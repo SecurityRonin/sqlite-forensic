@@ -629,6 +629,35 @@ provenance + generators are co-located in [`tests/data/README.md`](https://githu
 The env-gated **`sqlite-unhide`** corpus (nine author-keyed DBs; FREEWARE/home-use,
 never committed) is documented in [`tests-oracle-corpus/README.md`](https://github.com/SecurityRonin/sqlite-forensic/blob/main/tests-oracle-corpus/README.md).
 
+## §R Belkasoft "SQLite Exercises" corpus  (REAL-device, env-gated, **not committed**)
+
+Genuine mobile/desktop **messenger and app** SQLite databases (Android/iOS WhatsApp,
+Viber, Skype, Facebook Messenger, Safari, CarPlay) with live WAL and rollback-journal
+sidecars — a real-world **robustness sweep** (no-panic over vendor data), the sibling
+of the Josh Hickman iOS set (§P). It is **not** a known-answer recall oracle (no
+committed deletion key); scored recall lives in Nemetz (§I) and CFReDS (§K).
+
+- Classification: `REAL-device` (third-party real-device artifacts), confidence `✓`
+  (the sweep runs the full open → audit → carve → history pipeline over every db).
+  **Not committed** — Belkasoft's Terms of Use prohibit redistribution; the archive
+  and everything extracted from it are gitignored. Provenance + hashes:
+  [`tests/data/belkasoft/README.md`](https://github.com/SecurityRonin/sqlite-forensic/blob/main/tests/data/belkasoft/README.md).
+- Source: the "Advanced SQLite Queries with Belkasoft" training,
+  <https://belkasoft.com/advanced-sqlite-queries-with-belkasoft-training> (downloaded
+  2026-07-16 as `SQLite Exercises.zip`, SHA-256
+  `cf0c5485b39b609d3655529a20250b47e33b3b8d35377411e62171ed3e9d106b`). 52 SQLite dbs,
+  28 live `-wal`, ~16 non-empty `-journal`; 44 UTF-8; no `WITHOUT ROWID`, no encrypted
+  main dbs.
+- Test gate: `SQLITE_FORENSIC_BELKASOFT_CORPUS` (absolute path to the extracted root).
+  `forensic/tests/belkasoft_robustness.rs` finds every db **by file magic** (several
+  vendor dbs are extensionless, e.g. `viber_messages`), applies live WAL/journal
+  sidecars, and asserts the pipeline never panics; it **skips cleanly** when the var
+  is unset, so a plain `cargo test` stays green.
+- Yield: this corpus **found a real defect** — an unchecked `serial_body_len` sum in
+  the inferred carver overflowed `usize` on a free-space serial near `i64::MAX`
+  (panic in debug / silent wrap in release). Fixed with `checked_add` (`88ebfd9`);
+  all 52 dbs now survive. The Doer-Checker discipline paying off on real data.
+
 ## §H MD5 manifest
 
 Committed fixtures (under `tests/data/`, `tests/data/`):

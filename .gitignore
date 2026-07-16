@@ -48,3 +48,10 @@
 /tests/data/paper_fp/large_messages.db
 /tests/data/paper_fp/large_messages.db-*
 /tests/data/paper_fp/*.db.deleted.json
+
+# Belkasoft "SQLite Exercises" training corpus — real-world messenger app data
+# (WhatsApp/Viber/Skype/Facebook/Safari/CarPlay). Belkasoft's Terms of Use PROHIBIT
+# redistribution, so the archive/extracted DBs are NEVER committed; provenance +
+# hashes live in tests/data/belkasoft/README.md and docs/corpus-catalog.md §Q.
+/tests/data/belkasoft/*
+!/tests/data/belkasoft/README.md

@@ -1,6 +1,6 @@
 # sqlite-core
 
-Native, read-only, panic-free SQLite file-format reader for forensics.
+Native, read-only, input-fuzzed, panic-free-by-construction SQLite file-format reader for forensics.
 
 `sqlite-core` parses the raw SQLite database file format directly — header,
 pages, cells, overflow chains, the freelist, index b-trees (including

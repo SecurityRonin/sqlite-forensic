@@ -4351,7 +4351,9 @@ fn try_carve_cell_at(
     // — a strong self-consistency check that rejects coincidental matches.
     let mut body_len = 0usize;
     for &s in &serials {
-        body_len += serial_body_len(s)?;
+        // Checked: a serial from free-space bytes can declare a body length near
+        // usize::MAX; summing must reject (None) on overflow, never panic/wrap.
+        body_len = body_len.checked_add(serial_body_len(s)?)?;
     }
     if header_len + body_len != payload_len {
         return None;
@@ -4443,7 +4445,9 @@ fn try_carve_spilled_cell_at(
     // Length closure over the DECLARED payload: header + body must equal P.
     let mut body_len = 0usize;
     for &s in &serials {
-        body_len += serial_body_len(s)?;
+        // Checked: a serial from free-space bytes can declare a body length near
+        // usize::MAX; summing must reject (None) on overflow, never panic/wrap.
+        body_len = body_len.checked_add(serial_body_len(s)?)?;
     }
     if header_len + body_len != payload_len {
         return None;

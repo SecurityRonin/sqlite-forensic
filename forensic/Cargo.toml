@@ -12,6 +12,11 @@ description = "Forensic anomaly auditor for SQLite databases — header-integrit
 sqlite-core = { workspace = true }
 forensicnomicon = { workspace = true }
 sha2 = { workspace = true }
+# Fleet carving contract (ADR 0001): the medium-agnostic `Carver` trait a whole-DB
+# SQLite carver satisfies. Unpublished — committed PATH dep (raises MSRV to 1.80).
+forensic-carve = { path = "../../forensic-carve" }
+# Link-time carver registration into any binary that force-links this crate.
+inventory = "0.3"
 
 [lints]
 workspace = true

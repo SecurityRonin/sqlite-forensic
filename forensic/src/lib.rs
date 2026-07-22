@@ -29,6 +29,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod blob;
+pub mod carve;
 pub mod case_uco;
 pub mod interpret;
 

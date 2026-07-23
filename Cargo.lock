@@ -416,7 +416,9 @@ dependencies = [
 
 [[package]]
 name = "forensic-carve"
-version = "0.0.0"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce0033fbf842b95264c3af1c568bc4e6b5c4f21d295ab9a2e75248aa2ce766ff"
 dependencies = [
  "aho-corasick",
  "inventory",

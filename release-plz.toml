@@ -1,0 +1,57 @@
+# release-plz owns crates.io publishing + changelogs + version bumps for the two
+# workspace LIBRARIES (sqlite-core, sqlite-forensic). It runs on pushes to main
+# (see .github/workflows/release-plz.yml):
+#   - `release-pr`  opens a human-reviewed version-bump PR (conventional commits)
+#   - `release`     publishes any crate whose Cargo.toml version is ahead of
+#                   crates.io, in dependency order (sqlite-core before
+#                   sqlite-forensic), and creates its git tag
+#
+# Binary distribution (the sqlite4n6 MSI/deb/Homebrew/winget assets) stays in
+# release.yml, triggered by a manual `v[0-9]*` tag — decoupled from library
+# publishing.
+
+[workspace]
+# Per-package git tags, e.g. `sqlite-core-v0.11.0`. These deliberately do NOT
+# match release.yml's `v[0-9]*` trigger (a `<name>-v…` tag has a letter after
+# `v`), so a library release never kicks off a binary build. Cutting a binary
+# release stays a deliberate `v[0-9]*` tag push.
+git_tag_enable = true
+git_tag_name = "{{ package }}-v{{ version }}"
+# GitHub Releases (with downloadable assets) are owned by release.yml; library
+# crates get a git tag + CHANGELOG entry, not a separate GitHub Release.
+git_release_enable = false
+changelog_update = true
+# Only prepare a release when a real change exists since the last one. release-plz's
+# release detection is file-based, so a changelog-only "chore: release" commit
+# otherwise re-triggers a release (the churn loop). This allowlist makes
+# feat/fix/perf/refactor/doc/revert the only release triggers; chore/ci/test/style/
+# build (incl. release-plz's own release commits) never prepare a release.
+release_commits = "^(feat|fix|perf|refactor|doc|revert)"
+
+# Skip release-plz's own release commits so merging a release PR does not trigger
+# yet another release. Library releases still fire on feat/fix/perf/refactor/doc;
+# ci/chore/test/build no longer cause churn.
+[changelog]
+commit_parsers = [
+    { message = "^chore\\(release\\):", skip = true },
+    { message = "^chore: release", skip = true },
+    { message = "^feat", group = "added" },
+    { message = "^fix", group = "fixed" },
+    { message = "^perf", group = "performance" },
+    { message = "^refactor", group = "other" },
+    { message = "^doc", group = "documentation" },
+    { message = "^revert", group = "other" },
+    { message = "^style", skip = true },
+    { message = "^test", skip = true },
+    { message = "^ci", skip = true },
+    { message = "^build", skip = true },
+    { message = "^chore", skip = true },
+    { message = "^.*", group = "other" },
+]
+
+# sqlite4n6 is the end-user CLI binary. Its distribution (signed MSI/deb/Homebrew/
+# winget) is owned by release.yml on a `v[0-9]*` tag, NOT release-plz. release-plz
+# manages the two LIB crates only, so the CLI never gets a release-plz tag/publish.
+[[package]]
+name = "sqlite4n6"
+release = false

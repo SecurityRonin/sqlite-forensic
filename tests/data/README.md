@@ -381,3 +381,23 @@ its own provenance README (source, NIST/author hashes, licence, ground truth):
   `happy_holiday.jpg` (a **freeblock-clobbered** cell, first 4 bytes overwritten)
   — are both recovered by `forensic/tests/nist_dlc_snapshot.rs`, the latter via
   freeblock reconstruction (surviving tail `…holiday.jpg`).
+
+#### fuzz_render_alloc_bomb.db  (FUZZ, regression)
+
+- **Source:** FUZZ — a `render`-campaign crash artifact minimized by libFuzzer
+  (Tier-2; the contract is "does not abort", not a recall answer key). Committed
+  verbatim as `crash-ebdd2ca632cdce51e172def5dd1414e4da57383b`.
+- **Identity:** a 536-byte malformed SQLite file whose table-leaf cell declares a
+  ~5.9-exabyte spilled `payload_len` varint. Before the fix, the spill branch of
+  `decode_leaf_cell` (`core/src/lib.rs`) reached `Vec::with_capacity(total)` with
+  that untrusted length and aborted the process with
+  `memory allocation of 5955248086788122959 bytes failed`. Pins the allocation-cap
+  guard (`forensic/tests/fuzz_render_alloc_bomb.rs`): a payload larger than the
+  file can physically supply (`local + per_page * page_bound`) is rejected with
+  `MalformedOverflow` before the allocation, so `open → carve` returns cleanly.
+- **Generator:** libFuzzer `render` target over arbitrary bytes; no CLI recipe —
+  the crash bytes are the fixture. Corpus seed also under
+  `fuzz/corpus/render/` (gitignored).
+- **md5:** `6fe4622248008bf248eb367f37477c2c` — 536 bytes.
+- **Notable contents:** oversized spilled-payload cell; carving degrades to an
+  empty/partial result rather than aborting.

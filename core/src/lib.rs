@@ -2505,6 +2505,20 @@ fn decode_leaf_cell(
             .get(payload_start..payload_start + local)
             .ok_or(Error::TruncatedCell)?;
         let first_overflow = be_u32(slice, payload_start + local);
+        // Cap the pre-allocation against the untrusted payload length: a payload
+        // cannot exceed the bytes the file can physically supply — the `local`
+        // bytes on the leaf plus the content bytes of every page reachable
+        // through the overflow chain (`per_page * page_bound`). A crafted cell
+        // that declares a multi-exabyte `payload_len` would otherwise reach
+        // `Vec::with_capacity(total)` and abort the process with an allocation
+        // bomb. This is the same over-range condition `read_overflow_chain`
+        // rejects, pulled ahead of the allocation.
+        let per_page = usable.saturating_sub(4);
+        let max_overflow = per_page.saturating_mul(src.page_bound() as usize);
+        let max_payload = local.saturating_add(max_overflow);
+        if total > max_payload {
+            return Err(Error::MalformedOverflow);
+        }
         let mut buf = Vec::with_capacity(total);
         buf.extend_from_slice(head);
         read_overflow_chain(src, first_overflow, total - local, &mut buf)?;

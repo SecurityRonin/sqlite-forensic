@@ -3597,6 +3597,11 @@ fn live_cell_rowid(buf: &[u8], off: usize) -> Option<i64> {
 /// cell can never be re-surfaced.
 fn free_regions(live: &[(usize, usize)], lo: usize, hi: usize) -> Vec<(usize, usize)> {
     let mut regions = Vec::new();
+    // An inverted or empty range (lo >= hi) has no free regions. Guard before the
+    // `clamp(lo, hi)` calls below, which panic when lo > hi (untrusted-input path).
+    if lo >= hi {
+        return regions;
+    }
     let mut cursor = lo;
     for &(s, e) in live {
         let s = s.clamp(lo, hi);

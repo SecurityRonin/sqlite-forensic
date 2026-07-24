@@ -55,3 +55,5 @@
 # hashes live in tests/data/belkasoft/README.md and docs/corpus-catalog.md §Q.
 /tests/data/belkasoft/*
 !/tests/data/belkasoft/README.md
+/tests/data/cfreds/
+/tests/data/*.sqlite

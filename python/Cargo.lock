@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "aho-corasick"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -53,10 +62,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "forensicnomicon"
-version = "1.1.0"
+name = "forensic-carve"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ebe2da461724d13efa5ad4f23a7a5010015e4d528b482199887e530913f4734"
+checksum = "ce0033fbf842b95264c3af1c568bc4e6b5c4f21d295ab9a2e75248aa2ce766ff"
+dependencies = [
+ "aho-corasick",
+ "inventory",
+]
+
+[[package]]
+name = "forensicnomicon"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "150f629937191e09ad40c5adaa9b67617fc4648beae17891da2a95458c7716b9"
 dependencies = [
  "forensicnomicon-core",
  "forensicnomicon-data",
@@ -70,9 +89,9 @@ checksum = "f5d5b96ffd37d1e758a1657839de8b4d5e7bfc024a5500509d07ff7acd7b9461"
 
 [[package]]
 name = "forensicnomicon-data"
-version = "1.0.0"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "664814f07d95790e9c38a9c2c3a0a5539ba4e1ef8e4de72cf32424fc397364ba"
+checksum = "81a1473002767608b095a3dcd657ffb3c4c6e421c5cfe9fdca70a30fe477e0b7"
 dependencies = [
  "forensicnomicon-core",
 ]
@@ -103,10 +122,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "inventory"
+version = "0.3.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "memchr"
+version = "2.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memoffset"
@@ -229,16 +263,18 @@ dependencies = [
 
 [[package]]
 name = "sqlite-core"
-version = "0.9.0"
+version = "0.10.2"
 dependencies = [
  "forensicnomicon",
 ]
 
 [[package]]
 name = "sqlite-forensic"
-version = "0.9.0"
+version = "0.10.2"
 dependencies = [
+ "forensic-carve",
  "forensicnomicon",
+ "inventory",
  "sha2",
  "sqlite-core",
 ]

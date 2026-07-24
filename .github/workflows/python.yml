@@ -33,12 +33,12 @@ jobs:
           python-version: "3.11"
       - name: clippy (bindings)
         working-directory: python
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Install maturin + pytest
         run: pip install "maturin>=1,<2" pytest
       - name: Build + install the extension
         working-directory: python
-        run: maturin build --release --out dist && pip install dist/*.whl
+        run: maturin build --release --locked --out dist && pip install dist/*.whl
       - name: Run the Python tests
         working-directory: python
         run: python -m pytest tests/ -q

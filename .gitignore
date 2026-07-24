@@ -55,5 +55,12 @@
 # hashes live in tests/data/belkasoft/README.md and docs/corpus-catalog.md §Q.
 /tests/data/belkasoft/*
 !/tests/data/belkasoft/README.md
-/tests/data/cfreds/
+# NIST CFReDS SQLite corpus: the small ground-truth fixtures ARE committed
+# (public-domain; provenance in tests/data/cfreds/README.md + docs/corpus-catalog.md).
+# Only the large SFT-05 BLOB databases (~206 MB each) are gitignored — download
+# per tests/data/cfreds/README.md. A blanket ignore of the whole cfreds/ dir made
+# the committed fixtures "committed AND ignored", which fails release-plz's
+# `git ls-files -ci` working-tree check.
+/tests/data/cfreds/SFT-05_android.sqlite
+/tests/data/cfreds/SFT-05_ios.sqlite
 /tests/data/*.sqlite

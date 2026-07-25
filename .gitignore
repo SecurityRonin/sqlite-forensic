@@ -64,3 +64,4 @@
 /tests/data/cfreds/SFT-05_android.sqlite
 /tests/data/cfreds/SFT-05_ios.sqlite
 /tests/data/*.sqlite
+tools/fqlite/stubs/

@@ -31,6 +31,14 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
+      # python/ is a standalone workspace that release-plz does not manage, so a
+      # library version bump (sqlite-core/sqlite-forensic) leaves python/Cargo.lock
+      # pinning the old version and breaks the --locked steps below. Re-lock only
+      # those two path deps to the current source version; every third-party crate
+      # (pyo3, …) stays locked, so the wheel remains reproducible.
+      - name: Sync bindings lockfile to current crate versions
+        working-directory: python
+        run: cargo update -p sqlite-core -p sqlite-forensic
       - name: clippy (bindings)
         working-directory: python
         run: cargo clippy --all-targets --locked -- -D warnings

@@ -24,6 +24,7 @@
 pub mod attribution;
 pub mod rebuild;
 pub mod row_history;
+pub mod sqlcipher;
 
 // The page-1 header field offsets are consumed from the KNOWLEDGE leaf
 // (forensicnomicon::sqlite ≥ 1.5.0); the previously-local duplicates were promoted
@@ -70,11 +71,21 @@ pub enum Error {
     /// [`Database::open_path`], not a malformed database). Carries the
     /// [`std::io::ErrorKind`] (show-the-unrecognized-value).
     Io(std::io::ErrorKind),
+    /// `SQLCipher` decryption failed (wrong key, unsupported cipher parameters, or
+    /// a failed page authentication) via [`Database::open_encrypted`]. Carries
+    /// the underlying [`sqlcipher::DecryptError`] (show-the-unrecognized-value).
+    Decrypt(sqlcipher::DecryptError),
 }
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::Io(e.kind())
+    }
+}
+
+impl From<sqlcipher::DecryptError> for Error {
+    fn from(e: sqlcipher::DecryptError) -> Self {
+        Error::Decrypt(e)
     }
 }
 
@@ -655,6 +666,20 @@ impl Database {
             header,
             wal: None,
         })
+    }
+
+    /// Decrypt a **`SQLCipher`** database with `key` and open the resulting
+    /// plaintext, detecting the cipher version automatically (see
+    /// [`sqlcipher::decrypt`]). The reader then consumes the decrypted byte
+    /// stream exactly as for a plaintext file — the encryption is transparent
+    /// past this call.
+    ///
+    /// Secure-by-default and read-only: a wrong key or unsupported cipher
+    /// parameters is a loud [`Error::Decrypt`], never a silently-misread
+    /// database; nothing is written back to the evidence file.
+    pub fn open_encrypted(bytes: &[u8], key: &sqlcipher::SqlCipherKey) -> Result<Self, Error> {
+        let decrypted = sqlcipher::decrypt(bytes, key)?;
+        Self::open(decrypted.plaintext)
     }
 
     /// Open a database from a filesystem path with a **bounded-memory paged

@@ -41,5 +41,6 @@ The analysis layer hard-depends on its decode/enrichment stack, always on:
 - Decode output stays honest: an `interpreted` object carries `lossy` /
   `confidence` and sits *alongside* the raw base64 so the original bytes still
   round-trip (README "What you get").
-- Decryption stays out of scope — encrypted databases are detected and named, not
-  decrypted; recovering their records needs the key/VFS (README "Out of scope").
+- Decryption of a keyed database is now in scope — see ADR 0010: given a key,
+  `Database::open_encrypted` decrypts SQLCipher pages into the plaintext stream the
+  reader consumes. The reserved-space *naming* here stays the detection front door.

@@ -14,6 +14,9 @@
 //! reading back the known rows through the native reader is the cross-check.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// The module doc embeds literal `sqlcipher` reproducer command lines and product
+// names; backticking every token would mangle the reproducer (cf. real_db.rs).
+#![allow(clippy::doc_markdown)]
 
 use sqlite_core::sqlcipher::{self, SqlCipherKey, SqlCipherVersion};
 use sqlite_core::{Database, Value};
@@ -107,7 +110,10 @@ fn wrong_passphrase_is_a_clean_error() {
     );
 
     let err = sqlcipher::decrypt(ENC_V4, &SqlCipherKey::Passphrase(b"wrong".to_vec()));
-    assert_eq!(err, Err(sqlcipher::DecryptError::KeyOrParametersMismatch));
+    assert_eq!(
+        err.err(),
+        Some(sqlcipher::DecryptError::KeyOrParametersMismatch)
+    );
 }
 
 #[test]
@@ -115,7 +121,10 @@ fn wrong_raw_key_is_a_clean_error() {
     let mut bad = RAW_KEY;
     bad[0] ^= 0xff;
     let err = sqlcipher::decrypt(ENC_RAWKEY, &SqlCipherKey::RawKey(bad));
-    assert_eq!(err, Err(sqlcipher::DecryptError::KeyOrParametersMismatch));
+    assert_eq!(
+        err.err(),
+        Some(sqlcipher::DecryptError::KeyOrParametersMismatch)
+    );
 }
 
 #[test]
@@ -131,5 +140,5 @@ fn truncated_ciphertext_never_panics() {
 #[test]
 fn empty_input_is_too_small() {
     let err = sqlcipher::decrypt(&[], &SqlCipherKey::RawKey(RAW_KEY));
-    assert_eq!(err, Err(sqlcipher::DecryptError::TooSmall));
+    assert_eq!(err.err(), Some(sqlcipher::DecryptError::TooSmall));
 }

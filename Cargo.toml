@@ -20,6 +20,8 @@ sqlite-forensic = { version = "0.10.3", path = "forensic" }
 clap = { version = "4", features = ["derive"] }
 # SHA-256 content hashing for recovered BLOBs (RustCrypto — audited, never hand-rolled).
 sha2 = "0.10"
+# Output sanitization: RFC 4180 CSV quoting + spreadsheet formula guard.
+jsonguard = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -229,15 +229,14 @@ pub fn carve_lead_cells(rec: &CarvedRecord) -> Vec<String> {
     ]
 }
 
-/// CSV escape: wrap in double quotes and double any embedded quote when the cell
-/// contains a comma, quote, or newline.
+/// CSV escape via the fleet's shared `jsonguard` sanitizer: RFC 4180 quoting
+/// plus a spreadsheet formula guard. Every cell rendered here is carved from
+/// evidence, so a value beginning `=`, `+`, `-` or `@` would otherwise execute
+/// when the examiner opens the file; `jsonguard` prefixes an apostrophe and
+/// strips bidi-override and C0 control characters that misrepresent a cell.
 #[must_use]
 pub fn csv_escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
+    jsonguard::csv_field(s).value
 }
 
 /// JSON-escape a string for the hand-rolled JSONL writer (no serde dependency:

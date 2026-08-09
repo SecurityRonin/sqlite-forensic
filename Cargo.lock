@@ -653,6 +653,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonguard"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da69c0e1ea0a8594c077882aa53d25698a10238a47f3beff2fe961c0576bcdc2"
+
+[[package]]
 name = "libbz2-rs-sys"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -970,7 +976,7 @@ checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 
 [[package]]
 name = "sqlite-core"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "aes",
  "cbc",
@@ -984,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "sqlite-forensic"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "forensic-carve",
  "forensicnomicon",
@@ -995,13 +1001,14 @@ dependencies = [
 
 [[package]]
 name = "sqlite4n6"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "blob-decoder",
  "calamine",
  "clap",
  "forensicnomicon",
  "image",
+ "jsonguard",
  "rust_xlsxwriter",
  "sqlite-core",
  "sqlite-forensic",

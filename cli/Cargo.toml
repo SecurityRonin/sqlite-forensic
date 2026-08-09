@@ -25,6 +25,7 @@ sqlite-core = { workspace = true }
 sqlite-forensic = { workspace = true }
 forensicnomicon = { workspace = true }
 clap = { workspace = true }
+jsonguard = { workspace = true }
 # XLSX export (`carve --xlsx`): writes the rebuilt tables to a spreadsheet with
 # image blobs embedded in-cell. Both are pure Rust (no C deps) — the workspace
 # forbids unsafe and ships a single static binary. `image` enables only the

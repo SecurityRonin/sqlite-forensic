@@ -229,15 +229,14 @@ pub fn carve_lead_cells(rec: &CarvedRecord) -> Vec<String> {
     ]
 }
 
-/// CSV escape: wrap in double quotes and double any embedded quote when the cell
-/// contains a comma, quote, or newline.
+/// CSV escape via the fleet's shared `jsonguard` sanitizer: RFC 4180 quoting
+/// plus a spreadsheet formula guard. Every cell rendered here is carved from
+/// evidence, so a value beginning `=`, `+`, `-` or `@` would otherwise execute
+/// when the examiner opens the file; `jsonguard` prefixes an apostrophe and
+/// strips bidi-override and C0 control characters that misrepresent a cell.
 #[must_use]
 pub fn csv_escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
+    jsonguard::csv_field(s).value
 }
 
 /// JSON-escape a string for the hand-rolled JSONL writer (no serde dependency:
@@ -2933,6 +2932,50 @@ mod tests {
         )];
         let lines = render_carve(&records, &[], OutputFormat::Csv, false);
         assert!(lines[1].contains("\"a,b\""), "{}", lines[1]);
+    }
+
+    /// A carved cell is attacker-controlled by definition — it is whatever the
+    /// application (or an adversary using it) stored in the database. A value
+    /// beginning with `=`, `+`, `-` or `@` becomes a live formula the moment
+    /// the examiner opens the CSV in a spreadsheet, so the lead-in must be
+    /// neutralized before the cell reaches the file.
+    #[test]
+    fn carve_csv_neutralizes_formula_lead_ins() {
+        for lead in ['=', '+', '-', '@'] {
+            let payload = format!("{lead}cmd|'/c calc'!A1");
+            let records = vec![rec(
+                1,
+                0.9,
+                RecoverySource::FreelistPage,
+                vec![Value::Text(payload.clone())],
+            )];
+            let lines = render_carve(&records, &[], OutputFormat::Csv, false);
+            for cell in lines[1].split(',') {
+                assert!(
+                    !cell.starts_with(lead),
+                    "unguarded formula cell {cell:?} in row: {}",
+                    lines[1]
+                );
+            }
+        }
+    }
+
+    /// Anomaly notes embed values read out of the evidence file, so the audit
+    /// CSV carries the same exposure as the carve CSV.
+    #[test]
+    fn audit_csv_neutralizes_formula_lead_ins() {
+        for lead in ['=', '+', '-', '@'] {
+            let mut a = anomaly();
+            a.note = format!("{lead}cmd|'/c calc'!A1");
+            let lines = render_audit(&[a], OutputFormat::Csv);
+            for cell in lines[1].split(',') {
+                assert!(
+                    !cell.starts_with(lead),
+                    "unguarded formula cell {cell:?} in row: {}",
+                    lines[1]
+                );
+            }
+        }
     }
 
     #[test]

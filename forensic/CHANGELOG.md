@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3](https://github.com/SecurityRonin/sqlite-forensic/compare/sqlite-forensic-v0.10.2...sqlite-forensic-v0.10.3) - 2026-07-25
+
+### Fixed
+
+- cap overflow-payload alloc against untrusted payload_len (fuzz alloc bomb)
+
 ## [0.10.2](https://github.com/SecurityRonin/sqlite-forensic/compare/sqlite-forensic-v0.10.1...sqlite-forensic-v0.10.2) - 2026-07-23
 
 ### Added

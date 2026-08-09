@@ -17,9 +17,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use sqlite_core::{Database, Value};
 
@@ -49,14 +48,8 @@ fn scratch(tag: &str) -> PathBuf {
 /// Run `sqlite3 <db> "<sql>"` on a SHORT-LIVED writer connection. With a held
 /// reader already open (see [`build_incremental_fixture`]) the checkpoint-on-close
 /// is blocked, so the `-wal` survives.
-fn writer_sql(bin: &str, db: &Path, sql: &str) {
-    let out = Command::new(bin).arg(db).arg(sql).output().unwrap();
-    assert!(
-        out.status.success(),
-        "sqlite3 writer failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
+mod common;
+use common::{writer_sql, HeldReader};
 
 /// Query a snapshot db with `sqlite3` and return the oracle rows
 /// `(id, name, quote(big))` in id order.
@@ -117,33 +110,20 @@ pub struct Snap {
 /// The held reader is a `sqlite3` process reading commands from a pipe; it opens
 /// a read transaction (`BEGIN; SELECT ...`) that blocks checkpoint so the `-wal`
 /// is retained across the short-lived writer connections.
-fn build_incremental_fixture(bin: &str, dir: &Path) -> (std::process::Child, Vec<Snap>) {
+fn build_incremental_fixture(bin: &str, dir: &Path) -> (HeldReader, Vec<Snap>) {
     let db = dir.join("ev.db");
     let wal = dir.join("ev.db-wal");
 
     // Held reader: keep a connection open with an active read txn to block the
     // checkpoint-on-close that would otherwise delete the -wal.
-    let mut reader = Command::new(bin)
-        .arg(&db)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut rin = reader.stdin.take().unwrap();
-    writeln!(
-        rin,
+    let mut reader = HeldReader::spawn(bin, &db);
+    // Acknowledged, not slept on: the writers below cannot race the CREATE TABLE.
+    reader.run(
         "PRAGMA journal_mode=WAL;\nPRAGMA wal_autocheckpoint=0;\nPRAGMA secure_delete=OFF;\n\
-         CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, big BLOB);"
-    )
-    .unwrap();
-    rin.flush().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    writeln!(rin, "BEGIN;\nSELECT count(*) FROM t;").unwrap();
-    rin.flush().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    // Keep the reader's stdin open by handing it back to the child for cleanup.
-    reader.stdin = Some(rin);
+         CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, big BLOB);",
+    );
+    // Open the read transaction that retains the -wal across writer commits.
+    reader.run("BEGIN;\nSELECT count(*) FROM t;");
 
     let mut snaps = Vec::new();
     let snap = |dir: &Path, n: usize, db: &Path, wal: &Path| -> Snap {
@@ -180,11 +160,8 @@ fn build_incremental_fixture(bin: &str, dir: &Path) -> (std::process::Child, Vec
 }
 
 /// Release the held reader and remove the scratch directory.
-fn teardown(mut reader: std::process::Child, dir: &Path) {
-    if let Some(mut rin) = reader.stdin.take() {
-        let _ = writeln!(rin, "COMMIT;\n.quit");
-    }
-    let _ = reader.wait();
+fn teardown(reader: HeldReader, dir: &Path) {
+    reader.finish();
     let _ = std::fs::remove_dir_all(dir);
 }
 

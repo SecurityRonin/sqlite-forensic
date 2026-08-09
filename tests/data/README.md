@@ -401,3 +401,53 @@ its own provenance README (source, NIST/author hashes, licence, ground truth):
 - **md5:** `6fe4622248008bf248eb367f37477c2c` — 536 bytes.
 - **Notable contents:** oversized spilled-payload cell; carving degrades to an
   empty/partial result rather than aborting.
+
+#### sqlcipher/  (REAL-engine SQLCipher ciphertext, Tier-2 decryption oracle)
+
+- **Source:** SYNTHETIC — minted by the **SQLCipher 4.17.0 CLI**
+  (`/opt/homebrew/bin/sqlcipher`, an independent OpenSSL-backed implementation —
+  the decryption oracle). Ground truth is derivable from the construction below.
+  The 16-byte per-file salt is random, so a re-mint yields different bytes; the
+  committed files are the pinned artifacts these md5s refer to.
+- **Consumed by:** `core/tests/sqlcipher_oracle.rs` — our RustCrypto decryptor
+  (`sqlite_core::sqlcipher`) must reproduce the plaintext the engine produced, then
+  the native reader reads back the known rows.
+- **Common schema** (all three): `t(id INTEGER PRIMARY KEY, name TEXT, val INTEGER)`
+  with rows `(1,'alpha',100) (2,'bravo',200) (3,'unicode-snow',300)`;
+  passphrase fixtures share the passphrase `correct horse battery staple`.
+- **Generators:**
+
+  ```sh
+  # enc_v4.db — SQLCipher 4 defaults (PBKDF2/HMAC-SHA512, 256000 iter, page 4096, reserve 80)
+  sqlcipher enc_v4.db <<'SQL'
+  PRAGMA key = 'correct horse battery staple';
+  CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, val INTEGER);
+  INSERT INTO t VALUES (1,'alpha',100),(2,'bravo',200),(3,'unicode-snow',300);
+  CREATE TABLE notes(body TEXT);
+  INSERT INTO notes VALUES ('the quick brown fox');
+  SQL
+
+  # enc_v3.db — SQLCipher 3 compatibility (PBKDF2/HMAC-SHA1, 64000 iter, page 1024, reserve 48)
+  sqlcipher enc_v3.db <<'SQL'
+  PRAGMA key = 'correct horse battery staple';
+  PRAGMA cipher_compatibility = 3;
+  CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, val INTEGER);
+  INSERT INTO t VALUES (1,'alpha',100),(2,'bravo',200),(3,'unicode-snow',300);
+  SQL
+
+  # enc_rawkey.db — raw 32-byte key (no passphrase KDF for the encryption key)
+  sqlcipher enc_rawkey.db <<'SQL'
+  PRAGMA key = "x'2b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfe'";
+  CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, val INTEGER);
+  INSERT INTO t VALUES (1,'alpha',100),(2,'bravo',200),(3,'unicode-snow',300);
+  SQL
+  ```
+
+- **md5:**
+  - `enc_v4.db`     `dca83d44f81d66154b0417b1ef6a295d` — 12288 bytes (3 pages).
+  - `enc_v3.db`     `e6a1cc04a264f67ce9169de82b749cc5` — 2048 bytes (2 pages).
+  - `enc_rawkey.db` `18ea1699a334c0667edad678bba08131` — 8192 bytes (2 pages).
+- **Notable contents:** first 16 bytes are the random salt (NOT the `SQLite
+  format 3\0` magic); `enc_v4.db` additionally holds table `notes` (root page 3)
+  with one row `the quick brown fox`. Version is auto-detected by page-1 HMAC
+  verification; a wrong key matches no profile and fails loud.

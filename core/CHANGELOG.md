@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/SecurityRonin/sqlite-forensic/compare/sqlite-core-v0.10.3...sqlite-core-v0.11.0) - 2026-08-09
+
+### Fixed
+
+- *(test)* acknowledge sqlite3 statements instead of sleeping on them
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into try/sqlcipher
+
 ## [0.10.3](https://github.com/SecurityRonin/sqlite-forensic/compare/sqlite-core-v0.10.2...sqlite-core-v0.10.3) - 2026-07-25
 
 ### Fixed

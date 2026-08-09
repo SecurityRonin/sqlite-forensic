@@ -12,9 +12,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use sqlite_core::row_history::ViewState;
 use sqlite_core::{Database, Value};
@@ -42,15 +41,8 @@ fn scratch(tag: &str) -> PathBuf {
     p
 }
 
-/// Run one short-lived writer connection (the held reader blocks checkpoint).
-fn writer_sql(bin: &str, db: &Path, sql: &str) {
-    let out = Command::new(bin).arg(db).arg(sql).output().unwrap();
-    assert!(
-        out.status.success(),
-        "sqlite3 writer failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
+mod common;
+use common::{writer_sql, HeldReader};
 
 /// Build the WAL fixture with the KNOWN mutation sequence; return the held reader
 /// (kept alive until dropped) and the `(db, wal)` paths.
@@ -59,30 +51,19 @@ fn writer_sql(bin: &str, db: &Path, sql: &str) {
 ///   C1: insert (1,'a'),(2,'b'),(4,'x')
 ///   C2: update 1->'A'; delete 2; delete 4
 ///   C3: insert 3->'c'; insert 4->'y'   (rowid 4 REUSED after its C2 delete)
-fn build_fixture(bin: &str, dir: &Path) -> (std::process::Child, PathBuf, PathBuf) {
+fn build_fixture(bin: &str, dir: &Path) -> (HeldReader, PathBuf, PathBuf) {
     let db = dir.join("ev.db");
     let wal = dir.join("ev.db-wal");
 
-    let mut reader = Command::new(bin)
-        .arg(&db)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut rin = reader.stdin.take().unwrap();
-    writeln!(
-        rin,
+    let mut reader = HeldReader::spawn(bin, &db);
+    // Each `run` returns only once sqlite3 has executed the statement, so the
+    // writers below cannot race ahead of the CREATE TABLE.
+    reader.run(
         "PRAGMA journal_mode=WAL;\nPRAGMA wal_autocheckpoint=0;\nPRAGMA secure_delete=OFF;\n\
-         CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);"
-    )
-    .unwrap();
-    rin.flush().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    writeln!(rin, "BEGIN;\nSELECT count(*) FROM t;").unwrap();
-    rin.flush().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    reader.stdin = Some(rin);
+         CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);",
+    );
+    // Open the read transaction that retains the -wal across writer commits.
+    reader.run("BEGIN;\nSELECT count(*) FROM t;");
 
     writer_sql(
         bin,
@@ -107,11 +88,8 @@ fn build_fixture(bin: &str, dir: &Path) -> (std::process::Child, PathBuf, PathBu
 }
 
 /// Release the held reader and remove the scratch directory.
-fn teardown(mut reader: std::process::Child, dir: &Path) {
-    if let Some(mut rin) = reader.stdin.take() {
-        let _ = writeln!(rin, "COMMIT;\n.quit");
-    }
-    let _ = reader.wait();
+fn teardown(reader: HeldReader, dir: &Path) {
+    reader.finish();
     let _ = std::fs::remove_dir_all(dir);
 }
 

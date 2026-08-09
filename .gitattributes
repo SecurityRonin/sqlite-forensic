@@ -1,0 +1,5 @@
+# Byte-exact forensic fixtures: git must never translate line endings in them.
+# core.autocrlf defaults to TRUE on GitHub windows-latest runners, and git only
+# sniffs the first 8000 bytes for a NUL before deciding a file is text.
+tests/data/** -text
+fuzz/corpus/** -text

@@ -40,6 +40,12 @@ use forensicnomicon::sqlite::{
 
 /// Errors that can arise while reading a `SQLite` database, all recoverable —
 /// the reader never panics on malformed input.
+///
+/// `#[non_exhaustive]` so naming a newly-recognised malformation is an additive
+/// change. It is applied in the same release that adds
+/// [`Error::MalformedSerialType`], because that addition is breaking either way
+/// and doing both at once spends the break once instead of twice.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     /// File is shorter than the 100-byte header.
@@ -54,6 +60,16 @@ pub enum Error {
     NotATablePage(u8),
     /// A cell pointer or payload ran past the end of its page.
     TruncatedCell,
+    /// A record's serial type was negative, so it names no value at all. A
+    /// serial type is a varint, and a damaged record decodes one as a negative
+    /// `i64`. Carries the offending value and the body offset it was read for
+    /// (Show-the-unrecognized-value).
+    MalformedSerialType {
+        /// The serial type as decoded, verbatim.
+        serial: i64,
+        /// Offset into the cell body the value would have started at.
+        offset: usize,
+    },
     /// The b-tree was deeper / wider than the safety cap allows.
     TooManyPages,
     /// The freelist trunk chain cycled or exceeded the file's page count.
@@ -4691,22 +4707,55 @@ fn decode_value(
         9 => (Value::Integer(1), 0),
         n if n >= 12 && n % 2 == 0 => {
             let len = ((n - 12) / 2) as usize;
-            let bytes = buf.get(off..off + len).ok_or(Error::TruncatedCell)?;
+            let bytes = span(buf, off, len)?;
             (Value::Blob(bytes.to_vec()), len)
         }
-        n => {
-            // odd, >= 13: text, decoded per the database's text encoding
-            // (UTF-8 / UTF-16LE / UTF-16BE). Lossy so a corrupt byte can't panic.
+        // odd, >= 13: text, decoded per the database's text encoding
+        // (UTF-8 / UTF-16LE / UTF-16BE). Lossy so a corrupt byte can't panic.
+        //
+        // The `>= 13` guard is what keeps the subtraction below in range. It was
+        // previously a catch-all `n =>`, which also swallowed every NEGATIVE
+        // serial type — and a serial type is a varint, so a damaged record
+        // produces those. `i64::MIN - 13` underflows outright, and `-1` yields
+        // `((-1 - 13) / 2) as usize` = 18446744073709551609.
+        n if n >= 13 => {
             let len = ((n - 13) / 2) as usize;
-            let bytes = buf.get(off..off + len).ok_or(Error::TruncatedCell)?;
+            let bytes = span(buf, off, len)?;
             (Value::Text(enc.decode(bytes)), len)
+        }
+        // Only negatives reach here: 0..=11 are named above and everything from
+        // 12 up is claimed by the two arms. A negative serial type identifies no
+        // value at all, so it is a malformed record rather than a short one —
+        // reported with the offending value and its offset rather than folded
+        // into TruncatedCell, which would send a reader looking for a truncation
+        // that is not there.
+        n => {
+            return Err(Error::MalformedSerialType {
+                serial: n,
+                offset: off,
+            })
         }
     })
 }
 
+/// Take `buf[off..off + len]`, refusing rather than forming the range unchecked.
+///
+/// `buf.get(off..off + len)` reads as though the bounds check covers everything,
+/// and it does not: the range is constructed *before* `get` is given it, so a
+/// length taken from the evidence overflows the add. Under overflow checks that
+/// panics; in a release build it wraps to a small number, `get` succeeds, and
+/// the caller is handed a slice that is not the value it asked for — wrong bytes
+/// reported as fact, which is worse than the crash.
+///
+/// Every span whose length comes from the file goes through here.
+fn span(buf: &[u8], off: usize, len: usize) -> Result<&[u8], Error> {
+    let end = off.checked_add(len).ok_or(Error::TruncatedCell)?;
+    buf.get(off..end).ok_or(Error::TruncatedCell)
+}
+
 /// Read `width` (1..=8) big-endian bytes into a raw u64 (no sign extension).
 fn read_be_u64(buf: &[u8], off: usize, width: usize) -> Result<u64, Error> {
-    let bytes = buf.get(off..off + width).ok_or(Error::TruncatedCell)?;
+    let bytes = span(buf, off, width)?;
     let mut acc: u64 = 0;
     for &b in bytes {
         acc = (acc << 8) | u64::from(b);

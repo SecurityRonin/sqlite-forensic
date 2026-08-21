@@ -5280,6 +5280,44 @@ fn be_u32(buf: &[u8], off: usize) -> u32 {
 mod tests {
     use super::*;
 
+    /// A serial type is a varint, and a varint in a damaged record can decode to
+    /// a **negative** i64. Every arm above 11 is written for the positive cases,
+    /// so a negative one falls through to the catch-all text arm, where
+    /// `((n - 13) / 2) as usize` wraps: serial `-1` becomes a length of
+    /// 18446744073709551609.
+    ///
+    /// `buf.get(off..off + len)` reads as though the bounds check makes that
+    /// safe, but the range is built *before* `get` sees it. With overflow checks
+    /// the add panics; in a release build it wraps to a small number, `get`
+    /// succeeds, and the caller is handed bytes that are not the value —
+    /// silently wrong evidence, which is the worse of the two.
+    #[test]
+    fn a_negative_serial_type_is_refused_rather_than_wrapping() {
+        let buf = [0u8; 64];
+
+        for serial in [-1_i64, -3, -14, -4096, i64::MIN + 1] {
+            let result = decode_value(&buf, 0, serial, TextEncoding::Utf8);
+            assert!(
+                result.is_err(),
+                "serial {serial} decoded to {result:?}; a negative serial type \
+                 identifies no value and must be refused, never length-wrapped"
+            );
+        }
+    }
+
+    /// The boundary the arms actually turn on, pinned so a fix for the negative
+    /// case cannot quietly reject the smallest legal blob/text instead.
+    #[test]
+    fn the_smallest_legal_blob_and_text_serials_still_decode_empty() {
+        let buf = [0u8; 8];
+
+        let (blob, used) = decode_value(&buf, 0, 12, TextEncoding::Utf8).unwrap();
+        assert_eq!((blob, used), (Value::Blob(Vec::new()), 0));
+
+        let (text, used) = decode_value(&buf, 0, 13, TextEncoding::Utf8).unwrap();
+        assert_eq!((text, used), (Value::Text(String::new()), 0));
+    }
+
     fn page_rc(byte: u8) -> std::rc::Rc<[u8]> {
         std::rc::Rc::from(vec![byte].into_boxed_slice())
     }

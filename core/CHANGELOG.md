@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/SecurityRonin/sqlite-forensic/compare/sqlite-core-v0.11.0...sqlite-core-v0.12.0) - 2026-08-21
+
+### Fixed
+
+- *(cell)* [**breaking**] refuse a negative serial type instead of wrapping it into a length ([#16](https://github.com/SecurityRonin/sqlite-forensic/pull/16))
+
 ## [0.11.0](https://github.com/SecurityRonin/sqlite-forensic/compare/sqlite-core-v0.10.3...sqlite-core-v0.11.0) - 2026-08-09
 
 ### Fixed

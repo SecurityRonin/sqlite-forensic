@@ -4482,7 +4482,7 @@ mod tests {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
         let mut media = false;
         for i in 0..zip.len() {
-            let name = zip.by_index(i).unwrap().name().to_string();
+            let name = zip.by_index(i).unwrap().name().unwrap().to_string();
             let is_png = std::path::Path::new(&name)
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
@@ -5220,7 +5220,7 @@ mod tests {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
         let mut media = false;
         for i in 0..zip.len() {
-            let name = zip.by_index(i).unwrap().name().to_string();
+            let name = zip.by_index(i).unwrap().name().unwrap().to_string();
             let is_png = std::path::Path::new(&name)
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));

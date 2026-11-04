@@ -22,6 +22,14 @@ version = 2
 # This crate is MIT; permit only permissive, non-copyleft licences in the tree.
 allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "Unicode-3.0", "ISC", "Zlib"]
 confidence-threshold = 0.9
+# zip 9 (test-only, via calamine and the zip fixture oracle; RUSTSEC-2026-0367/
+# 0368/0369/0429 fixed in 9.0) brings two pure-Rust codec backends whose licenses
+# are permissive but not on the list. Scoped to those crates (ADR-0013: fix the
+# gate, not the feature set).
+exceptions = [
+    { allow = ["bzip2-1.0.6"], crate = "libbz2-rs-sys" },
+    { allow = ["CC0-1.0", "MIT-0"], crate = "ppmd-rust" },
+]
 
 [bans]
 multiple-versions = "warn"

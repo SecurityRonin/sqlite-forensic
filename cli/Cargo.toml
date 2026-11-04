@@ -30,14 +30,14 @@ jsonguard = { workspace = true }
 # image blobs embedded in-cell. Both are pure Rust (no C deps) — the workspace
 # forbids unsafe and ships a single static binary. `image` enables only the
 # codecs the in-cell thumbnailer detects (png/jpeg/gif/bmp/webp/tiff).
-rust_xlsxwriter = "0.95"
+rust_xlsxwriter = "0.102"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
 
 [dev-dependencies]
 # Real oracles that read the produced .xlsx back: calamine parses the sheets and
 # cell values; zip confirms embedded image media (`xl/media/*.png`) is present.
-calamine = "0.35"
-zip = "4"
+calamine = "0.38"
+zip = "9"
 
 [lints]
 workspace = true

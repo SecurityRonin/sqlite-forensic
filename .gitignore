@@ -64,3 +64,10 @@ target/
 /tests/data/cfreds/SFT-05_android.sqlite
 /tests/data/cfreds/SFT-05_ios.sqlite
 /tests/data/*.sqlite
+
+# The reference paper (LaTeX source, bibliography, built PDF) is kept out of the
+# repository. It was previously committed; the files are untracked in the same
+# change that adds this rule, so nothing is left "committed AND ignored" (which
+# would fail release-plz's `git ls-files -ci` working-tree check — see the
+# cfreds note above). The paper remains on disk locally.
+/paper/
